@@ -54,8 +54,9 @@ pub(crate) struct Job {
     pub(crate) id: String,
     tool: String,
     summary: String,
-    /// What it writes, absolute: reserved while it runs.
-    outputs: Vec<PathBuf>,
+    /// What it writes, absolute as given, each with its [`hold_key`]:
+    /// reserved while it runs.
+    outputs: Vec<(PathBuf, PathBuf)>,
     started_at: String,
     started: Instant,
     progress: Mutex<Progress>,
@@ -136,7 +137,7 @@ impl Jobs {
             id: format!("job-{n}"),
             tool: tool.into(),
             summary: summary.into(),
-            outputs: outputs.iter().map(|o| absolute(o)).collect(),
+            outputs: outputs.iter().map(|o| (absolute(o), hold_key(o))).collect(),
             started_at: crate::project::rfc3339(),
             started: Instant::now(),
             progress: Mutex::new(Progress {
@@ -153,19 +154,27 @@ impl Jobs {
         job
     }
 
-    /// A running job writing one of `outputs` (the same path, or one inside
-    /// the other): its id and the path. A job's outputs are free again once
-    /// it ends, however it ends.
+    /// A running job writing one of `outputs` (the same file, or one inside
+    /// the other, however either is spelled): its id and the path as that
+    /// job gave it, made absolute. A job's outputs are free again once it
+    /// ends, however it ends.
     pub(crate) fn holder(&self, outputs: &[PathBuf]) -> Option<(String, PathBuf)> {
-        let wanted: Vec<PathBuf> = outputs.iter().map(|o| absolute(o)).collect();
-        let all = self.all.lock().unwrap_or_else(|e| e.into_inner());
-        all.values().filter(|j| j.running()).find_map(|j| {
-            let hit = j.outputs.iter().find(|held| {
+        let running: Vec<Arc<Job>> = {
+            let all = self.all.lock().unwrap_or_else(|e| e.into_inner());
+            all.values().filter(|j| j.running()).cloned().collect()
+        };
+        if running.is_empty() {
+            return None;
+        }
+        // Resolved off the lock: it reads the file system.
+        let wanted: Vec<PathBuf> = outputs.iter().map(|o| hold_key(o)).collect();
+        running.iter().find_map(|j| {
+            let (given, _) = j.outputs.iter().find(|(_, held)| {
                 wanted
                     .iter()
                     .any(|w| w.starts_with(held) || held.starts_with(w))
             })?;
-            Some((j.id.clone(), hit.clone()))
+            Some((j.id.clone(), given.clone()))
         })
     }
 
@@ -238,4 +247,134 @@ impl Jobs {
 /// `p` absolute, against the working directory, without touching the disk.
 fn absolute(p: &Path) -> PathBuf {
     std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Links followed before a path is taken as it is spelled (a loop).
+const LINKS_MAX: usize = 40;
+
+/// The file `p` names, however it is spelled, for comparing outputs only
+/// (what is recorded stays as given): `p` absolute, resolved a component
+/// at a time as the system would, so each link is followed (also one to a
+/// folder not made yet) before a `..` after it; a part that does not exist
+/// yet is taken as spelled. Two spellings of one file (`a/../fit` and
+/// `fit`, a linked folder and its target, `/var` and `/private/var` on
+/// macOS) get one key, before and after the job makes its folders. Case
+/// is not folded: on a case-insensitive file system `Fit` and `fit` are
+/// two keys.
+pub(crate) fn hold_key(p: &Path) -> PathBuf {
+    resolve(&absolute(p), &mut 0)
+}
+
+fn resolve(p: &Path, links: &mut usize) -> PathBuf {
+    use std::path::Component;
+    let mut real = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => real.push(c),
+            Component::CurDir => {}
+            // `real` holds no links, so its parent is where `..` goes.
+            Component::ParentDir => {
+                real.pop();
+            }
+            Component::Normal(name) => {
+                let next = real.join(name);
+                // Not a link, or not there yet: no target.
+                real = match std::fs::read_link(&next).ok() {
+                    Some(t) if *links < LINKS_MAX => {
+                        *links += 1;
+                        resolve(&real.join(t), links)
+                    }
+                    _ => next,
+                };
+            }
+        }
+    }
+    real
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    fn held_by(jobs: &Jobs, out: &Path) -> Option<String> {
+        jobs.holder(&[out.to_path_buf()]).map(|(id, _)| id)
+    }
+
+    #[test]
+    fn one_out_spelled_two_ways_is_held_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("runs")).unwrap();
+        let jobs = Jobs::default();
+        jobs.add("fit", "a fit", &[root.join("runs/../fit")]);
+        assert_eq!(held_by(&jobs, &root.join("fit")).as_deref(), Some("job-1"));
+        assert_eq!(
+            held_by(&jobs, &root.join("./fit/x")).as_deref(),
+            Some("job-1")
+        );
+        assert_eq!(held_by(&jobs, &root.join("other")), None);
+        // The holder is named as it was given.
+        let (_, given) = jobs.holder(&[root.join("fit")]).unwrap();
+        assert_eq!(given, root.join("runs/../fit"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_link_is_followed_before_the_dots_after_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("deep/real")).unwrap();
+        symlink(root.join("deep/real"), root.join("link")).unwrap();
+        // `link/../x` is `deep/x`, as the system resolves it, not `x`.
+        assert_eq!(
+            hold_key(&root.join("link/../x")),
+            hold_key(&root.join("deep/x"))
+        );
+        assert_ne!(hold_key(&root.join("link/../x")), hold_key(&root.join("x")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_linked_folder_is_its_target_before_and_after_it_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A relative link to a folder not made yet.
+        symlink("target", root.join("link")).unwrap();
+        let jobs = Jobs::default();
+        jobs.add("fit", "a fit", &[root.join("link/fit")]);
+        assert_eq!(
+            held_by(&jobs, &root.join("target/fit")).as_deref(),
+            Some("job-1")
+        );
+        std::fs::create_dir(root.join("target")).unwrap();
+        for out in ["target/fit", "link/fit"] {
+            assert_eq!(held_by(&jobs, &root.join(out)).as_deref(), Some("job-1"));
+        }
+        // The key matches the system's own resolution once it exists.
+        std::fs::write(root.join("target/fit"), "").unwrap();
+        assert_eq!(
+            hold_key(&root.join("link/fit")),
+            root.join("link/fit").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_link_loop_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        symlink(root.join("b"), root.join("a")).unwrap();
+        symlink(root.join("a"), root.join("b")).unwrap();
+        // Followed up to the cap, then taken as the link it stopped at.
+        let key = hold_key(&root.join("a/fit"));
+        let real = root.canonicalize().unwrap();
+        assert!(
+            key == real.join("a/fit") || key == real.join("b/fit"),
+            "{}",
+            key.display()
+        );
+        assert_eq!(key, hold_key(&root.join("a/fit")));
+    }
 }
