@@ -65,7 +65,7 @@ found again and redone without the agent:
 - `notebook` is a built-in tool: the agent opens the day with a plan (the
   question, the data, and how the result will be checked, after [2]), then
   records what it did and saw, and its conclusions.
-- `LEGUME_MCP_JOURNAL=off` keeps no records.
+- `LEGUME_MCP_RECORDS=off` keeps no records.
 
 [1] W. S. Noble, "A quick guide to organizing computational biology projects",
 PLoS Comput Biol 5(7): e1000424 (2009). doi:10.1371/journal.pcbi.1000424

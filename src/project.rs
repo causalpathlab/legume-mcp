@@ -44,7 +44,7 @@ use std::process::Command;
 /// The project root, when not the working directory.
 pub const ROOT_ENV: &str = "LEGUME_MCP_PROJECT";
 /// `off` keeps no records.
-pub const OFF_ENV: &str = "LEGUME_MCP_JOURNAL";
+pub const OFF_ENV: &str = "LEGUME_MCP_RECORDS";
 
 pub(crate) struct Project {
     root: PathBuf,
@@ -52,20 +52,30 @@ pub(crate) struct Project {
     version: String,
 }
 
-/// Local date and time, `YYYY-MM-DD` and `HH:MM:SS`.
+/// Local date and time, `YYYY-MM-DD` and `HH:MM:SS` (UTC where the local
+/// time cannot be had).
 fn now() -> (String, String) {
-    let local = Command::new("date")
-        .arg("+%F %T")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok());
-    let text = local.unwrap_or_else(utc);
-    let (d, t) = text
-        .trim()
-        .split_once(' ')
-        .unwrap_or(("1970-01-01", "00:00:00"));
-    (d.into(), t.into())
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    #[cfg(unix)]
+    {
+        let t = secs as libc::time_t;
+        // SAFETY: localtime_r only writes the struct it is given.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if !unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+            return (
+                format!(
+                    "{:04}-{:02}-{:02}",
+                    tm.tm_year + 1900,
+                    tm.tm_mon + 1,
+                    tm.tm_mday
+                ),
+                format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec),
+            );
+        }
+    }
+    utc(secs)
 }
 
 impl Project {
@@ -209,9 +219,7 @@ impl Project {
     pub(crate) fn command_line(&self, cmd: &Command, outputs: &[PathBuf]) -> String {
         let word = |s: &str| quote(&self.rel(s));
         let program = Path::new(cmd.get_program());
-        let own = std::env::current_exe().ok();
-        let is_self =
-            program == Path::new("/proc/self/exe") || own.as_deref().is_some_and(|e| e == program);
+        let is_self = crate::own_exe().is_some_and(|e| e == program);
         let mut words: Vec<String> = cmd
             .get_envs()
             .filter_map(|(k, v)| {
@@ -242,30 +250,31 @@ impl Project {
             .iter()
             .map(|o| format!("[ ! -e {} ]", word(&o.to_string_lossy())))
             .collect();
-        let dirs = self.mkdirs(outputs.iter().map(PathBuf::as_path));
+        let dirs = self
+            .mkdirs(outputs.iter().map(PathBuf::as_path))
+            .map_or(String::new(), |m| format!("{m}\n  "));
         format!("if {}; then\n  {dirs}{line}\nfi", missing.join(" || "))
     }
 
-    /// `mkdir -p` of the folders `paths` go in, project-relative, with a
-    /// line break and indent; empty when they all go in the project itself.
-    fn mkdirs<'a>(&self, paths: impl Iterator<Item = &'a Path>) -> String {
+    /// `mkdir -p` of the folders `paths` go in, project-relative; none when
+    /// they all go in the project itself.
+    fn mkdirs<'a>(&self, paths: impl Iterator<Item = &'a Path>) -> Option<String> {
         let mut dirs: Vec<String> = paths
             .filter_map(|p| Some(self.rel(&p.parent()?.to_string_lossy())))
             .filter(|d| !d.is_empty() && d != "." && d != &*self.root.to_string_lossy())
             .map(|d| quote(&d))
             .collect();
         dirs.dedup();
-        if dirs.is_empty() {
-            return String::new();
-        }
-        format!("mkdir -p {}\n  ", dirs.join(" "))
+        (!dirs.is_empty()).then(|| format!("mkdir -p {}", dirs.join(" ")))
     }
 
     /// A heredoc that writes `contents` to `path`: as it is when it is plain
     /// text (tabs and newlines), else base64, so no byte bash reads
     /// differently can end the heredoc early.
     pub(crate) fn file(&self, path: &Path, contents: &str) {
-        let dir = self.mkdirs(std::iter::once(path)).replace("\n  ", "\n");
+        let dir = self
+            .mkdirs(std::iter::once(path))
+            .map_or(String::new(), |m| format!("{m}\n"));
         let path = quote(&self.rel(&path.to_string_lossy()));
         if contents
             .chars()
@@ -398,11 +407,8 @@ pub(crate) fn quote(s: &str) -> String {
     }
 }
 
-/// Now in UTC, `YYYY-MM-DD HH:MM:SS`, where `date` cannot say the local time.
-fn utc() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+/// `secs` since 1970 in UTC, as [`now`] gives it.
+fn utc(secs: u64) -> (String, String) {
     let (days, rem) = (secs / 86_400, secs % 86_400);
     // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
     let z = days as i64 + 719_468;
@@ -414,11 +420,9 @@ fn utc() -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
-        rem / 3_600,
-        rem % 3_600 / 60,
-        rem % 60
+    (
+        format!("{y:04}-{m:02}-{d:02}"),
+        format!("{:02}:{:02}:{:02}", rem / 3_600, rem % 3_600 / 60, rem % 60),
     )
 }
 
@@ -499,6 +503,9 @@ mod tests {
     fn dates_are_iso() {
         let (d, t) = now();
         assert_eq!((d.len(), t.len()), (10, 8), "{d} {t}");
-        assert_eq!(utc().len(), 19);
+        assert_eq!(
+            utc(86_400 * 366 + 3_661),
+            ("1971-01-02".into(), "01:01:01".into())
+        );
     }
 }
