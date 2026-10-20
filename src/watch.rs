@@ -17,11 +17,16 @@
 //! a day are pruned when another starts. `LEGUME_MCP_WATCH=off` writes none;
 //! a path there puts the folders under it instead.
 //!
-//! The reader ([`live`], [`follow`], [`state`], [`control`]) has no UI in
-//! it, so every tool's viewer can follow its own server.
+//! The reader ([`live`], [`find`], [`follow`], [`state`], [`control`]) and
+//! the followed server as a person sees it ([`Agent`]) have no UI in them,
+//! so every tool's viewer can follow its own server; [`view`] (feature
+//! `tui`) draws it on a terminal.
 
+pub mod agent;
 #[cfg(feature = "tui")]
 pub mod view;
+
+pub use agent::{Action, Agent, CallView, Outcome, Status};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

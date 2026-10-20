@@ -579,7 +579,6 @@ dependencies = [
  "ratatui",
  "rustix",
  "signal-hook",
- "unicode-width",
 ]
 
 [[package]]
