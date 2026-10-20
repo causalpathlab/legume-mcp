@@ -55,6 +55,8 @@ pub const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26
 
 /// Lines of a failed child's stderr quoted in its error.
 const STDERR_TAIL: usize = 20;
+/// Lines of a child's stderr kept to find its error in.
+const STDERR_KEPT: usize = 400;
 /// How often a waiting child run looks for a cancellation.
 const POLL: Duration = Duration::from_millis(100);
 
@@ -237,10 +239,30 @@ impl Call {
     /// skips it when they all exist, and `results/INDEX.tsv` lists each
     /// with `summary` (one line: what was made, from what).
     pub fn run_making(&self, cmd: Command, outputs: &[PathBuf], summary: &str) -> Result<String> {
+        self.not_held(outputs)?;
         let bare = self.records.as_ref().map(|p| p.command(&cmd));
-        let result = self.run_child(cmd);
+        let result = self
+            .run_child(cmd)
+            .and_then(|out| made(outputs).map(|()| out));
         record_step(&self.records, &self.tool, bare, outputs, summary, &result);
         result
+    }
+
+    /// Refuse `outputs` a running job is writing, naming the job.
+    fn not_held(&self, outputs: &[PathBuf]) -> Result<()> {
+        match self.jobs.holder(outputs) {
+            None => Ok(()),
+            Some((job, path)) => {
+                let shown = path.display().to_string();
+                let shown = self
+                    .records
+                    .as_ref()
+                    .map_or(shown.clone(), |p| p.rel(&shown));
+                anyhow::bail!(
+                    "{shown} is being written by {job}: job_wait for it, or choose another out"
+                )
+            }
+        }
     }
 
     /// [`Self::run_making`] in the background, for a step longer than a
@@ -250,7 +272,8 @@ impl Call {
     /// id (a person can stop it there too); it is recorded when it ends, as
     /// a step that ran.
     pub fn spawn_job(&self, cmd: Command, outputs: &[PathBuf], summary: &str) -> Result<String> {
-        let job = self.jobs.add(&self.tool, summary);
+        self.not_held(outputs)?;
+        let job = self.jobs.add(&self.tool, summary, outputs);
         let id = job.id.clone();
         if let Some(f) = &self.feed {
             f.emit(Body::Call {
@@ -279,7 +302,8 @@ impl Call {
                         });
                     }
                 };
-                let result = run_child(cmd, &|| job.cancelled() || stopped(), &progress);
+                let result = run_child(cmd, &|| job.cancelled() || stopped(), &progress)
+                    .and_then(|out| made(&outputs).map(|()| out));
                 record_step(&records, &tool, bare, &outputs, &summary, &result);
                 let (state, text) = match &result {
                     Ok(out) => (JobState::Done, out.clone()),
@@ -341,14 +365,55 @@ fn record_step(
     }
 }
 
+/// Fail a step that exited well but left one of its `outputs` unwritten.
+fn made(outputs: &[PathBuf]) -> Result<()> {
+    let missing: Vec<String> = outputs
+        .iter()
+        .filter(|o| !o.exists())
+        .map(|o| o.display().to_string())
+        .collect();
+    anyhow::ensure!(
+        missing.is_empty(),
+        "finished without writing {}",
+        missing.join(", ")
+    );
+    Ok(())
+}
+
+/// What a failed child's stderr is quoted as: from its last `Error:` line
+/// (a Rust program's error, before any backtrace) when it has one, else its
+/// last lines; [`STDERR_TAIL`] lines either way.
+fn quote(lines: &VecDeque<String>) -> String {
+    let from = lines
+        .iter()
+        .rposition(|l| {
+            let l = l.trim_start();
+            l.starts_with("Error:") || l.starts_with("error:")
+        })
+        .unwrap_or(lines.len().saturating_sub(STDERR_TAIL));
+    let picked: Vec<&str> = lines
+        .iter()
+        .skip(from)
+        .take(STDERR_TAIL)
+        .map(String::as_str)
+        .collect();
+    picked.join("\n")
+}
+
 /// Run `cmd` to its end and return its stdout; each stderr line goes to
 /// `progress`; `cancelled` is asked as it runs, and kills the child when
-/// it says so; a failure quotes the last lines of its stderr.
+/// it says so; a failure quotes its error ([`quote`]). A Rust child prints
+/// no backtrace unless the tool asks for one: the agent reads the error.
 fn run_child(
     mut cmd: Command,
     cancelled: &dyn Fn() -> bool,
     progress: &dyn Fn(&str),
 ) -> Result<String> {
+    for var in ["RUST_BACKTRACE", "RUST_LIB_BACKTRACE"] {
+        if !cmd.get_envs().any(|(k, _)| k == var) {
+            cmd.env(var, "0");
+        }
+    }
     let shown = format!("{cmd:?}");
     let mut child = cmd
         .stdin(Stdio::null())
@@ -370,7 +435,7 @@ fn run_child(
             }
         }
     });
-    let mut tail = VecDeque::with_capacity(STDERR_TAIL);
+    let mut tail = VecDeque::with_capacity(STDERR_KEPT);
     let status = loop {
         if cancelled() {
             let _ = child.kill();
@@ -380,7 +445,7 @@ fn run_child(
         match rx.recv_timeout(POLL) {
             Ok(line) => {
                 progress(&line);
-                if tail.len() == STDERR_TAIL {
+                if tail.len() == STDERR_KEPT {
                     tail.pop_front();
                 }
                 tail.push_back(line);
@@ -397,8 +462,7 @@ fn run_child(
         .join()
         .map_err(|_| anyhow::anyhow!("reading the child's stdout"))??;
     if !status.success() {
-        let tail: Vec<String> = tail.into();
-        anyhow::bail!("{shown} failed ({status}):\n{}", tail.join("\n"));
+        anyhow::bail!("{shown} failed ({status}):\n{}", quote(&tail));
     }
     Ok(out)
 }

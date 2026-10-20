@@ -20,10 +20,15 @@ impl Handler for Tools {
     fn call(&mut self, _name: &str, args: Value, cx: &Call) -> Result<Vec<Content>> {
         let out = PathBuf::from(args["out"].as_str().unwrap());
         let mut cmd = Command::new("sh");
+        // `write: false` exits well without writing its output.
+        let touch = if args["write"] == false {
+            String::new()
+        } else {
+            format!("touch '{}';", out.display())
+        };
         let script = format!(
-            "echo fitting >&2; sleep {}; touch '{}'; printf fitted",
-            args["seconds"],
-            out.display()
+            "echo fitting >&2; sleep {}; {touch} printf fitted",
+            args["seconds"]
         );
         cmd.args(["-c", &script]);
         let id = cx.spawn_job(cmd, std::slice::from_ref(&out), "a model fit")?;
@@ -138,6 +143,48 @@ fn a_long_step_runs_as_a_job_and_is_recorded_when_it_ends() {
     let all = c.call("job_status", json!({}));
     assert_eq!(structured(&all)["jobs"].as_array().unwrap().len(), 3);
     assert!(c.call("job_wait", json!({ "id": "job-9" }))["isError"] == true);
+
+    // A running job's output is reserved: a second call for it is refused,
+    // naming the job, until the job ends.
+    let held = project.join("held");
+    let first = structured(&c.call("fit", json!({ "out": held, "seconds": 30 })))["job"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let refused = c.call("fit", json!({ "out": held, "seconds": 1 }));
+    assert_eq!(refused["isError"], true, "{refused}");
+    let why = refused["content"][0]["text"].as_str().unwrap();
+    assert!(
+        why.contains(&format!("is being written by {first}")),
+        "{why}"
+    );
+    c.call("job_cancel", json!({ "id": first }));
+    c.call("job_wait", json!({ "id": first, "seconds": 10 }));
+    let again = c.call("fit", json!({ "out": held, "seconds": 0 }));
+    assert_ne!(
+        again["isError"], true,
+        "free again once the job ended: {again}"
+    );
+    let id = structured(&again)["job"].as_str().unwrap().to_string();
+    c.call("job_wait", json!({ "id": id, "seconds": 10 }));
+
+    // Exiting well without writing its output is a failure, not recorded.
+    let unwritten = project.join("never");
+    let quiet = structured(&c.call(
+        "fit",
+        json!({ "out": unwritten, "seconds": 0, "write": false }),
+    ))["job"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let w = c.call("job_wait", json!({ "id": quiet, "seconds": 10 }));
+    assert_eq!(structured(&w)["state"], "failed", "{w}");
+    assert!(structured(&w)["error"]
+        .as_str()
+        .unwrap()
+        .contains("finished without writing"));
+    let index = std::fs::read_to_string(project.join("results/INDEX.tsv")).unwrap();
+    assert!(!index.contains("never"), "{index}");
     assert!(!project.join("a").exists() && !project.join("b").exists());
 
     // A person following sees each job as a call of its own.
