@@ -35,7 +35,38 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
-Register a server with a client, e.g. `claude mcp add lupin -- lupin mcp`.
+## Connecting any client
+
+A legume server is a plain MCP server on stdio, so any MCP client and any model
+can use it: `lupin mcp`, `senna mcp`, `pinto mcp`, `data-beans mcp`. A client
+needs the command and where the project is. The records go to the server's
+working directory, or to `LEGUME_MCP_PROJECT` when set; set it whenever the
+client may start servers elsewhere (desktop apps usually do). Most clients
+(Claude Desktop, Cursor, Gemini CLI, and others) take this shape:
+
+```json
+{
+  "mcpServers": {
+    "lupin": {
+      "command": "lupin",
+      "args": ["mcp"],
+      "env": { "LEGUME_MCP_PROJECT": "/path/to/project" }
+    }
+  }
+}
+```
+
+Claude Code: `claude mcp add lupin -e LEGUME_MCP_PROJECT="$PWD" -- lupin mcp`.
+VS Code takes `"servers"` with `"type": "stdio"` in `.vscode/mcp.json`; Codex
+CLI takes `[mcp_servers.lupin]` with `command`, `args` and `env` in
+`~/.codex/config.toml`. Key names differ between clients; the server needs only
+the command, its arguments and, optionally, the environment.
+
+Each server sends its workflow to the agent when it connects (the MCP
+`instructions`, with the records note below added). A client that does not pass
+those to its model can be given the same text in the agent's own instructions
+(an `AGENTS.md`, a system prompt); each tool's README has it. Every server also
+offers the `notebook` tool for the agent's plan, observations and conclusions.
 
 ## Watching and steering
 
