@@ -20,6 +20,9 @@
 //! The reader ([`live`], [`follow`], [`state`], [`control`]) has no UI in
 //! it, so every tool's viewer can follow its own server.
 
+#[cfg(feature = "tui")]
+pub mod view;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -36,6 +39,9 @@ pub const ENV: &str = "LEGUME_MCP_WATCH";
 const TEXT_CAP: usize = 4096;
 /// Folders of servers gone this long are pruned.
 const KEEP_ENDED: Duration = Duration::from_secs(24 * 3600);
+/// How long a stop or a note waits for the server to take it: longer than
+/// the server waits on a client, so a slow server is not cut off.
+const SEND_WAIT: Duration = Duration::from_secs(5);
 /// How often a follower at the end of the feed looks for more.
 const POLL: Duration = Duration::from_millis(200);
 /// How long the control socket waits on one client's command or reply.
@@ -300,6 +306,9 @@ impl Control {
     fn send(&self, msg: &Value) -> Result<()> {
         let mut s = std::os::unix::net::UnixStream::connect(&self.socket)
             .with_context(|| format!("connecting to {}", self.socket.display()))?;
+        // A server that hangs leaves the person's screen waiting no longer.
+        s.set_read_timeout(Some(SEND_WAIT))?;
+        s.set_write_timeout(Some(SEND_WAIT))?;
         writeln!(s, "{msg}")?;
         let mut reply = String::new();
         BufReader::new(s).read_line(&mut reply)?;

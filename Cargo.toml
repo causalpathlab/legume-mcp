@@ -27,9 +27,21 @@ log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
+# The person's view of a server (`watch::view`), for `<tool> mcp watch`.
+# `child` for its log-line cleaning (no colours, no "[time LEVEL]" prefix).
+legume-tui = { version = "0.3.13", default-features = false, features = ["child"], optional = true }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }
+
+[features]
+tui = ["dep:legume-tui", "dep:ratatui"]
+
 [target.'cfg(unix)'.dependencies]
 # geteuid and O_NOFOLLOW, to leave alone record files this user does not own.
 libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[[test]]
+name = "watch_view"
+required-features = ["tui"]
