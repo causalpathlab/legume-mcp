@@ -40,6 +40,9 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+
+use crate::watch::{Body, Feed};
 
 /// The project root, when not the working directory.
 pub const ROOT_ENV: &str = "LEGUME_MCP_PROJECT";
@@ -50,11 +53,14 @@ pub(crate) struct Project {
     root: PathBuf,
     name: String,
     version: String,
+    /// The server's feed, which hears of each script block and notebook
+    /// entry too.
+    feed: Option<Arc<Feed>>,
 }
 
-/// Local date and time, `YYYY-MM-DD` and `HH:MM:SS` (UTC where the local
-/// time cannot be had).
-fn now() -> (String, String) {
+/// Local date and time, `YYYY-MM-DD` and `HH:MM:SS`, and the offset from
+/// UTC in seconds (UTC where the local time cannot be had).
+fn local_now() -> (String, String, i64) {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -72,10 +78,28 @@ fn now() -> (String, String) {
                     tm.tm_mday
                 ),
                 format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec),
+                // c_long: i64 on 64-bit targets, i32 on 32-bit ones.
+                #[allow(clippy::useless_conversion)]
+                i64::from(tm.tm_gmtoff),
             );
         }
     }
-    utc(secs)
+    let (d, t) = utc(secs);
+    (d, t, 0)
+}
+
+/// Local date and time, `YYYY-MM-DD` and `HH:MM:SS`.
+fn now() -> (String, String) {
+    let (d, t, _) = local_now();
+    (d, t)
+}
+
+/// Now, local, as RFC 3339 (`2026-10-20T12:03:33-07:00`).
+pub(crate) fn rfc3339() -> String {
+    let (d, t, off) = local_now();
+    let sign = if off < 0 { '-' } else { '+' };
+    let off = off.abs();
+    format!("{d}T{t}{sign}{:02}:{:02}", off / 3600, off % 3600 / 60)
 }
 
 impl Project {
@@ -84,7 +108,14 @@ impl Project {
             root: std::path::absolute(&root).unwrap_or(root),
             name: name.into(),
             version: version.into(),
+            feed: None,
         }
+    }
+
+    /// The project, telling `feed` of what it records.
+    pub(crate) fn watched(mut self, feed: Option<Arc<Feed>>) -> Self {
+        self.feed = feed;
+        self
     }
 
     /// The project [`ROOT_ENV`] and [`OFF_ENV`] say: none when `off`.
@@ -190,6 +221,11 @@ impl Project {
             )
         };
         self.append(&dir.join("runall.sh"), 0o700, head, text);
+        if let Some(f) = &self.feed {
+            f.emit(Body::Record {
+                line: text.trim_matches('\n').into(),
+            });
+        }
     }
 
     /// The comment a tool call starts with.
@@ -340,6 +376,12 @@ impl Project {
             text.trim_end()
         );
         self.append(&dir.join("notebook.md"), 0o644, head, &entry);
+        if let Some(f) = &self.feed {
+            f.emit(Body::Notebook {
+                entry: kind.into(),
+                text: text.into(),
+            });
+        }
     }
 
     /// A line of `data/README.md`: where input `path` came from.

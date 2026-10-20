@@ -25,6 +25,9 @@
 //!   make their inputs through [`Call::write_file`], and put default
 //!   outputs under [`Call::results_dir`], so a user can find and redo an
 //!   agent's work without the agent.
+//! - [`serve`] also writes a feed a person can follow live, and takes their
+//!   stop and note commands (see [`watch`]); tools publish their view with
+//!   [`Call::state`].
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -40,7 +43,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub mod project;
+pub mod watch;
 use project::Project;
+use watch::{Body, Feed, Steer};
 
 /// Protocol revisions this server speaks, newest first. A client asking for
 /// one of them gets it; any other gets the newest.
@@ -133,9 +138,22 @@ pub struct Call {
     cancelled: Cancelled,
     tool: String,
     records: Records,
+    /// The request id as the feed and the control socket name it.
+    key: String,
+    feed: Option<Arc<Feed>>,
+    steer: Arc<Mutex<Steer>>,
 }
 
 impl Call {
+    /// Publish the tool's view (what a person following the server should
+    /// see now: a map's settings, the round in hand): `state.json` in the
+    /// server's watch folder, and an event in its feed.
+    pub fn state(&self, state: &Value) {
+        if let Some(f) = &self.feed {
+            f.state(&self.key, state);
+        }
+    }
+
     /// Write `contents` to `path`: an input the tool makes for a child (a
     /// decisions file, say), kept in the driver script as a heredoc.
     pub fn write_file(&self, path: &Path, contents: &str) -> Result<()> {
@@ -164,14 +182,27 @@ impl Call {
         }
     }
 
-    /// Whether the client has cancelled this call.
+    /// Whether the client cancelled this call, or the person following the
+    /// server stopped it.
     pub fn is_cancelled(&self) -> bool {
         let set = self.cancelled.lock().unwrap_or_else(|e| e.into_inner());
-        set.contains(&self.id)
+        set.contains(&self.id) || self.is_stopped()
     }
 
-    /// Tell the client what the call is doing, when it asked to hear.
+    fn is_stopped(&self) -> bool {
+        let steer = self.steer.lock().unwrap_or_else(|e| e.into_inner());
+        steer.stopped.contains(&self.key)
+    }
+
+    /// Tell the client what the call is doing, when it asked to hear, and
+    /// whoever follows the server.
     pub fn progress(&self, message: &str) {
+        if let Some(f) = &self.feed {
+            f.emit(Body::Progress {
+                id: self.key.clone(),
+                message: message.into(),
+            });
+        }
         let Some(token) = &self.token else { return };
         let n = self.step.fetch_add(1, Ordering::Relaxed) + 1;
         send(
@@ -305,15 +336,28 @@ where
 }
 
 /// Serve `handler` on stdin and stdout until stdin closes, keeping the
-/// records of the project [`project::ROOT_ENV`] and [`project::OFF_ENV`] say.
+/// records of the project [`project::ROOT_ENV`] and [`project::OFF_ENV`] say,
+/// and a feed to follow where [`watch::ENV`] says.
 pub fn serve(info: ServerInfo, handler: impl Handler) -> Result<()> {
-    serve_in(
+    let options = Options {
+        project: Project::root_from_env(),
+        watch: watch::base(),
+    };
+    serve_with(
         BufReader::new(std::io::stdin()),
         std::io::stdout(),
         info,
-        Project::root_from_env(),
+        options,
         handler,
     )
+}
+
+/// Where a server keeps what it keeps: the project for its records, and
+/// the folder its feed's folder goes in ([`watch`]).
+#[derive(Clone, Debug, Default)]
+pub struct Options {
+    pub project: Option<PathBuf>,
+    pub watch: Option<PathBuf>,
 }
 
 /// [`serve`] on any input and output (tests, sockets), keeping no records.
@@ -322,7 +366,7 @@ where
     R: BufRead + Send + 'static,
     W: Write + Send + 'static,
 {
-    serve_in(input, output, info, None, handler)
+    serve_with(input, output, info, Options::default(), handler)
 }
 
 /// What the agent is told about the records, after the server's own
@@ -357,16 +401,48 @@ fn notebook_spec() -> ToolSpec {
 pub fn serve_in<R, W>(
     input: R,
     output: W,
-    mut info: ServerInfo,
+    info: ServerInfo,
     project: Option<PathBuf>,
+    handler: impl Handler,
+) -> Result<()>
+where
+    R: BufRead + Send + 'static,
+    W: Write + Send + 'static,
+{
+    let options = Options {
+        project,
+        watch: None,
+    };
+    serve_with(input, output, info, options, handler)
+}
+
+/// [`serve_on`] with the records and the feed `options` ask for.
+pub fn serve_with<R, W>(
+    input: R,
+    output: W,
+    mut info: ServerInfo,
+    options: Options,
     mut handler: impl Handler,
 ) -> Result<()>
 where
     R: BufRead + Send + 'static,
     W: Write + Send + 'static,
 {
-    let records: Records = project.map(|root| {
-        let p = Project::new(root, &info.name, &info.version);
+    let feed: Option<Arc<Feed>> = options.watch.as_deref().and_then(|base| {
+        let meta = watch::Meta {
+            server: info.name.clone(),
+            version: info.version.clone(),
+            pid: std::process::id(),
+            project: options.project.clone(),
+            started: project::rfc3339(),
+        };
+        Feed::start(base, meta)
+            .inspect_err(|e| log::warn!("mcp feed under {}: {e}", base.display()))
+            .ok()
+            .map(Arc::new)
+    });
+    let records: Records = options.project.map(|root| {
+        let p = Project::new(root, &info.name, &info.version).watched(feed.clone());
         let note = RECORDS_NOTE.replace("{root}", &p.root().display().to_string());
         info.instructions = Some(match info.instructions.take() {
             Some(text) => format!("{text}\n\n{note}"),
@@ -374,6 +450,19 @@ where
         });
         Arc::new(p)
     });
+    let steer: Arc<Mutex<Steer>> = Arc::default();
+    #[cfg(unix)]
+    if let Some(f) = &feed {
+        let records = records.clone();
+        let listening = f.listen(steer.clone(), move |text| {
+            if let Some(p) = &records {
+                p.notebook("user", text);
+            }
+        });
+        if let Err(e) = listening {
+            log::warn!("mcp control socket in {}: {e}", f.dir().display());
+        }
+    }
     let out: Out = Arc::new(Mutex::new(Box::new(output)));
     let cancelled: Cancelled = Arc::default();
     let (tx, rx) = channel::<Value>();
@@ -470,9 +559,26 @@ where
                     Some(a) if !a.is_null() => a.clone(),
                     _ => json!({}),
                 };
+                let key = id.as_str().map_or_else(|| id.to_string(), str::to_string);
                 if let Some(p) = &records {
                     p.call(name, &args);
                 }
+                if let Some(f) = &feed {
+                    f.emit(Body::Call {
+                        id: key.clone(),
+                        tool: name.into(),
+                        args: args.clone(),
+                    });
+                }
+                let started = std::time::Instant::now();
+                let done = Done {
+                    out: &out,
+                    feed: feed.as_deref(),
+                    steer: &steer,
+                    id,
+                    key: &key,
+                    started,
+                };
                 if builtin_notebook && name == "notebook" {
                     let p = records.as_ref().expect("a built-in notebook has records");
                     let result = match (args["kind"].as_str(), args["text"].as_str()) {
@@ -482,13 +588,16 @@ where
                         }
                         _ => Err(anyhow::anyhow!("`kind` and `text` are required")),
                     };
-                    respond(&out, id, call_result(result));
+                    done.respond(call_result(result));
                     continue;
                 }
                 let cx = Call {
                     tool: name.to_string(),
                     records: records.clone(),
                     id: id.to_string(),
+                    key: key.clone(),
+                    feed: feed.clone(),
+                    steer: steer.clone(),
                     token: params["_meta"].get("progressToken").cloned(),
                     step: AtomicU64::new(0),
                     out: out.clone(),
@@ -503,13 +612,24 @@ where
                             .unwrap_or("panic");
                         Err(anyhow::anyhow!("{name} panicked: {what}"))
                     });
-                let was_cancelled = cx.is_cancelled();
-                cancelled
+                let stopped = steer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .stopped
+                    .remove(&key);
+                let by_client = cancelled
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&cx.id);
-                if !was_cancelled {
-                    respond(&out, id, call_result(result));
+                if stopped {
+                    // The person stopped it: unlike a client's cancel, the
+                    // client is still owed an answer.
+                    done.cancelled("user");
+                    done.respond(call_result(Err(anyhow::anyhow!("stopped by the user"))));
+                } else if by_client {
+                    done.cancelled("client");
+                } else {
+                    done.respond(call_result(result));
                 }
             }
             _ => fail(&out, id, -32601, &format!("method not found: {method}")),
@@ -518,6 +638,43 @@ where
     reader
         .join()
         .map_err(|_| anyhow::anyhow!("the stdin reader panicked"))
+}
+
+/// How a tool call ends: its answer, with the person's notes, to the client
+/// and the feed.
+struct Done<'a> {
+    out: &'a Out,
+    feed: Option<&'a Feed>,
+    steer: &'a Mutex<Steer>,
+    id: &'a Value,
+    key: &'a str,
+    started: std::time::Instant,
+}
+
+impl Done<'_> {
+    /// Answer with `result`, the notes left since the last answer added.
+    fn respond(&self, mut result: Value) {
+        let notes = std::mem::take(&mut self.steer.lock().unwrap_or_else(|e| e.into_inner()).notes);
+        if let Some(content) = result["content"].as_array_mut() {
+            for n in notes {
+                let text = format!("Note from the user: {n}");
+                content.push(json!({ "type": "text", "text": text }));
+            }
+        }
+        if let Some(f) = self.feed {
+            f.result(self.key, &result, self.started.elapsed().as_millis() as u64);
+        }
+        respond(self.out, self.id, result);
+    }
+
+    fn cancelled(&self, by: &str) {
+        if let Some(f) = self.feed {
+            f.emit(Body::Cancelled {
+                id: self.key.into(),
+                by: by.into(),
+            });
+        }
+    }
 }
 
 fn initialize(info: &ServerInfo, params: &Value) -> Value {

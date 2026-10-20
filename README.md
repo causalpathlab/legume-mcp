@@ -37,6 +37,20 @@ fn main() -> anyhow::Result<()> {
 
 Register a server with a client, e.g. `claude mcp add lupin -- lupin mcp`.
 
+## Watching and steering
+
+While an agent works, each server writes what it is doing to an owner-only
+folder, `$XDG_RUNTIME_DIR/legume-mcp/<server>-<pid>/`: `meta.json`, a feed of
+events (`feed.jsonl`: calls, progress, results, the tool's view, steps added
+to `runall.sh`, notebook entries, notes), the tool's current view
+(`state.json`, published with `Call::state`) and a control socket. A person
+follows it from a terminal with `legume_mcp::watch` (`live`, `follow`,
+`state`) and can steer through `watch::control`: `stop` a call (its child is
+killed and the agent is told the user stopped it) or leave a `note` (it comes
+with the agent's next tool result and goes into the notebook). The feed is
+for watching; the records below stay the account to redo the work from.
+`LEGUME_MCP_WATCH=off` writes none; a path puts the folders under it.
+
 ## Project records
 
 Every server keeps the same records under the project (its working
