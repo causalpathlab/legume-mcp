@@ -324,7 +324,7 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
         "{script}"
     );
     assert!(
-        script.contains(" t echo {\"a\":1}\n"),
+        script.contains(" t 0 echo {\"a\":1}\n"),
         "every call is a comment: {script}"
     );
     assert!(

@@ -185,7 +185,8 @@ impl Project {
     /// The comment a tool call starts with.
     pub(crate) fn call(&self, tool: &str, args: &Value) {
         let args = self.rel(&args.to_string());
-        self.script(&format!("\n# {} {} {tool} {args}\n", now().1, self.name));
+        let (name, version) = (&self.name, &self.version);
+        self.script(&format!("\n# {} {name} {version} {tool} {args}\n", now().1));
     }
 
     /// `s` with the project's root dropped from the paths in it.
