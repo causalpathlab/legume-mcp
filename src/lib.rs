@@ -42,8 +42,10 @@ use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod jobs;
 pub mod project;
 pub mod watch;
+use jobs::{Jobs, State as JobState};
 use project::Project;
 use watch::{Body, Feed, Steer};
 
@@ -142,6 +144,7 @@ pub struct Call {
     key: String,
     feed: Option<Arc<Feed>>,
     steer: Arc<Mutex<Steer>>,
+    jobs: Arc<Jobs>,
 }
 
 impl Call {
@@ -236,78 +239,168 @@ impl Call {
     pub fn run_making(&self, cmd: Command, outputs: &[PathBuf], summary: &str) -> Result<String> {
         let bare = self.records.as_ref().map(|p| p.command(&cmd));
         let result = self.run_child(cmd);
-        if let (Some(p), Some(bare)) = (&self.records, bare) {
-            let line = p.guarded(&bare, outputs);
-            match &result {
-                Ok(_) => {
-                    p.script_step(&format!("{line}\n"), Some(&bare));
-                    p.index(&self.tool, outputs, summary);
-                }
-                Err(e) => {
-                    let why = p.rel(&format!("{e:#}"));
-                    let why = why.lines().next().unwrap_or_default();
-                    let commented: String = line.lines().map(|l| format!("#   {l}\n")).collect();
-                    p.script(&format!("# did not succeed ({why}):\n{commented}"));
-                }
-            }
-        }
+        record_step(&self.records, &self.tool, bare, outputs, summary, &result);
         result
     }
 
-    fn run_child(&self, mut cmd: Command) -> Result<String> {
-        let shown = format!("{cmd:?}");
-        let mut child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("starting {shown}"))?;
-        let mut stdout = child.stdout.take().context("child stdout")?;
-        let stderr = child.stderr.take().context("child stderr")?;
-        let reader = std::thread::spawn(move || {
-            let mut s = String::new();
-            stdout.read_to_string(&mut s).map(|_| s)
-        });
-        let (tx, rx) = channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        let mut tail = VecDeque::with_capacity(STDERR_TAIL);
-        let status = loop {
-            if self.is_cancelled() {
-                let _ = child.kill();
-                let _ = child.wait();
-                anyhow::bail!("cancelled");
-            }
-            match rx.recv_timeout(POLL) {
-                Ok(line) => {
-                    self.progress(&line);
-                    if tail.len() == STDERR_TAIL {
-                        tail.pop_front();
-                    }
-                    tail.push_back(line);
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                // stderr is closed: the child is ending, or ended.
-                Err(RecvTimeoutError::Disconnected) => match child.try_wait()? {
-                    Some(status) => break status,
-                    None => std::thread::sleep(POLL),
-                },
-            }
-        };
-        let out = reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("reading the child's stdout"))??;
-        if !status.success() {
-            let tail: Vec<String> = tail.into();
-            anyhow::bail!("{shown} failed ({status}):\n{}", tail.join("\n"));
+    /// [`Self::run_making`] in the background, for a step longer than a
+    /// client waits on one call: it returns the job's id (`job-N`) at once,
+    /// for the tool to give the agent, who follows it with `job_status`,
+    /// `job_wait` and `job_cancel`. The job's log goes to the feed under its
+    /// id (a person can stop it there too); it is recorded when it ends, as
+    /// a step that ran.
+    pub fn spawn_job(&self, cmd: Command, outputs: &[PathBuf], summary: &str) -> Result<String> {
+        let job = self.jobs.add(&self.tool, summary);
+        let id = job.id.clone();
+        if let Some(f) = &self.feed {
+            f.emit(Body::Call {
+                id: id.clone(),
+                tool: format!("{} (job)", self.tool),
+                args: json!({ "summary": summary, "from": self.key }),
+            });
         }
-        Ok(out)
+        let bare = self.records.as_ref().map(|p| p.command(&cmd));
+        let (records, feed, steer) = (self.records.clone(), self.feed.clone(), self.steer.clone());
+        let (tool, outputs, summary) = (self.tool.clone(), outputs.to_vec(), summary.to_string());
+        let started = std::time::Instant::now();
+        std::thread::Builder::new()
+            .name(id.clone())
+            .spawn(move || {
+                let stopped = || {
+                    let s = steer.lock().unwrap_or_else(|e| e.into_inner());
+                    s.stopped.contains(&job.id)
+                };
+                let progress = |line: &str| {
+                    job.line(line);
+                    if let Some(f) = &feed {
+                        f.emit(Body::Progress {
+                            id: job.id.clone(),
+                            message: line.into(),
+                        });
+                    }
+                };
+                let result = run_child(cmd, &|| job.cancelled() || stopped(), &progress);
+                record_step(&records, &tool, bare, &outputs, &summary, &result);
+                let (state, text) = match &result {
+                    Ok(out) => (JobState::Done, out.clone()),
+                    Err(_) if job.cancelled() || stopped() => {
+                        if let Some(f) = &feed {
+                            let by = if stopped() { "user" } else { "client" };
+                            f.emit(Body::Cancelled {
+                                id: job.id.clone(),
+                                by: by.into(),
+                            });
+                        }
+                        (JobState::Cancelled, "cancelled".to_string())
+                    }
+                    Err(e) => (JobState::Failed, format!("{e:#}")),
+                };
+                if let Some(f) = &feed {
+                    let ok = state == JobState::Done;
+                    let result =
+                        json!({ "content": [{ "type": "text", "text": text }], "isError": !ok });
+                    f.result(&job.id, &result, started.elapsed().as_millis() as u64);
+                }
+                job.end(state, text);
+            })
+            .context("starting a job")?;
+        Ok(id)
     }
+
+    fn run_child(&self, cmd: Command) -> Result<String> {
+        run_child(cmd, &|| self.is_cancelled(), &|line| self.progress(line))
+    }
+}
+
+/// Record a step that ran `bare` (when records are kept): its guarded line
+/// in the driver script and its outputs in the index when it succeeded, a
+/// commented line saying why when it did not.
+fn record_step(
+    records: &Records,
+    tool: &str,
+    bare: Option<String>,
+    outputs: &[PathBuf],
+    summary: &str,
+    result: &Result<String>,
+) {
+    let (Some(p), Some(bare)) = (records, bare) else {
+        return;
+    };
+    let line = p.guarded(&bare, outputs);
+    match result {
+        Ok(_) => {
+            p.script_step(&format!("{line}\n"), Some(&bare));
+            p.index(tool, outputs, summary);
+        }
+        Err(e) => {
+            let why = p.rel(&format!("{e:#}"));
+            let why = why.lines().next().unwrap_or_default();
+            let commented: String = line.lines().map(|l| format!("#   {l}\n")).collect();
+            p.script(&format!("# did not succeed ({why}):\n{commented}"));
+        }
+    }
+}
+
+/// Run `cmd` to its end and return its stdout; each stderr line goes to
+/// `progress`; `cancelled` is asked as it runs, and kills the child when
+/// it says so; a failure quotes the last lines of its stderr.
+fn run_child(
+    mut cmd: Command,
+    cancelled: &dyn Fn() -> bool,
+    progress: &dyn Fn(&str),
+) -> Result<String> {
+    let shown = format!("{cmd:?}");
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("starting {shown}"))?;
+    let mut stdout = child.stdout.take().context("child stdout")?;
+    let stderr = child.stderr.take().context("child stderr")?;
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        stdout.read_to_string(&mut s).map(|_| s)
+    });
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut tail = VecDeque::with_capacity(STDERR_TAIL);
+    let status = loop {
+        if cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("cancelled");
+        }
+        match rx.recv_timeout(POLL) {
+            Ok(line) => {
+                progress(&line);
+                if tail.len() == STDERR_TAIL {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            // stderr is closed: the child is ending, or ended.
+            Err(RecvTimeoutError::Disconnected) => match child.try_wait()? {
+                Some(status) => break status,
+                None => std::thread::sleep(POLL),
+            },
+        }
+    };
+    let out = reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("reading the child's stdout"))??;
+    if !status.success() {
+        let tail: Vec<String> = tail.into();
+        anyhow::bail!("{shown} failed ({status}):\n{}", tail.join("\n"));
+    }
+    Ok(out)
 }
 
 /// This server's own binary: where it was started from, or, once that file
@@ -380,6 +473,44 @@ without you; results/INDEX.tsv lists each output with a summary. Use the \
 `notebook` tool: before starting, a `plan` (the question, the data, and how the \
 result will be checked); then what you did and saw, and your conclusions. Tell \
 the user where these are when the work is done.";
+
+/// The built-in tools that follow jobs ([`Call::spawn_job`]).
+const JOB_TOOLS: [&str; 3] = ["job_status", "job_wait", "job_cancel"];
+
+fn job_specs() -> Vec<ToolSpec> {
+    let id = json!({ "type": "string", "description": "The job's id (job-N), as the tool that started it gave it" });
+    vec![
+        ToolSpec::new(
+            "job_status",
+            "A background job's state (running, done, failed, cancelled), its last log lines and, once done, its output; without `id`, every job of this server.",
+            json!({ "type": "object", "properties": { "id": id } }),
+        ),
+        ToolSpec::new(
+            "job_wait",
+            "Wait for a background job to end, up to `seconds` (30; at most 120), then its status as job_status gives it. Call again while it is still running.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": id,
+                    "seconds": { "type": "integer", "minimum": 1, "maximum": jobs::WAIT_MAX },
+                },
+                "required": ["id"],
+            }),
+        ),
+        ToolSpec::new(
+            "job_cancel",
+            "Stop a background job: its child is killed, and nothing it would have written is recorded.",
+            json!({ "type": "object", "properties": { "id": id }, "required": ["id"] }),
+        ),
+    ]
+}
+
+/// What the agent is told about jobs, after the server's instructions.
+const JOBS_NOTE: &str = "\
+A tool may run a long step as a background job and return its id (job-N) at \
+once: follow it with job_status or job_wait (wait again while it runs), and \
+stop it with job_cancel. Its outputs exist once it is done; do not use them \
+before. Jobs end when this server does.";
 
 /// The built-in tool every server with records offers.
 fn notebook_spec() -> ToolSpec {
@@ -527,6 +658,15 @@ where
     if builtin_notebook {
         specs.push(notebook_spec());
     }
+    let jobs: Arc<Jobs> = Arc::default();
+    let builtin_jobs = !specs.iter().any(|t| JOB_TOOLS.contains(&t.name.as_str()));
+    if builtin_jobs {
+        specs.extend(job_specs());
+        info.instructions = Some(match info.instructions.take() {
+            Some(text) => format!("{text}\n\n{JOBS_NOTE}"),
+            None => JOBS_NOTE.to_string(),
+        });
+    }
     for msg in rx {
         let Some(method) = msg.get("method").and_then(Value::as_str) else {
             continue; // a response to a request we never send
@@ -580,6 +720,20 @@ where
                     key: &key,
                     started,
                 };
+                if builtin_jobs && JOB_TOOLS.contains(&name) {
+                    let id = args["id"].as_str();
+                    let result = match (name, id) {
+                        ("job_status", id) => jobs.status(id),
+                        ("job_wait", Some(id)) => {
+                            let seconds = args["seconds"].as_u64().unwrap_or(30);
+                            jobs.wait(id, seconds)
+                        }
+                        ("job_cancel", Some(id)) => jobs.cancel(id),
+                        _ => Err(anyhow::anyhow!("`id` is required")),
+                    };
+                    done.respond(call_result(result.map(|v| vec![Content::Json(v)])));
+                    continue;
+                }
                 if builtin_notebook && name == "notebook" {
                     let p = records.as_ref().expect("a built-in notebook has records");
                     let result = match (args["kind"].as_str(), args["text"].as_str()) {
@@ -599,6 +753,7 @@ where
                     key: key.clone(),
                     feed: feed.clone(),
                     steer: steer.clone(),
+                    jobs: jobs.clone(),
                     token: params["_meta"].get("progressToken").cloned(),
                     step: AtomicU64::new(0),
                     out: out.clone(),
@@ -639,6 +794,8 @@ where
     let result = reader
         .join()
         .map_err(|_| anyhow::anyhow!("the stdin reader panicked"));
+    // Jobs end with their server.
+    jobs.stop_all();
     if let Some(f) = &feed {
         f.emit(Body::Ended { ok: result.is_ok() });
     }
