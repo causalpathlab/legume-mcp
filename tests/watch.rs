@@ -182,3 +182,37 @@ fn a_person_follows_stops_and_leaves_a_note() {
         "{notebook}"
     );
 }
+
+#[test]
+fn a_folder_too_deep_for_a_socket_still_gets_its_feed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().join("x".repeat(110));
+    let options = Options {
+        project: None,
+        watch: Some(base.clone()),
+    };
+    let info = ServerInfo {
+        name: "t".into(),
+        version: "0".into(),
+        instructions: None,
+    };
+    serve_with(
+        std::io::Cursor::new(""),
+        std::io::sink(),
+        info,
+        options,
+        Tools,
+    )
+    .unwrap();
+    let found = watch::live_in(&base).pop().expect("the server's folder");
+    assert!(
+        !found.dir.join("control.sock").exists(),
+        "no socket it could not bind"
+    );
+    let events: Vec<Body> = watch::follow(&found.dir, From::Start)
+        .unwrap()
+        .map(|e| e.body)
+        .collect();
+    assert!(matches!(events.first(), Some(Body::Server(_))));
+    assert_eq!(events.last(), Some(&Body::Ended { ok: true }));
+}

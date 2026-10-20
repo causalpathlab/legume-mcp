@@ -444,6 +444,17 @@ impl Feed {
         on_note: impl Fn(&str) + Send + 'static,
     ) -> std::io::Result<()> {
         let path = self.dir.join("control.sock");
+        // A socket's path has room for 103 bytes on macOS, 107 on Linux.
+        let room = if cfg!(target_os = "macos") { 103 } else { 107 };
+        let len = path.as_os_str().len();
+        if len > room {
+            return Err(std::io::Error::other(format!(
+                "{} is {len} bytes, more than a socket path can hold ({room}): \
+                 the feed is written but stop and note are off; set {ENV} to a \
+                 shorter folder",
+                path.display()
+            )));
+        }
         let _ = std::fs::remove_file(&path);
         let listener = std::os::unix::net::UnixListener::bind(&path)?;
         let feed = self.clone();
