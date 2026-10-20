@@ -40,6 +40,9 @@ impl Handler for Tools {
             "child" => {
                 let mut cmd = Command::new("sh");
                 cmd.args(["-c", args["script"].as_str().unwrap()]);
+                if let Some(b) = args["backtrace"].as_str() {
+                    cmd.env("RUST_BACKTRACE", b);
+                }
                 Ok(vec![Content::Text(cx.run(cmd)?)])
             }
             "picture" => Ok(vec![Content::Png(vec![0x89, b'P', b'N', b'G'])]),
@@ -421,7 +424,7 @@ fn a_failed_childs_error_is_quoted_past_its_backtrace() {
     // As a Rust program fails with a backtrace on: its error, then many
     // frames. The quote starts at the error; the child was asked for none.
     let script = "echo \"backtrace asked: $RUST_BACKTRACE $RUST_LIB_BACKTRACE\" >&2; \
-                  echo 'Error: no section matches qc' >&2; \
+                  echo 'Error: no section matches qc' >&2; echo >&2; echo 'Stack backtrace:' >&2; \
                   for i in $(seq 40); do echo \"  $i: frame\" >&2; done; exit 1";
     let msgs = session(&[call(1, "child", json!({ "script": script }))]);
     let text = by_id(&msgs, 1)["result"]["content"][0]["text"]
@@ -440,4 +443,15 @@ fn a_child_is_asked_for_no_backtrace() {
     let script = "printf \"$RUST_BACKTRACE/$RUST_LIB_BACKTRACE\"";
     let msgs = session(&[call(1, "child", json!({ "script": script }))]);
     assert_eq!(by_id(&msgs, 1)["result"]["content"][0]["text"], "0/0");
+}
+
+#[test]
+fn a_tool_that_asks_for_a_backtrace_keeps_it() {
+    let script = "printf \"$RUST_BACKTRACE/$RUST_LIB_BACKTRACE\"";
+    let msgs = session(&[call(
+        1,
+        "child",
+        json!({ "script": script, "backtrace": "1" }),
+    )]);
+    assert_eq!(by_id(&msgs, 1)["result"]["content"][0]["text"], "1/0");
 }

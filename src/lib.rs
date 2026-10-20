@@ -380,21 +380,35 @@ fn made(outputs: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-/// What a failed child's stderr is quoted as: from its last `Error:` line
-/// (a Rust program's error, before any backtrace) when it has one, else its
-/// last lines; [`STDERR_TAIL`] lines either way.
+/// What a failed child's stderr is quoted as, [`STDERR_TAIL`] lines at
+/// most: its last lines; or, when its last `Error:` line is followed only by
+/// a backtrace (a Rust program failing with backtraces on), from that line
+/// to where the backtrace starts. An error line with other output after it
+/// (a retry that went on to fail otherwise) is not the end, so the tail is.
 fn quote(lines: &VecDeque<String>) -> String {
-    let from = lines
-        .iter()
-        .rposition(|l| {
-            let l = l.trim_start();
-            l.starts_with("Error:") || l.starts_with("error:")
-        })
-        .unwrap_or(lines.len().saturating_sub(STDERR_TAIL));
+    let is_error = |l: &str| {
+        let l = l.trim_start();
+        l.starts_with("Error:") || l.starts_with("error:")
+    };
+    let is_backtrace = |l: &str| {
+        let l = l.trim_start().to_ascii_lowercase();
+        l.starts_with("stack backtrace:")
+    };
+    let tail = lines.len().saturating_sub(STDERR_TAIL);
+    let (from, to) = match lines.iter().rposition(|l| is_error(l)) {
+        Some(e) => match lines.iter().skip(e).position(|l| is_backtrace(l)) {
+            // The error, up to its backtrace.
+            Some(b) => (e, e + b),
+            // The error near the end: it is how the child ended.
+            None if e >= tail => (e, lines.len()),
+            None => (tail, lines.len()),
+        },
+        None => (tail, lines.len()),
+    };
     let picked: Vec<&str> = lines
         .iter()
         .skip(from)
-        .take(STDERR_TAIL)
+        .take(to.saturating_sub(from).min(STDERR_TAIL))
         .map(String::as_str)
         .collect();
     picked.join("\n")
@@ -409,6 +423,8 @@ fn run_child(
     cancelled: &dyn Fn() -> bool,
     progress: &dyn Fn(&str),
 ) -> Result<String> {
+    // Left as the tool has it when it set the variable, or removed it
+    // (get_envs lists a removal too).
     for var in ["RUST_BACKTRACE", "RUST_LIB_BACKTRACE"] {
         if !cmd.get_envs().any(|(k, _)| k == var) {
             cmd.env(var, "0");
@@ -956,4 +972,44 @@ fn call_result(result: Result<Vec<Content>>) -> Value {
         v["structuredContent"] = Value::Object(m);
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(text: &[&str]) -> VecDeque<String> {
+        text.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_rust_error_is_quoted_up_to_its_backtrace() {
+        let mut l = vec![
+            "loading",
+            "Error: no section matches qc",
+            "",
+            "Stack backtrace:",
+        ];
+        let frames: Vec<String> = (0..40).map(|i| format!("  {i}: frame")).collect();
+        l.extend(frames.iter().map(String::as_str));
+        assert_eq!(quote(&lines(&l)), "Error: no section matches qc\n");
+    }
+
+    #[test]
+    fn an_error_the_child_went_on_from_is_not_its_end() {
+        // A retry logged as an error, then much more, then the real end.
+        let mut l = vec!["error: fetch failed, retrying"];
+        let more: Vec<String> = (0..30).map(|i| format!("step {i}")).collect();
+        l.extend(more.iter().map(String::as_str));
+        l.push("fatal: out of disk");
+        let q = quote(&lines(&l));
+        assert!(q.ends_with("fatal: out of disk"), "{q}");
+        assert!(!q.contains("retrying"), "{q}");
+    }
+
+    #[test]
+    fn an_error_near_the_end_is_quoted_from() {
+        let l = ["a", "b", "Error: bad input", "caused by: x"];
+        assert_eq!(quote(&lines(&l)), "Error: bad input\ncaused by: x");
+    }
 }
