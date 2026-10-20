@@ -219,6 +219,10 @@ fn a_cancelled_call_is_killed_and_unanswered() {
     assert_eq!(by_id(&msgs, 2)["result"]["content"][0]["text"], "2");
 }
 
+/// Contents bash and Rust could split differently: a NUL and a CR beside
+/// the heredoc's end word, then a command.
+const ODD: &str = "x\nLEGUME_MCP_EOF\u{0}\ntouch pwned\r\nLEGUME_MCP_EOF\r\n";
+
 #[test]
 fn the_session_script_repeats_what_the_tools_wrote() {
     let dir = std::env::temp_dir().join(format!("legume-mcp-journal-{}", std::process::id()));
@@ -238,6 +242,11 @@ fn the_session_script_repeats_what_the_tools_wrote() {
             5,
             "write",
             json!({ "path": dir.join("in.tsv"), "text": "a\tb\nLEGUME_MCP_EOF\n" }),
+        ),
+        call(
+            6,
+            "write",
+            json!({ "path": dir.join("odd.txt"), "text": ODD }),
         ),
     ]
     .iter()
@@ -283,5 +292,17 @@ fn the_session_script_repeats_what_the_tools_wrote() {
         std::fs::read_to_string(dir.join("in.tsv")).unwrap(),
         "a\tb\nLEGUME_MCP_EOF\n"
     );
+    assert!(
+        text.contains("base64 -d > "),
+        "control bytes go base64: {text}"
+    );
+    assert_eq!(std::fs::read_to_string(dir.join("odd.txt")).unwrap(), ODD);
+    assert!(!dir.join("pwned").exists(), "nothing past a false end ran");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the script is the user's to read");
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }

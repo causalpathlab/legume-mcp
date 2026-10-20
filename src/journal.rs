@@ -6,6 +6,7 @@
 //! failed or cancelled child stays as a comment. The file is made on the
 //! first call, so a session that calls nothing leaves none.
 
+use base64::Engine;
 use serde_json::Value;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -77,10 +78,12 @@ impl Journal {
                 quote(&cwd.to_string_lossy())
             );
         }
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut open = OpenOptions::new();
+        open.create(true).append(true);
+        // The script holds the session's arguments: the user's to read.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
+        let mut f = open.open(&self.path)?;
         write!(f, "{head}{text}")?;
         self.started = true;
         Ok(())
@@ -100,7 +103,16 @@ impl Journal {
             program == Path::new("/proc/self/exe") || own.as_deref().is_some_and(|e| e == program);
         let mut words: Vec<String> = cmd
             .get_envs()
-            .filter_map(|(k, v)| Some(format!("{}={}", k.to_str()?, quote(&v?.to_string_lossy()))))
+            .filter_map(|(k, v)| {
+                let k = k.to_str()?;
+                let v = if is_secret(k) {
+                    // Asked for at replay, never written down.
+                    format!("\"${{{k}:?export {k}}}\"")
+                } else {
+                    quote(&v?.to_string_lossy())
+                };
+                Some(format!("{k}={v}"))
+            })
             .collect();
         words.push(if is_self {
             self.name.clone()
@@ -115,8 +127,29 @@ impl Journal {
         }
     }
 
-    /// A heredoc that writes `contents` to `path`.
+    /// A heredoc that writes `contents` to `path`: as it is when it is plain
+    /// text (tabs and newlines), else base64, so no byte bash reads
+    /// differently can end the heredoc early.
     pub(crate) fn file(&mut self, path: &Path, contents: &str) {
+        let path = quote(&path.to_string_lossy());
+        if contents
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t')
+        {
+            let mut b64 = base64::engine::general_purpose::STANDARD.encode(contents);
+            // Lines of 76, as `base64` writes them; `_` is not in its alphabet.
+            let mut wrapped = String::new();
+            while !b64.is_empty() {
+                let rest = b64.split_off(b64.len().min(76));
+                wrapped += &b64;
+                wrapped.push('\n');
+                b64 = rest;
+            }
+            self.append(&format!(
+                "base64 -d > {path} <<'LEGUME_MCP_EOF'\n{wrapped}LEGUME_MCP_EOF\n"
+            ));
+            return;
+        }
         let mut tag = String::from("LEGUME_MCP_EOF");
         while contents.lines().any(|l| l == tag) {
             tag.push('_');
@@ -126,11 +159,25 @@ impl Journal {
         } else {
             "\n"
         };
-        self.append(&format!(
-            "cat > {} <<'{tag}'\n{contents}{nl}{tag}\n",
-            quote(&path.to_string_lossy())
-        ));
+        self.append(&format!("cat > {path} <<'{tag}'\n{contents}{nl}{tag}\n"));
     }
+}
+
+/// Whether environment variable `name` likely holds a secret.
+fn is_secret(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    [
+        "TOKEN",
+        "KEY",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "AUTH",
+        "CREDENTIAL",
+        "COOKIE",
+    ]
+    .iter()
+    .any(|w| n.contains(w))
 }
 
 /// `s` as one shell word.
@@ -179,6 +226,23 @@ mod tests {
         assert_eq!(quote("two words"), "'two words'");
         assert_eq!(quote("it's"), r"'it'\''s'");
         assert_eq!(quote(""), "''");
+    }
+
+    #[test]
+    fn secrets_are_asked_for_at_replay() {
+        let j = Journal::new(PathBuf::from("x.sh"), "t", "0");
+        let mut cmd = Command::new("tool");
+        cmd.env("HF_TOKEN", "hf_abc").env("MODE", "fast").arg("go");
+        let line = j.command_line(&cmd);
+        assert!(!line.contains("hf_abc"), "{line}");
+        assert!(
+            line.contains(r#"HF_TOKEN="${HF_TOKEN:?export HF_TOKEN}""#),
+            "{line}"
+        );
+        assert!(
+            line.contains("MODE=fast") && line.ends_with("tool go"),
+            "{line}"
+        );
     }
 
     #[test]
