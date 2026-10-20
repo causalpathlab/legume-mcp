@@ -152,7 +152,7 @@ fn a_person_follows_stops_and_leaves_a_note() {
         &|b| matches!(b, Body::State { id, state } if id == "2" && state["focus"] == json!([3]))
     ));
     assert!(has(
-        &|b| matches!(b, Body::Record { line } if line.contains("did not succeed"))
+        &|b| matches!(b, Body::Record { line, command: None } if line.contains("did not succeed"))
     ));
     // From an offset: only what came after.
     let later: Vec<Body> = std::iter::from_fn({

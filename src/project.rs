@@ -207,6 +207,12 @@ impl Project {
 
     /// Append to today's `runall.sh`.
     pub(crate) fn script(&self, text: &str) {
+        self.script_step(text, None);
+    }
+
+    /// Append to today's `runall.sh` a block that runs `command` (the bare
+    /// command line, for followers that want it without the guard).
+    pub(crate) fn script_step(&self, text: &str, command: Option<&str>) {
         let Ok(dir) = self.day_dir() else { return };
         let head = || {
             format!(
@@ -224,6 +230,7 @@ impl Project {
         if let Some(f) = &self.feed {
             f.emit(Body::Record {
                 line: text.trim_matches('\n').into(),
+                command: command.map(str::to_string),
             });
         }
     }
@@ -249,10 +256,16 @@ impl Project {
         }
     }
 
-    /// `cmd` as a shell line: its own directory and environment, this
-    /// server's binary under the server's name, project paths relative, and
-    /// skipped when every one of `outputs` exists.
+    /// `cmd` as a shell line ([`Self::command`]), skipped when every one of
+    /// `outputs` exists.
+    #[cfg(test)]
     pub(crate) fn command_line(&self, cmd: &Command, outputs: &[PathBuf]) -> String {
+        self.guarded(&self.command(cmd), outputs)
+    }
+
+    /// `cmd` as a shell line: its own directory and environment, this
+    /// server's binary under the server's name, project paths relative.
+    pub(crate) fn command(&self, cmd: &Command) -> String {
         let word = |s: &str| quote(&self.rel(s));
         let program = Path::new(cmd.get_program());
         let is_self = crate::own_exe().is_some_and(|e| e == program);
@@ -275,13 +288,20 @@ impl Project {
             word(&program.to_string_lossy())
         });
         words.extend(cmd.get_args().map(|a| word(&a.to_string_lossy())));
-        let mut line = words.join(" ");
-        if let Some(dir) = cmd.get_current_dir() {
-            line = format!("(cd {} && {line})", word(&dir.to_string_lossy()));
+        let line = words.join(" ");
+        match cmd.get_current_dir() {
+            Some(dir) => format!("(cd {} && {line})", word(&dir.to_string_lossy())),
+            None => line,
         }
+    }
+
+    /// `line`, skipped when every one of `outputs` exists and run with
+    /// their folders made.
+    pub(crate) fn guarded(&self, line: &str, outputs: &[PathBuf]) -> String {
         if outputs.is_empty() {
-            return line;
+            return line.into();
         }
+        let word = |s: &str| quote(&self.rel(s));
         let missing: Vec<String> = outputs
             .iter()
             .map(|o| format!("[ ! -e {} ]", word(&o.to_string_lossy())))

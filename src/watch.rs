@@ -81,9 +81,12 @@ pub enum Body {
         id: String,
         state: Value,
     },
-    /// A block added to the day's `runall.sh`.
+    /// A block added to the day's `runall.sh`; for a step that ran,
+    /// `command` is its bare command line (no guard, no `mkdir`).
     Record {
         line: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
     },
     /// A notebook entry: `entry` is its kind (plan, observation, …, user).
     Notebook {
@@ -156,7 +159,7 @@ pub fn live_in(base: &Path) -> Vec<Live> {
             let dir = e.path();
             let meta: Meta =
                 serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).ok()?).ok()?;
-            let alive = pid_alive(meta.pid);
+            let alive = alive(meta.pid);
             Some(Live { meta, dir, alive })
         })
         .collect();
@@ -215,6 +218,13 @@ impl Follow {
         self.offset
     }
 
+    /// Whether the server has ended: its [`Body::Ended`] was read, or its
+    /// process is gone (what it wrote last is still there for
+    /// [`Self::try_next`]). It never waits, for a viewer's tick.
+    pub fn ended(&self) -> bool {
+        self.ended || !alive(self.pid)
+    }
+
     /// The next event if one is there now, without waiting.
     pub fn try_next(&mut self) -> Option<Event> {
         loop {
@@ -250,7 +260,7 @@ impl Iterator for Follow {
             if self.ended {
                 return None;
             }
-            if !pid_alive(self.pid) {
+            if !alive(self.pid) {
                 // Gone: whatever it wrote last is read, then the end.
                 return self.try_next();
             }
@@ -302,14 +312,16 @@ impl Control {
 }
 
 #[cfg(unix)]
-fn pid_alive(pid: u32) -> bool {
+/// Whether process `pid` is running.
+pub fn alive(pid: u32) -> bool {
     // SAFETY: kill with signal 0 only checks the process exists.
     let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
     r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(not(unix))]
-fn pid_alive(_pid: u32) -> bool {
+/// Whether process `pid` is running (assumed, where it cannot be asked).
+pub fn alive(_pid: u32) -> bool {
     true
 }
 

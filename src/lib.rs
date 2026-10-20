@@ -234,12 +234,13 @@ impl Call {
     /// skips it when they all exist, and `results/INDEX.tsv` lists each
     /// with `summary` (one line: what was made, from what).
     pub fn run_making(&self, cmd: Command, outputs: &[PathBuf], summary: &str) -> Result<String> {
-        let line = self.records.as_ref().map(|p| p.command_line(&cmd, outputs));
+        let bare = self.records.as_ref().map(|p| p.command(&cmd));
         let result = self.run_child(cmd);
-        if let (Some(p), Some(line)) = (&self.records, line) {
+        if let (Some(p), Some(bare)) = (&self.records, bare) {
+            let line = p.guarded(&bare, outputs);
             match &result {
                 Ok(_) => {
-                    p.script(&format!("{line}\n"));
+                    p.script_step(&format!("{line}\n"), Some(&bare));
                     p.index(&self.tool, outputs, summary);
                 }
                 Err(e) => {
