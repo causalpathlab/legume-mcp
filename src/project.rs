@@ -102,8 +102,12 @@ impl Project {
     /// `text` appended to `path`, which starts with `head` when new. Records
     /// are not the work: a write that fails is logged, never the call's
     /// failure. Every server appends to the same files, each write whole.
+    /// A file someone else could have planted (not a regular file of this
+    /// user's, or writable by others) is left alone: the records go to
+    /// `{stem}-{pid}.{ext}` beside it instead.
     fn append(&self, path: &Path, mode: u32, head: impl FnOnce() -> String, text: &str) {
-        let write = || -> std::io::Result<()> {
+        let mut head = Some(head);
+        let mut write = |path: &Path| -> std::io::Result<bool> {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
@@ -111,17 +115,51 @@ impl Project {
             open.create_new(true).write(true);
             #[cfg(unix)]
             std::os::unix::fs::OpenOptionsExt::mode(&mut open, mode);
-            let block = match open.open(path) {
-                Ok(mut f) => return f.write_all(format!("{}{text}", head()).as_bytes()),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => text,
+            match open.open(path) {
+                Ok(mut f) => {
+                    let head = head.take().map(|h| h()).unwrap_or_default();
+                    f.write_all(format!("{head}{text}").as_bytes())?;
+                    return Ok(true);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(e) => return Err(e),
+            }
+            let mut open = OpenOptions::new();
+            open.append(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NOFOLLOW);
+            let Ok(mut f) = open.open(path) else {
+                return Ok(false); // a symlink, or not ours to open
             };
-            OpenOptions::new()
-                .append(true)
-                .open(path)?
-                .write_all(block.as_bytes())
+            if !trusted(&f.metadata()?) {
+                return Ok(false);
+            }
+            f.write_all(text.as_bytes())?;
+            Ok(true)
         };
-        if let Err(e) = write() {
+        let own = || {
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+            let ext = path
+                .extension()
+                .map_or(String::new(), |e| format!(".{}", e.to_string_lossy()));
+            path.with_file_name(format!("{stem}-{}{ext}", std::process::id()))
+        };
+        let result = write(path).and_then(|done| {
+            if done {
+                return Ok(());
+            }
+            let other = own();
+            log::warn!(
+                "mcp records: {} is not this user's own file; writing {}",
+                path.display(),
+                other.display()
+            );
+            match write(&other)? {
+                true => Ok(()),
+                false => Err(std::io::Error::other("untrusted file")),
+            }
+        });
+        if let Err(e) = result {
             log::warn!("mcp records {}: {e}", path.display());
         }
     }
@@ -309,6 +347,20 @@ impl Project {
     }
 }
 
+/// A regular file of this user's that no one else can write.
+#[cfg(unix)]
+fn trusted(m: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    m.is_file() && m.uid() == me && m.mode() & 0o022 == 0
+}
+
+#[cfg(not(unix))]
+fn trusted(m: &std::fs::Metadata) -> bool {
+    m.is_file()
+}
+
 fn one_line(s: &str) -> String {
     s.split(['\t', '\n', '\r'])
         .filter(|w| !w.is_empty())
@@ -407,6 +459,39 @@ mod tests {
         );
         assert_eq!(p.rel("/proj"), ".");
         assert_eq!(p.rel("/project/x"), "/project/x", "only the root itself");
+    }
+
+    #[test]
+    fn planted_files_are_left_alone() {
+        let dir = std::env::temp_dir().join(format!("legume-mcp-planted-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = Project::new(dir.clone(), "t", "0");
+        let target = dir.join("elsewhere.txt");
+        std::fs::write(&target, "x\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, dir.join("log.md")).unwrap();
+        p.append(&dir.join("log.md"), 0o644, || "head\n".into(), "line\n");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "x\n",
+            "a symlink is not followed"
+        );
+        let own = dir.join(format!("log-{}.md", std::process::id()));
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), "head\nline\n");
+        // Writable by others: left alone too.
+        let open = dir.join("open.md");
+        std::fs::write(&open, "o\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o666)).unwrap();
+            p.append(&open, 0o644, String::new, "line\n");
+            assert_eq!(std::fs::read_to_string(&open).unwrap(), "o\n");
+        }
+        // Our own file is appended to.
+        p.append(&own, 0o644, String::new, "more\n");
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), "head\nline\nmore\n");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

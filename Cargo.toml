@@ -25,3 +25,7 @@ anyhow = "1.0"
 base64 = "0.22"
 log = "0.4"
 serde_json = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+# geteuid and O_NOFOLLOW, to leave alone record files this user does not own.
+libc = "0.2"
