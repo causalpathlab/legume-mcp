@@ -124,13 +124,14 @@ fn a_person_follows_stops_and_leaves_a_note() {
     drop(send);
     server.join().unwrap();
 
-    let events: Vec<Body> = std::iter::from_fn({
-        let mut f = watch::follow(&dir, From::Start).unwrap();
-        move || f.try_next()
-    })
-    .map(|e| e.body)
-    .collect();
+    // The blocking follower ends on the server's last event, though this
+    // process (the server's pid) lives on.
+    let events: Vec<Body> = watch::follow(&dir, From::Start)
+        .unwrap()
+        .map(|e| e.body)
+        .collect();
     assert!(matches!(&events[0], Body::Server(m) if m.server == "t"));
+    assert_eq!(events.last(), Some(&Body::Ended { ok: true }));
     let has = |want: &dyn Fn(&Body) -> bool| events.iter().any(want);
     assert!(has(
         &|b| matches!(b, Body::Call { id, tool, .. } if id == "a" && tool == "wait")

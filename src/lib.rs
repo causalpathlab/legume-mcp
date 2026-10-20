@@ -635,9 +635,13 @@ where
             _ => fail(&out, id, -32601, &format!("method not found: {method}")),
         }
     }
-    reader
+    let result = reader
         .join()
-        .map_err(|_| anyhow::anyhow!("the stdin reader panicked"))
+        .map_err(|_| anyhow::anyhow!("the stdin reader panicked"));
+    if let Some(f) = &feed {
+        f.emit(Body::Ended { ok: result.is_ok() });
+    }
+    result
 }
 
 /// How a tool call ends: its answer, with the person's notes, to the client

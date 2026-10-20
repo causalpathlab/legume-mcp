@@ -94,6 +94,12 @@ pub enum Body {
     Note {
         text: String,
     },
+    /// The server stopped serving: its input closed (`ok`), or it failed.
+    /// The feed's last line; a crashed server writes none, and its pid is
+    /// gone instead.
+    Ended {
+        ok: bool,
+    },
 }
 
 /// A server, as `meta.json` describes it.
@@ -189,6 +195,7 @@ pub fn follow(dir: &Path, from: From) -> Result<Follow> {
         pid,
         offset,
         partial: String::new(),
+        ended: false,
     })
 }
 
@@ -198,6 +205,8 @@ pub struct Follow {
     pid: u32,
     offset: u64,
     partial: String,
+    /// The server's [`Body::Ended`] was read.
+    ended: bool,
 }
 
 impl Follow {
@@ -220,7 +229,8 @@ impl Follow {
             }
             let whole = std::mem::take(&mut self.partial);
             self.offset += whole.len() as u64;
-            if let Ok(e) = serde_json::from_str(&whole) {
+            if let Ok(e) = serde_json::from_str::<Event>(&whole) {
+                self.ended |= matches!(e.body, Body::Ended { .. });
                 return Some(e);
             }
         }
@@ -230,10 +240,15 @@ impl Follow {
 impl Iterator for Follow {
     type Item = Event;
 
+    /// The next event, waiting for it; none once the server has ended (its
+    /// last event read) or is gone.
     fn next(&mut self) -> Option<Event> {
         loop {
             if let Some(e) = self.try_next() {
                 return Some(e);
+            }
+            if self.ended {
+                return None;
             }
             if !pid_alive(self.pid) {
                 // Gone: whatever it wrote last is read, then the end.
