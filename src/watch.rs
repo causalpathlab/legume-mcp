@@ -26,7 +26,7 @@ pub mod agent;
 #[cfg(feature = "tui")]
 pub mod view;
 
-pub use agent::{Action, Agent, CallView, Outcome, Status};
+pub use agent::{fit, Action, Agent, CallView, Outcome, Status};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -164,20 +164,26 @@ pub fn live() -> Vec<Live> {
 
 /// [`live`] under `base`.
 pub fn live_in(base: &Path) -> Vec<Live> {
-    let mut out: Vec<Live> = std::fs::read_dir(base)
+    // Newest first by when meta.json was written (once, as the server
+    // started): to the nanosecond and free of the local clock's changes,
+    // where the `started` text is to the second and local.
+    let mut out: Vec<(std::time::SystemTime, Live)> = std::fs::read_dir(base)
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|e| {
             let dir = e.path();
-            let meta: Meta =
-                serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).ok()?).ok()?;
+            let path = dir.join("meta.json");
+            let meta: Meta = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+            let written = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
             let alive = alive(meta.pid);
-            Some(Live { meta, dir, alive })
+            Some((written, Live { meta, dir, alive }))
         })
         .collect();
-    out.sort_by(|a, b| b.meta.started.cmp(&a.meta.started));
-    out
+    out.sort_by(|(a, _), (b, _)| b.cmp(a));
+    out.into_iter().map(|(_, l)| l).collect()
 }
 
 /// The running servers named `server` (and with process `pid`, when
@@ -631,5 +637,25 @@ mod tests {
         assert_eq!(found[0].meta.pid, me);
         assert!(find_in(base.path(), "lupin", Some(me + 1)).is_empty());
         assert_eq!(find_in(base.path(), "senna", Some(me)).len(), 1);
+    }
+
+    #[test]
+    fn servers_started_in_the_same_second_come_newest_first() {
+        let base = tempfile::tempdir().unwrap();
+        for name in ["first", "second"] {
+            let dir = base.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let meta = Meta {
+                server: "t".into(),
+                version: "0".into(),
+                pid: std::process::id(),
+                project: None,
+                started: "2026-11-01T01:30:00-07:00".into(),
+            };
+            std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let found = find_in(base.path(), "t", None);
+        assert!(found[0].dir.ends_with("second"), "{found:?}");
     }
 }

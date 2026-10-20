@@ -107,7 +107,7 @@ fn an_agent_follows_a_server_without_a_screen() {
 
     // A sidebar's lines.
     let lines = agent.lines(3, 30);
-    assert_eq!(lines[0], "t · following");
+    assert_eq!(lines[0], format!("t {} · following", std::process::id()));
     assert!(
         lines[1].contains("make done") && lines[2].starts_with('>'),
         "{lines:?}"
@@ -163,6 +163,9 @@ fn an_agent_follows_a_server_without_a_screen() {
     });
     assert!(!agent.can_steer());
     assert!(matches!(agent.act(Action::Stop), Outcome::Unavailable));
-    assert_eq!(agent.lines(1, 40), ["t · ended"]);
+    assert_eq!(
+        agent.lines(1, 40),
+        [format!("t {} · ended", std::process::id())]
+    );
     assert_eq!(agent.calls().len(), 3);
 }

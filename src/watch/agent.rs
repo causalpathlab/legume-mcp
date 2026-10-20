@@ -18,6 +18,8 @@ const PROGRESS_KEPT: usize = 40;
 const NOTES_KEPT: usize = 50;
 /// Recorded commands kept.
 const RECORDS_KEPT: usize = 50;
+/// Calls kept: a viewer left on a long session drops the oldest.
+const CALLS_KEPT: usize = 500;
 /// How far a page moves the selection.
 const PAGE: usize = 10;
 
@@ -76,6 +78,18 @@ pub struct CallView {
     pub progress: VecDeque<String>,
 }
 
+impl CallView {
+    /// What the call is doing or came to, in a line: its last log line while
+    /// it runs, the first line of its result once it has one.
+    pub fn doing(&self) -> Option<&str> {
+        if self.text.is_empty() {
+            self.progress.back().map(String::as_str)
+        } else {
+            self.text.lines().next()
+        }
+    }
+}
+
 /// What a person can ask of the agent's view; a host binds its own keys to
 /// them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,8 +139,11 @@ pub struct Agent {
     /// A state not yet taken by [`Agent::take_new_state`].
     state_new: bool,
     ended: bool,
-    /// The call the person moved to; none while following.
+    /// The call the person picked; none means the latest.
     selected: Option<usize>,
+    /// Not following: the person picked a call, or the host's own view
+    /// moved away ([`Agent::pause`]).
+    paused: bool,
     /// The server's steering, when the view offers it.
     steer: Option<Control>,
 }
@@ -147,6 +164,7 @@ impl Agent {
             state_new: false,
             ended: false,
             selected: None,
+            paused: false,
             steer: steer.then(|| control(dir)),
         };
         // The feed so far, read now: its views are one view, new once, and a
@@ -193,15 +211,25 @@ impl Agent {
     fn apply(&mut self, e: Event) {
         match e.body {
             Body::Server(m) => self.meta = Some(m),
-            Body::Call { id, tool, args } => self.calls.push(CallView {
-                id,
-                tool,
-                args,
-                at: clock(&e.t).to_string(),
-                status: Status::Running,
-                text: String::new(),
-                progress: VecDeque::new(),
-            }),
+            Body::Call { id, tool, args } => {
+                if self.calls.len() == CALLS_KEPT {
+                    self.calls.remove(0);
+                    // The call the person picked stays picked, or the
+                    // oldest left when it was the one dropped.
+                    if let Some(s) = &mut self.selected {
+                        *s = s.saturating_sub(1);
+                    }
+                }
+                self.calls.push(CallView {
+                    id,
+                    tool,
+                    args,
+                    at: clock(&e.t).to_string(),
+                    status: Status::Running,
+                    text: String::new(),
+                    progress: VecDeque::new(),
+                });
+            }
             Body::Progress { id, message } => {
                 if let Some(c) = self.call(&id) {
                     push_kept(&mut c.progress, plain(&message), PROGRESS_KEPT);
@@ -285,13 +313,13 @@ impl Agent {
             .flatten()
     }
 
-    /// Whether the view follows the agent (the latest call selected).
+    /// Whether the view follows the agent.
     pub fn following(&self) -> bool {
-        self.selected.is_none()
+        !self.paused
     }
 
-    /// The selected call's place: the latest while following; `None`
-    /// before the first call.
+    /// The selected call's place: the one the person picked, else the
+    /// latest; `None` before the first call.
     pub fn selected(&self) -> Option<usize> {
         (!self.calls.is_empty()).then(|| self.at())
     }
@@ -300,14 +328,19 @@ impl Agent {
         self.selected.unwrap_or(self.calls.len().saturating_sub(1))
     }
 
-    /// Stop following: the host's own navigation moved the view.
+    /// Stop following because the host's own view moved (the person panned
+    /// the map): the calls keep coming in as they are, the latest selected;
+    /// only picking a call ([`Action::Previous`] and the like) holds one.
     pub fn pause(&mut self) {
-        self.selected = Some(self.at());
+        self.paused = true;
     }
 
-    /// Follow again, from the latest call.
+    /// Follow again, from the latest call; the agent's latest view is new
+    /// again ([`Self::take_new_state`]), for the host to go back to it.
     pub fn resume(&mut self) {
         self.selected = None;
+        self.paused = false;
+        self.state_new = self.state.is_some();
     }
 
     /// Whether the server is gone.
@@ -344,7 +377,9 @@ impl Agent {
             _ => None,
         };
         if let Some(to) = to {
+            // Picking a call holds it, and stops following.
             self.selected = Some(to.min(last));
+            self.paused = true;
             return Outcome::Done;
         }
         match action {
@@ -391,16 +426,16 @@ impl Agent {
     }
 
     /// The view in `n` lines of at most `width` characters, for a sidebar:
-    /// the server and whether it is followed, then the latest calls with
-    /// their status, the selected one marked `>`.
+    /// the server and its pid and whether it is followed, then the latest
+    /// calls with their status, the selected one marked `>`.
     pub fn lines(&self, n: usize, width: usize) -> Vec<String> {
         if n == 0 {
             return vec![];
         }
-        let who = self
-            .meta
-            .as_ref()
-            .map_or_else(|| self.dir.display().to_string(), |m| m.server.clone());
+        let who = self.meta.as_ref().map_or_else(
+            || self.dir.display().to_string(),
+            |m| format!("{} {}", m.server, m.pid),
+        );
         let how = if self.ended {
             "ended"
         } else if self.following() {
@@ -409,24 +444,38 @@ impl Agent {
             "paused"
         };
         let mut out = vec![fit(&format!("{who} · {how}"), width)];
-        let shown = n - 1;
-        let sel = self.selected();
-        // The selected call in sight: the window ends at it, or at the
-        // latest while following.
-        let end = sel.map_or(0, |s| s + 1).max(shown.min(self.calls.len()));
-        let start = end.saturating_sub(shown);
-        for (i, c) in self.calls.iter().enumerate().take(end).skip(start) {
-            let mark = if Some(i) == sel { '>' } else { ' ' };
-            let line = format!("{mark}{} {} {}", c.at, c.tool, c.status.label());
-            out.push(fit(&line, width));
-        }
+        out.extend(self.call_lines(n - 1, width));
         out
+    }
+
+    /// [`Self::lines`] without its head: the latest calls with their status
+    /// (at most `n`), the selected one marked `>`, each cut to `width`; for a
+    /// host that writes its own title.
+    pub fn call_lines(&self, n: usize, width: usize) -> Vec<String> {
+        let sel = self.selected();
+        // The selected call in sight: the window ends at the call the person
+        // picked, else at the latest (a host's pause does not hold one).
+        let end = sel.map_or(0, |s| s + 1).max(n.min(self.calls.len()));
+        let start = end.saturating_sub(n);
+        self.calls
+            .iter()
+            .enumerate()
+            .take(end)
+            .skip(start)
+            .map(|(i, c)| {
+                let mark = if Some(i) == sel { '>' } else { ' ' };
+                fit(
+                    &format!("{mark}{} {} {}", c.at, c.tool, c.status.label()),
+                    width,
+                )
+            })
+            .collect()
     }
 }
 
 /// `s` cut to `width` characters (not display columns: wide characters
 /// take two), an ellipsis marking the cut.
-fn fit(s: &str, width: usize) -> String {
+pub fn fit(s: &str, width: usize) -> String {
     if s.chars().count() <= width {
         return s.into();
     }
@@ -453,12 +502,103 @@ fn push_kept<T>(q: &mut VecDeque<T>, x: T, kept: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::fit;
+    use super::*;
+    use serde_json::json;
 
     #[test]
     fn lines_are_cut_to_fit() {
         assert_eq!(fit("abcdef", 4), "abc…");
         assert_eq!(fit("abc", 4), "abc");
         assert_eq!(fit("abc", 0), "");
+    }
+
+    /// A server's folder whose feed holds `calls` calls, each done.
+    fn folder(calls: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = json!({ "server": "t", "version": "0", "pid": std::process::id(),
+                           "project": null, "started": "x" });
+        std::fs::write(dir.path().join("meta.json"), meta.to_string()).unwrap();
+        let t = "2026-10-20T12:00:00-07:00";
+        let mut server = meta.clone();
+        server["t"] = json!(t);
+        server["kind"] = json!("server");
+        let mut feed = format!("{server}\n");
+        for i in 0..calls {
+            let id = i.to_string();
+            feed += &format!(
+                "{}\n{}\n",
+                json!({ "t": t, "kind": "call", "id": id, "tool": "x", "args": {} }),
+                json!({ "t": t, "kind": "result", "id": id, "ok": true, "ms": 1, "text": "" })
+            );
+        }
+        std::fs::write(dir.path().join("feed.jsonl"), feed).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_long_session_keeps_its_latest_calls() {
+        let dir = folder(CALLS_KEPT + 7);
+        let agent = Agent::new(dir.path(), false).unwrap();
+        assert_eq!(agent.calls().len(), CALLS_KEPT);
+        assert_eq!(agent.calls()[0].id, "7", "the oldest dropped");
+        assert_eq!(
+            agent.calls().last().unwrap().id,
+            (CALLS_KEPT + 6).to_string()
+        );
+    }
+
+    #[test]
+    fn a_hosts_pause_holds_no_call() {
+        let dir = folder(5);
+        let mut agent = Agent::new(dir.path(), false).unwrap();
+        agent.pause();
+        assert!(!agent.following());
+        assert_eq!(agent.selected(), Some(4), "the latest, not held");
+        assert!(
+            agent.lines(3, 40)[2].starts_with(">"),
+            "the window at the latest"
+        );
+        // Picking a call holds it.
+        agent.act(Action::First);
+        assert_eq!(agent.selected(), Some(0));
+        assert!(agent.lines(3, 40)[1].starts_with(">"));
+        agent.act(Action::Follow);
+        assert!(agent.following());
+        assert_eq!(agent.selected(), Some(4));
+    }
+
+    #[test]
+    fn rows_without_a_head_and_a_call_in_a_line() {
+        let dir = folder(3);
+        let agent = Agent::new(dir.path(), false).unwrap();
+        let rows = agent.call_lines(2, 40);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows[1].starts_with('>') && rows[1].contains("x done"),
+            "{rows:?}"
+        );
+        assert_eq!(&agent.lines(3, 40)[1..], &rows[..]);
+        let mut c = agent.calls()[0].clone();
+        assert_eq!(c.doing(), None);
+        c.progress.push_back("50%".into());
+        c.text.clear();
+        assert_eq!(c.doing(), Some("50%"));
+        c.text = "made it\nmore".into();
+        assert_eq!(c.doing(), Some("made it"));
+    }
+
+    #[test]
+    fn following_again_hands_the_view_over_again() {
+        let dir = folder(1);
+        std::fs::write(dir.path().join("state.json"), r#"{"focus":[1]}"#).unwrap();
+        let mut agent = Agent::new(dir.path(), false).unwrap();
+        assert!(agent.take_new_state().is_some());
+        agent.pause();
+        assert_eq!(agent.take_new_state(), None);
+        agent.resume();
+        assert_eq!(
+            agent.take_new_state(),
+            Some(serde_json::json!({ "focus": [1] }))
+        );
     }
 }
