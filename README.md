@@ -68,6 +68,18 @@ those to its model can be given the same text in the agent's own instructions
 (an `AGENTS.md`, a system prompt); each tool's README has it. Every server also
 offers the `notebook` tool for the agent's plan, observations and conclusions.
 
+## Long steps as jobs
+
+A step longer than a client waits on one call (a model fit, a large pass)
+runs as a background job: the tool calls `Call::spawn_job(cmd, outputs,
+summary)` in place of `run_making` and returns the job's id (`job-N`) at once.
+Every server offers the agent `job_status`, `job_wait` (blocks up to 120 s; call
+again while it runs) and `job_cancel`, and its instructions say how to use
+them. A job's log goes to the feed under its id, where a person can stop it
+too; a job that succeeds is recorded when it ends, like any step (`runall.sh`,
+`INDEX.tsv`); one cancelled or failed is not. Jobs end with their server: a
+step longer than a client session is the tool's own command line's to run.
+
 ## Watching and steering
 
 While an agent works, each server writes what it is doing to an owner-only

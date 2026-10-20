@@ -117,7 +117,12 @@ fn initialize_negotiates_the_version() {
     let r = &by_id(&msgs, 1)["result"];
     assert_eq!(r["protocolVersion"], "2025-06-18");
     assert_eq!(r["serverInfo"]["name"], "test");
-    assert_eq!(r["instructions"], "read me");
+    let told = r["instructions"].as_str().unwrap();
+    assert!(
+        told.starts_with("read me\n\n"),
+        "the server's own first: {told}"
+    );
+    assert!(told.contains("job_status"), "then the jobs: {told}");
     assert!(r["capabilities"]["tools"].is_object());
     assert_eq!(
         by_id(&msgs, 2)["result"]["protocolVersion"],
