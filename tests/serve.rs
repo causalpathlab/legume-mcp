@@ -25,7 +25,7 @@ struct Tools {
 impl Handler for Tools {
     fn tools(&self) -> Vec<ToolSpec> {
         [
-            "echo", "fail", "count", "child", "picture", "panic", "write", "make",
+            "echo", "fail", "count", "child", "picture", "panic", "write", "make", "peek",
         ]
         .map(|n| ToolSpec::new(n, n, json!({ "type": "object" })))
         .into()
@@ -47,6 +47,11 @@ impl Handler for Tools {
                 let path = std::path::PathBuf::from(args["path"].as_str().unwrap());
                 cx.write_file(&path, args["text"].as_str().unwrap())?;
                 Ok(vec![])
+            }
+            "peek" => {
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", "echo seen"]);
+                Ok(vec![Content::Text(cx.run_reading(cmd)?)])
             }
             "make" => {
                 let (out, from) = (
@@ -275,6 +280,7 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
         call(6, "write", json!({ "path": at("odd.txt"), "text": ODD })),
         call(7, "make", json!({ "out": made, "from": at("in.tsv") })),
         call(8, "child", json!({ "script": "exit 2" })),
+        call(10, "peek", json!({})),
         call(9, "notebook", json!({ "kind": "plan" })),
     ]
     .iter()
@@ -336,6 +342,10 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
         "restartable: {script}"
     );
     assert!(script.contains("# did not succeed ("), "{script}");
+    assert!(
+        script.contains(" t 0 peek {}\n") && !script.contains("echo seen"),
+        "a read is only its call: {script}"
+    );
     assert!(
         script.contains("<<'LEGUME_MCP_EOF_'\na\tb\nLEGUME_MCP_EOF\nLEGUME_MCP_EOF_\n"),
         "{script}"

@@ -192,6 +192,13 @@ impl Call {
         self.run_making(cmd, &[], "")
     }
 
+    /// [`Self::run`] for a child that writes nothing (a preview, a report
+    /// on stdout): kept out of the driver script, whose call comment is
+    /// record enough, so a replay never runs it or misses its inputs.
+    pub fn run_reading(&self, cmd: Command) -> Result<String> {
+        self.run_child(cmd)
+    }
+
     /// [`Self::run`] for a step that writes `outputs`: the driver script
     /// skips it when they all exist, and `results/INDEX.tsv` lists each
     /// with `summary` (one line: what was made, from what).
@@ -205,7 +212,7 @@ impl Call {
                     p.index(&self.tool, outputs, summary);
                 }
                 Err(e) => {
-                    let why = format!("{e:#}");
+                    let why = p.rel(&format!("{e:#}"));
                     let why = why.lines().next().unwrap_or_default();
                     let commented: String = line.lines().map(|l| format!("#   {l}\n")).collect();
                     p.script(&format!("# did not succeed ({why}):\n{commented}"));
