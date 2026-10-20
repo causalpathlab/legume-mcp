@@ -78,6 +78,18 @@ pub struct CallView {
     pub progress: VecDeque<String>,
 }
 
+impl CallView {
+    /// What the call is doing or came to, in a line: its last log line while
+    /// it runs, the first line of its result once it has one.
+    pub fn doing(&self) -> Option<&str> {
+        if self.text.is_empty() {
+            self.progress.back().map(String::as_str)
+        } else {
+            self.text.lines().next()
+        }
+    }
+}
+
 /// What a person can ask of the agent's view; a host binds its own keys to
 /// them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -323,10 +335,12 @@ impl Agent {
         self.paused = true;
     }
 
-    /// Follow again, from the latest call.
+    /// Follow again, from the latest call; the agent's latest view is new
+    /// again ([`Self::take_new_state`]), for the host to go back to it.
     pub fn resume(&mut self) {
         self.selected = None;
         self.paused = false;
+        self.state_new = self.state.is_some();
     }
 
     /// Whether the server is gone.
@@ -430,24 +444,38 @@ impl Agent {
             "paused"
         };
         let mut out = vec![fit(&format!("{who} · {how}"), width)];
-        let shown = n - 1;
+        out.extend(self.call_lines(n - 1, width));
+        out
+    }
+
+    /// [`Self::lines`] without its head: the latest calls with their status
+    /// (at most `n`), the selected one marked `>`, each cut to `width`; for a
+    /// host that writes its own title.
+    pub fn call_lines(&self, n: usize, width: usize) -> Vec<String> {
         let sel = self.selected();
         // The selected call in sight: the window ends at the call the person
         // picked, else at the latest (a host's pause does not hold one).
-        let end = sel.map_or(0, |s| s + 1).max(shown.min(self.calls.len()));
-        let start = end.saturating_sub(shown);
-        for (i, c) in self.calls.iter().enumerate().take(end).skip(start) {
-            let mark = if Some(i) == sel { '>' } else { ' ' };
-            let line = format!("{mark}{} {} {}", c.at, c.tool, c.status.label());
-            out.push(fit(&line, width));
-        }
-        out
+        let end = sel.map_or(0, |s| s + 1).max(n.min(self.calls.len()));
+        let start = end.saturating_sub(n);
+        self.calls
+            .iter()
+            .enumerate()
+            .take(end)
+            .skip(start)
+            .map(|(i, c)| {
+                let mark = if Some(i) == sel { '>' } else { ' ' };
+                fit(
+                    &format!("{mark}{} {} {}", c.at, c.tool, c.status.label()),
+                    width,
+                )
+            })
+            .collect()
     }
 }
 
 /// `s` cut to `width` characters (not display columns: wide characters
 /// take two), an ellipsis marking the cut.
-fn fit(s: &str, width: usize) -> String {
+pub fn fit(s: &str, width: usize) -> String {
     if s.chars().count() <= width {
         return s.into();
     }
@@ -537,5 +565,40 @@ mod tests {
         agent.act(Action::Follow);
         assert!(agent.following());
         assert_eq!(agent.selected(), Some(4));
+    }
+
+    #[test]
+    fn rows_without_a_head_and_a_call_in_a_line() {
+        let dir = folder(3);
+        let agent = Agent::new(dir.path(), false).unwrap();
+        let rows = agent.call_lines(2, 40);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows[1].starts_with('>') && rows[1].contains("x done"),
+            "{rows:?}"
+        );
+        assert_eq!(&agent.lines(3, 40)[1..], &rows[..]);
+        let mut c = agent.calls()[0].clone();
+        assert_eq!(c.doing(), None);
+        c.progress.push_back("50%".into());
+        c.text.clear();
+        assert_eq!(c.doing(), Some("50%"));
+        c.text = "made it\nmore".into();
+        assert_eq!(c.doing(), Some("made it"));
+    }
+
+    #[test]
+    fn following_again_hands_the_view_over_again() {
+        let dir = folder(1);
+        std::fs::write(dir.path().join("state.json"), r#"{"focus":[1]}"#).unwrap();
+        let mut agent = Agent::new(dir.path(), false).unwrap();
+        assert!(agent.take_new_state().is_some());
+        agent.pause();
+        assert_eq!(agent.take_new_state(), None);
+        agent.resume();
+        assert_eq!(
+            agent.take_new_state(),
+            Some(serde_json::json!({ "focus": [1] }))
+        );
     }
 }

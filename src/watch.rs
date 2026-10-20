@@ -26,7 +26,7 @@ pub mod agent;
 #[cfg(feature = "tui")]
 pub mod view;
 
-pub use agent::{Action, Agent, CallView, Outcome, Status};
+pub use agent::{fit, Action, Agent, CallView, Outcome, Status};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
