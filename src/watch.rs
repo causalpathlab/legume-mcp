@@ -175,6 +175,47 @@ pub fn live_in(base: &Path) -> Vec<Live> {
     out
 }
 
+/// The running servers named `server` (and with process `pid`, when
+/// given), newest first: whom a viewer of that tool follows.
+pub fn find(server: &str, pid: Option<u32>) -> Vec<Live> {
+    base().map(|b| find_in(&b, server, pid)).unwrap_or_default()
+}
+
+/// [`find`] under `base`.
+pub fn find_in(base: &Path, server: &str, pid: Option<u32>) -> Vec<Live> {
+    live_in(base)
+        .into_iter()
+        .filter(|l| l.alive && l.meta.server == server && pid.is_none_or(|p| p == l.meta.pid))
+        .collect()
+}
+
+/// A progress line as a person reads it: what follows its last carriage
+/// return (a redrawn bar's last state), without terminal colours or other
+/// escape sequences, without a log's `[time LEVEL module] ` head, tabs as
+/// spaces and no other control.
+pub fn plain(line: &str) -> String {
+    let mut text = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            text.push(c);
+        } else if chars.next() == Some('[') {
+            // A CSI sequence runs to its final byte.
+            let _ = chars.by_ref().find(|c| ('@'..='~').contains(c));
+        }
+    }
+    let last = text.rsplit('\r').next().unwrap_or(&text).trim();
+    let message = match last.split_once("] ") {
+        Some((head, msg)) if head.starts_with('[') => msg.trim(),
+        _ => last,
+    };
+    message
+        .replace('\t', "    ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
 /// The tool's current view in `dir`, when it published one.
 pub fn state(dir: &Path) -> Option<Value> {
     serde_json::from_str(&std::fs::read_to_string(dir.join("state.json")).ok()?).ok()
@@ -539,5 +580,51 @@ fn prune(base: &Path) {
         if !l.alive && old {
             let _ = std::fs::remove_dir_all(&l.dir);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_lines_read_plainly() {
+        assert_eq!(
+            plain("[2026-10-20T18:20:17Z INFO  lupin::run] Loaded the run"),
+            "Loaded the run"
+        );
+        assert_eq!(
+            plain("\u{1b}[32m 10%\r\u{1b}[2K 55%\tleft\u{7}"),
+            "55%    left"
+        );
+        assert_eq!(plain("[not a head] stays"), "stays");
+        assert_eq!(plain("plain text"), "plain text");
+    }
+
+    #[test]
+    fn find_takes_the_running_servers_of_a_tool() {
+        let base = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        for (server, pid, started) in [
+            ("lupin", me, "2"),
+            ("senna", me, "3"),
+            ("lupin", u32::MAX - 1, "1"),
+        ] {
+            let dir = base.path().join(format!("{server}-{pid}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let meta = Meta {
+                server: server.into(),
+                version: "0".into(),
+                pid,
+                project: None,
+                started: started.into(),
+            };
+            std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        }
+        let found = find_in(base.path(), "lupin", None);
+        assert_eq!(found.len(), 1, "the gone one is left out");
+        assert_eq!(found[0].meta.pid, me);
+        assert!(find_in(base.path(), "lupin", Some(me + 1)).is_empty());
+        assert_eq!(find_in(base.path(), "senna", Some(me)).len(), 1);
     }
 }
