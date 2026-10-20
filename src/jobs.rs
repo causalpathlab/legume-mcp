@@ -364,14 +364,15 @@ mod tests {
     #[cfg(unix)]
     fn a_link_loop_ends() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
+        // The real folder, so the loop's links are the only ones (macOS's
+        // temp folder sits under the `/var` link).
+        let root = tmp.path().canonicalize().unwrap();
         symlink(root.join("b"), root.join("a")).unwrap();
         symlink(root.join("a"), root.join("b")).unwrap();
         // Followed up to the cap, then taken as the link it stopped at.
         let key = hold_key(&root.join("a/fit"));
-        let real = root.canonicalize().unwrap();
         assert!(
-            key == real.join("a/fit") || key == real.join("b/fit"),
+            key == root.join("a/fit") || key == root.join("b/fit"),
             "{}",
             key.display()
         );
