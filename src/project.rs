@@ -40,6 +40,9 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+
+use crate::watch::{Body, Feed};
 
 /// The project root, when not the working directory.
 pub const ROOT_ENV: &str = "LEGUME_MCP_PROJECT";
@@ -50,11 +53,14 @@ pub(crate) struct Project {
     root: PathBuf,
     name: String,
     version: String,
+    /// The server's feed, which hears of each script block and notebook
+    /// entry too.
+    feed: Option<Arc<Feed>>,
 }
 
-/// Local date and time, `YYYY-MM-DD` and `HH:MM:SS` (UTC where the local
-/// time cannot be had).
-fn now() -> (String, String) {
+/// Local date and time, `YYYY-MM-DD` and `HH:MM:SS`, and the offset from
+/// UTC in seconds (UTC where the local time cannot be had).
+fn local_now() -> (String, String, i64) {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -72,10 +78,28 @@ fn now() -> (String, String) {
                     tm.tm_mday
                 ),
                 format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec),
+                // c_long: i64 on 64-bit targets, i32 on 32-bit ones.
+                #[allow(clippy::useless_conversion)]
+                i64::from(tm.tm_gmtoff),
             );
         }
     }
-    utc(secs)
+    let (d, t) = utc(secs);
+    (d, t, 0)
+}
+
+/// Local date and time, `YYYY-MM-DD` and `HH:MM:SS`.
+fn now() -> (String, String) {
+    let (d, t, _) = local_now();
+    (d, t)
+}
+
+/// Now, local, as RFC 3339 (`2026-10-20T12:03:33-07:00`).
+pub(crate) fn rfc3339() -> String {
+    let (d, t, off) = local_now();
+    let sign = if off < 0 { '-' } else { '+' };
+    let off = off.abs();
+    format!("{d}T{t}{sign}{:02}:{:02}", off / 3600, off % 3600 / 60)
 }
 
 impl Project {
@@ -84,7 +108,14 @@ impl Project {
             root: std::path::absolute(&root).unwrap_or(root),
             name: name.into(),
             version: version.into(),
+            feed: None,
         }
+    }
+
+    /// The project, telling `feed` of what it records.
+    pub(crate) fn watched(mut self, feed: Option<Arc<Feed>>) -> Self {
+        self.feed = feed;
+        self
     }
 
     /// The project [`ROOT_ENV`] and [`OFF_ENV`] say: none when `off`.
@@ -176,6 +207,12 @@ impl Project {
 
     /// Append to today's `runall.sh`.
     pub(crate) fn script(&self, text: &str) {
+        self.script_step(text, None);
+    }
+
+    /// Append to today's `runall.sh` a block that runs `command` (the bare
+    /// command line, for followers that want it without the guard).
+    pub(crate) fn script_step(&self, text: &str, command: Option<&str>) {
         let Ok(dir) = self.day_dir() else { return };
         let head = || {
             format!(
@@ -190,6 +227,12 @@ impl Project {
             )
         };
         self.append(&dir.join("runall.sh"), 0o700, head, text);
+        if let Some(f) = &self.feed {
+            f.emit(Body::Record {
+                line: text.trim_matches('\n').into(),
+                command: command.map(str::to_string),
+            });
+        }
     }
 
     /// The comment a tool call starts with.
@@ -213,10 +256,16 @@ impl Project {
         }
     }
 
-    /// `cmd` as a shell line: its own directory and environment, this
-    /// server's binary under the server's name, project paths relative, and
-    /// skipped when every one of `outputs` exists.
+    /// `cmd` as a shell line ([`Self::command`]), skipped when every one of
+    /// `outputs` exists.
+    #[cfg(test)]
     pub(crate) fn command_line(&self, cmd: &Command, outputs: &[PathBuf]) -> String {
+        self.guarded(&self.command(cmd), outputs)
+    }
+
+    /// `cmd` as a shell line: its own directory and environment, this
+    /// server's binary under the server's name, project paths relative.
+    pub(crate) fn command(&self, cmd: &Command) -> String {
         let word = |s: &str| quote(&self.rel(s));
         let program = Path::new(cmd.get_program());
         let is_self = crate::own_exe().is_some_and(|e| e == program);
@@ -239,13 +288,20 @@ impl Project {
             word(&program.to_string_lossy())
         });
         words.extend(cmd.get_args().map(|a| word(&a.to_string_lossy())));
-        let mut line = words.join(" ");
-        if let Some(dir) = cmd.get_current_dir() {
-            line = format!("(cd {} && {line})", word(&dir.to_string_lossy()));
+        let line = words.join(" ");
+        match cmd.get_current_dir() {
+            Some(dir) => format!("(cd {} && {line})", word(&dir.to_string_lossy())),
+            None => line,
         }
+    }
+
+    /// `line`, skipped when every one of `outputs` exists and run with
+    /// their folders made.
+    pub(crate) fn guarded(&self, line: &str, outputs: &[PathBuf]) -> String {
         if outputs.is_empty() {
-            return line;
+            return line.into();
         }
+        let word = |s: &str| quote(&self.rel(s));
         let missing: Vec<String> = outputs
             .iter()
             .map(|o| format!("[ ! -e {} ]", word(&o.to_string_lossy())))
@@ -340,6 +396,12 @@ impl Project {
             text.trim_end()
         );
         self.append(&dir.join("notebook.md"), 0o644, head, &entry);
+        if let Some(f) = &self.feed {
+            f.emit(Body::Notebook {
+                entry: kind.into(),
+                text: text.into(),
+            });
+        }
     }
 
     /// A line of `data/README.md`: where input `path` came from.
