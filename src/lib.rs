@@ -192,6 +192,13 @@ impl Call {
         self.run_making(cmd, &[], "")
     }
 
+    /// [`Self::run`] for a child that writes nothing (a preview, a report
+    /// on stdout): kept out of the driver script, whose call comment is
+    /// record enough, so a replay never runs it or misses its inputs.
+    pub fn run_reading(&self, cmd: Command) -> Result<String> {
+        self.run_child(cmd)
+    }
+
     /// [`Self::run`] for a step that writes `outputs`: the driver script
     /// skips it when they all exist, and `results/INDEX.tsv` lists each
     /// with `summary` (one line: what was made, from what).
@@ -205,7 +212,7 @@ impl Call {
                     p.index(&self.tool, outputs, summary);
                 }
                 Err(e) => {
-                    let why = format!("{e:#}");
+                    let why = p.rel(&format!("{e:#}"));
                     let why = why.lines().next().unwrap_or_default();
                     let commented: String = line.lines().map(|l| format!("#   {l}\n")).collect();
                     p.script(&format!("# did not succeed ({why}):\n{commented}"));
@@ -269,6 +276,32 @@ impl Call {
         }
         Ok(out)
     }
+}
+
+/// This server's own binary: where it was started from, or, once that file
+/// is replaced (a reinstall while serving), the running image itself.
+pub(crate) fn own_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let running = Path::new("/proc/self/exe");
+    Some(if !exe.exists() && running.exists() {
+        running.to_path_buf()
+    } else {
+        exe
+    })
+}
+
+/// A command that runs this server's own binary with `args`: the way a tool
+/// runs its CLI as a child. The session's records name it by the server's
+/// name.
+pub fn own_command<I, S>(args: I) -> Result<Command>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let exe = own_exe().context("finding this server's binary")?;
+    let mut cmd = Command::new(exe);
+    cmd.args(args);
+    Ok(cmd)
 }
 
 /// Serve `handler` on stdin and stdout until stdin closes, keeping the
@@ -365,7 +398,6 @@ where
                 // session goes on.
                 let Some(msg) = std::str::from_utf8(&buf)
                     .ok()
-                    .filter(|l| !l.trim().is_empty() || l.is_empty())
                     .and_then(|l| serde_json::from_str::<Value>(l).ok())
                 else {
                     if !buf.iter().all(u8::is_ascii_whitespace) {
@@ -441,7 +473,8 @@ where
                 if let Some(p) = &records {
                     p.call(name, &args);
                 }
-                if let (true, Some(p)) = (builtin_notebook && name == "notebook", &records) {
+                if builtin_notebook && name == "notebook" {
+                    let p = records.as_ref().expect("a built-in notebook has records");
                     let result = match (args["kind"].as_str(), args["text"].as_str()) {
                         (Some(kind), Some(text)) => {
                             p.notebook(kind, text);
@@ -521,8 +554,10 @@ fn call_result(result: Result<Vec<Content>>) -> Value {
             Content::Text(text) => json!({ "type": "text", "text": text }),
             Content::Json(v) => {
                 let text = serde_json::to_string_pretty(&v).unwrap_or_default();
-                if let (true, Value::Object(m)) = (structured.is_none(), v) {
-                    structured = Some(m);
+                if structured.is_none() {
+                    if let Value::Object(m) = v {
+                        structured = Some(m);
+                    }
                 }
                 json!({ "type": "text", "text": text })
             }
