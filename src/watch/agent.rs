@@ -412,16 +412,16 @@ impl Agent {
     }
 
     /// The view in `n` lines of at most `width` characters, for a sidebar:
-    /// the server and whether it is followed, then the latest calls with
-    /// their status, the selected one marked `>`.
+    /// the server and its pid and whether it is followed, then the latest
+    /// calls with their status, the selected one marked `>`.
     pub fn lines(&self, n: usize, width: usize) -> Vec<String> {
         if n == 0 {
             return vec![];
         }
-        let who = self
-            .meta
-            .as_ref()
-            .map_or_else(|| self.dir.display().to_string(), |m| m.server.clone());
+        let who = self.meta.as_ref().map_or_else(
+            || self.dir.display().to_string(),
+            |m| format!("{} {}", m.server, m.pid),
+        );
         let how = if self.ended {
             "ended"
         } else if self.following() {
