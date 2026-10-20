@@ -80,6 +80,12 @@ too; a job that succeeds is recorded when it ends, like any step (`runall.sh`,
 `INDEX.tsv`); one cancelled or failed is not. Jobs end with their server: a
 step longer than a client session is the tool's own command line's to run.
 
+While a job runs, its outputs are held: a step writing one of them (the same
+file, or one inside the other, however spelled) is refused, naming the job,
+until the job ends. `run_making` and `spawn_job` check this themselves; a tool
+that writes an input file beside its outputs first, or chooses an output name
+itself, asks `Call::ensure_free(outputs)` before it does.
+
 ## Watching and steering
 
 While an agent works, each server writes what it is doing to an owner-only
