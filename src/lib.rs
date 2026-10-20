@@ -381,14 +381,16 @@ fn made(outputs: &[PathBuf]) -> Result<()> {
 }
 
 /// What a failed child's stderr is quoted as, [`STDERR_TAIL`] lines at
-/// most: its last lines; or, when its last `Error:` line is followed only by
-/// a backtrace (a Rust program failing with backtraces on), from that line
-/// to where the backtrace starts. An error line with other output after it
-/// (a retry that went on to fail otherwise) is not the end, so the tail is.
+/// most: its last lines; or, when its last `Error:` (or panic) line is
+/// followed closely by a backtrace (a Rust program failing with backtraces
+/// on), from that line to where the backtrace starts. An error line with
+/// other output after it (a retry that went on to fail otherwise) is not the
+/// end, so the tail is.
 fn quote(lines: &VecDeque<String>) -> String {
+    // A panic ends a Rust program the way an error does.
     let is_error = |l: &str| {
         let l = l.trim_start();
-        l.starts_with("Error:") || l.starts_with("error:")
+        l.starts_with("Error:") || l.starts_with("error:") || l.contains("' panicked at ")
     };
     let is_backtrace = |l: &str| {
         let l = l.trim_start().to_ascii_lowercase();
@@ -398,10 +400,10 @@ fn quote(lines: &VecDeque<String>) -> String {
     let (from, to) = match lines.iter().rposition(|l| is_error(l)) {
         Some(e) => match lines.iter().skip(e).position(|l| is_backtrace(l)) {
             // The error, up to its backtrace.
-            Some(b) => (e, e + b),
+            Some(b) if b <= STDERR_TAIL => (e, e + b),
             // The error near the end: it is how the child ended.
-            None if e >= tail => (e, lines.len()),
-            None => (tail, lines.len()),
+            _ if e >= tail => (e, lines.len()),
+            _ => (tail, lines.len()),
         },
         None => (tail, lines.len()),
     };
@@ -1011,5 +1013,37 @@ mod tests {
     fn an_error_near_the_end_is_quoted_from() {
         let l = ["a", "b", "Error: bad input", "caused by: x"];
         assert_eq!(quote(&lines(&l)), "Error: bad input\ncaused by: x");
+    }
+
+    #[test]
+    fn a_panic_after_an_early_error_is_the_end_quoted() {
+        // A retry logged as an error, much more, then a panic with backtrace.
+        let mut l = vec!["error: fetch failed, retrying"];
+        let more: Vec<String> = (0..30).map(|i| format!("step {i}")).collect();
+        l.extend(more.iter().map(String::as_str));
+        l.extend([
+            "thread 'main' panicked at src/fit.rs:7:5:",
+            "index out of bounds",
+            "stack backtrace:",
+            "  0: frame",
+        ]);
+        let q = quote(&lines(&l));
+        assert_eq!(
+            q,
+            "thread 'main' panicked at src/fit.rs:7:5:\nindex out of bounds"
+        );
+    }
+
+    #[test]
+    fn an_error_far_from_a_backtrace_is_not_paired_with_it() {
+        // An error, then far more than a quote, then a backtrace with no
+        // error line of its own: the tail is quoted, not the old error.
+        let mut l = vec!["error: fetch failed, retrying"];
+        let more: Vec<String> = (0..30).map(|i| format!("step {i}")).collect();
+        l.extend(more.iter().map(String::as_str));
+        l.extend(["stack backtrace:", "  0: frame"]);
+        let q = quote(&lines(&l));
+        assert!(!q.contains("retrying"), "{q}");
+        assert!(q.ends_with("  0: frame"), "{q}");
     }
 }
