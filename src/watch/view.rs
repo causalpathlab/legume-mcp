@@ -1,6 +1,8 @@
-//! The person's side of [`super`]: a pane that follows a server's feed, for
-//! a tool's own TUI to embed ([`AgentPane`]), and a full screen of it in a
-//! session of the tool's own ([`run`], for `<tool> mcp watch`).
+//! The person's side of [`super`] on a terminal: a pane drawing an
+//! [`Agent`], for a tool's own TUI to embed ([`AgentPane`]), and a full
+//! screen of it in a session of the tool's own ([`run`], for
+//! `<tool> mcp watch`). A host that draws the agent its own way (a sidebar,
+//! its own map) uses [`Agent`] alone.
 //!
 //! What the pane does is the same in every tool:
 //!
@@ -20,9 +22,13 @@
 //!    the selected call to the tool ([`Handled::Open`]), which may open a
 //!    view of its own on what it wrote.
 //!
-//! Only key presses act; a key's release or repeat is taken and dropped.
+//! The keys are a table ([`Keys`]) the host can rebind, so F can follow
+//! elsewhere. Only key presses act; a key's release or repeat is taken and
+//! dropped.
 
-use super::{control, follow, Body, Control, Event, Follow, From, Meta};
+use super::agent::clock;
+pub use super::agent::{Action, Agent, CallView, Outcome, Status};
+use super::Meta;
 use anyhow::Result;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
@@ -35,15 +41,9 @@ use ratatui::widgets::{
     Block, Borders, List, ListItem, ListState, Paragraph, StatefulWidget, Widget, Wrap,
 };
 use serde_json::Value;
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
-
-/// Lines of a call's log kept for the pane.
-const PROGRESS_KEPT: usize = 40;
-/// Notebook entries kept for the pane.
-const NOTES_KEPT: usize = 50;
 
 /// What became of a key the pane was given.
 pub enum Handled {
@@ -55,86 +55,89 @@ pub enum Handled {
     Open(CallView),
 }
 
-/// How a call went.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Status {
-    Running,
-    Done {
-        ms: u64,
-    },
-    Failed {
-        ms: u64,
-    },
-    /// `by`: the client or the user.
-    Stopped {
-        by: String,
-    },
-    /// The server went while it ran.
-    Lost,
-}
-
-/// One call, as the feed told it.
+/// The pane's keys: which key asks for which [`Action`].
 #[derive(Clone, Debug)]
-pub struct CallView {
-    pub id: String,
-    pub tool: String,
-    pub args: Value,
-    /// When it came, `12:34:56`.
-    pub at: String,
-    pub status: Status,
-    /// What came of it: the result's text and JSON, cut to 4 KB.
-    pub text: String,
-    /// Its log, the last lines; dropped once a result says what came of it.
-    progress: VecDeque<String>,
-}
+pub struct Keys(Vec<(KeyCode, Action)>);
 
-fn seconds(ms: u64) -> String {
-    if ms < 1000 {
-        format!("{ms} ms")
-    } else {
-        format!("{:.1} s", ms as f64 / 1000.0)
+impl Default for Keys {
+    fn default() -> Self {
+        use Action::*;
+        Self(vec![
+            (KeyCode::Up, Previous),
+            (KeyCode::Char('k'), Previous),
+            (KeyCode::Down, Next),
+            (KeyCode::Char('j'), Next),
+            (KeyCode::PageUp, PageUp),
+            (KeyCode::PageDown, PageDown),
+            (KeyCode::Home, First),
+            (KeyCode::End, Last),
+            (KeyCode::Char('F'), Follow),
+            (KeyCode::Char('f'), Follow),
+            (KeyCode::Char('o'), Open),
+            (KeyCode::Char('s'), Stop),
+            (KeyCode::Char('n'), Note),
+        ])
     }
 }
 
-impl Status {
-    fn shown(&self) -> (String, Style) {
-        match self {
-            Status::Running => (
-                "running".into(),
-                Style::new().cyan().add_modifier(Modifier::BOLD),
-            ),
-            Status::Done { ms } => (format!("done {}", seconds(*ms)), Style::new().green()),
-            Status::Failed { ms } => (format!("failed {}", seconds(*ms)), Style::new().red()),
-            Status::Stopped { by } => (format!("stopped by the {by}"), Style::new().yellow()),
-            Status::Lost => ("lost: the server went".into(), Style::new().red()),
-        }
+impl Keys {
+    /// `key` asks for `action`, in place of whatever it asked for before.
+    #[must_use]
+    pub fn bind(mut self, key: KeyCode, action: Action) -> Self {
+        self.0.retain(|(k, _)| *k != key);
+        self.0.push((key, action));
+        self
+    }
+
+    /// `key` asks for nothing: the host keeps it.
+    #[must_use]
+    pub fn unbind(mut self, key: KeyCode) -> Self {
+        self.0.retain(|(k, _)| *k != key);
+        self
+    }
+
+    fn action(&self, key: KeyCode) -> Option<Action> {
+        self.0.iter().find(|(k, _)| *k == key).map(|(_, a)| *a)
+    }
+
+    /// The first key bound to `action`, as the footer names it.
+    fn name(&self, action: Action) -> Option<String> {
+        let (k, _) = self.0.iter().find(|(_, a)| *a == action)?;
+        Some(match k {
+            KeyCode::Char(c) => c.to_string(),
+            KeyCode::Up => "↑".into(),
+            KeyCode::Down => "↓".into(),
+            KeyCode::PageUp => "PgUp".into(),
+            KeyCode::PageDown => "PgDn".into(),
+            KeyCode::Home => "Home".into(),
+            KeyCode::End => "End".into(),
+            KeyCode::Enter => "Enter".into(),
+            KeyCode::Tab => "Tab".into(),
+            other => format!("{other:?}"),
+        })
     }
 }
 
-/// The clock time of an RFC 3339 stamp: `12:34:56`.
-fn clock(t: &str) -> &str {
-    t.get(11..19).unwrap_or(t)
+/// The colour of a status.
+fn style(status: &Status) -> Style {
+    match status {
+        Status::Running => Style::new().cyan().add_modifier(Modifier::BOLD),
+        Status::Done { .. } => Style::new().green(),
+        Status::Failed { .. } | Status::Lost => Style::new().red(),
+        Status::Stopped { .. } => Style::new().yellow(),
+    }
 }
 
-/// A line as a terminal would leave it: what came after its last carriage
-/// return (a redrawn bar's last state), tabs as spaces, no control left.
-fn plain(line: &str) -> String {
+/// A result's line as a terminal would leave it: what came after its last
+/// carriage return, tabs as spaces, no control left. (Progress lines also
+/// lose a log's head, through [`super::plain`]; a result's text keeps its
+/// brackets.)
+fn text_line(line: &str) -> String {
     let line = line.rsplit('\r').next().unwrap_or(line);
     line.replace('\t', "    ")
         .chars()
         .filter(|c| !c.is_control())
         .collect()
-}
-
-/// A log line without its terminal colours or "[time LEVEL module]" prefix.
-#[cfg(unix)]
-fn log(line: &str) -> String {
-    plain(&legume_tui::child::log_line(line))
-}
-
-#[cfg(not(unix))]
-fn log(line: &str) -> String {
-    plain(line)
 }
 
 /// A server in a line: `name version · pid N · project`.
@@ -153,30 +156,12 @@ fn list<'a>(items: Vec<ListItem<'a>>, title: String) -> List<'a> {
         .highlight_style(Style::new().reversed())
 }
 
-/// Push to the back, dropping from the front past `kept`.
-fn push_kept<T>(q: &mut VecDeque<T>, x: T, kept: usize) {
-    if q.len() == kept {
-        q.pop_front();
-    }
-    q.push_back(x);
-}
-
-/// A pane following one server.
+/// A pane following one server: an [`Agent`] drawn, with its keys.
 pub struct AgentPane {
-    dir: PathBuf,
-    feed: Follow,
-    meta: Option<Meta>,
-    calls: Vec<CallView>,
-    /// The notebook and the person's notes: (who or what kind, text).
-    notes: VecDeque<(String, String)>,
-    state: Option<Value>,
-    ended: bool,
-    /// The call the person moved to; none while following.
-    selected: Option<usize>,
+    agent: Agent,
+    keys: Keys,
     /// Where the call list is scrolled to, kept between frames.
     list: ListState,
-    /// The server's steering, when the tool offers it.
-    steer: Option<Control>,
     /// A note being typed.
     typing: Option<String>,
     /// What the last key did, said in the footer until the next key.
@@ -187,142 +172,63 @@ impl AgentPane {
     /// Follow the server in `dir` (one of [`super::live`]) from the start of
     /// its feed; `steer` offers stop and note.
     pub fn new(dir: &Path, steer: bool) -> Result<Self> {
+        Self::with_keys(dir, steer, Keys::default())
+    }
+
+    /// [`Self::new`] with the host's own key table.
+    pub fn with_keys(dir: &Path, steer: bool, keys: Keys) -> Result<Self> {
         Ok(Self {
-            dir: dir.to_path_buf(),
-            feed: follow(dir, From::Start)?,
-            meta: None,
-            calls: vec![],
-            notes: VecDeque::new(),
-            state: super::state(dir),
-            ended: false,
-            selected: None,
+            agent: Agent::new(dir, steer)?,
+            keys,
             list: ListState::default(),
-            steer: steer.then(|| control(dir)),
             typing: None,
             said: None,
         })
     }
 
+    /// The followed server, as the pane knows it.
+    pub fn agent(&self) -> &Agent {
+        &self.agent
+    }
+
+    pub fn agent_mut(&mut self) -> &mut Agent {
+        &mut self.agent
+    }
+
     /// Take in what the feed has now, without waiting; whether anything
     /// changed.
     pub fn poll(&mut self) -> bool {
-        let mut changed = false;
-        while let Some(e) = self.feed.try_next() {
-            self.apply(e);
-            changed = true;
-        }
-        if !self.ended && self.feed.ended() {
-            // What it wrote last, then nothing more.
-            while let Some(e) = self.feed.try_next() {
-                self.apply(e);
-            }
-            self.ended = true;
-            for c in self
-                .calls
-                .iter_mut()
-                .filter(|c| c.status == Status::Running)
-            {
-                c.status = Status::Lost;
-            }
-            changed = true;
-        }
-        changed
-    }
-
-    fn call(&mut self, id: &str) -> Option<&mut CallView> {
-        self.calls.iter_mut().rev().find(|c| c.id == id)
-    }
-
-    fn apply(&mut self, e: Event) {
-        match e.body {
-            Body::Server(m) => self.meta = Some(m),
-            Body::Call { id, tool, args } => self.calls.push(CallView {
-                id,
-                tool,
-                args,
-                at: clock(&e.t).to_string(),
-                status: Status::Running,
-                text: String::new(),
-                progress: VecDeque::new(),
-            }),
-            Body::Progress { id, message } => {
-                if let Some(c) = self.call(&id) {
-                    push_kept(&mut c.progress, log(&message), PROGRESS_KEPT);
-                }
-            }
-            Body::Result { id, ok, ms, text } => {
-                if let Some(c) = self.call(&id) {
-                    // A stop comes before its failed result, and stays.
-                    if c.status == Status::Running {
-                        c.status = if ok {
-                            Status::Done { ms }
-                        } else {
-                            Status::Failed { ms }
-                        };
-                    }
-                    c.text = text;
-                    c.progress = VecDeque::new();
-                }
-            }
-            Body::Cancelled { id, by } => {
-                if let Some(c) = self.call(&id) {
-                    c.status = Status::Stopped { by };
-                }
-            }
-            Body::State { state, .. } => self.state = Some(state),
-            // The person's notes show as they leave them; the notebook's
-            // copy of one (as `user`) is not shown twice.
-            Body::Note { text } => push_kept(&mut self.notes, ("you".into(), text), NOTES_KEPT),
-            Body::Notebook { entry, .. } if entry == "user" => {}
-            Body::Notebook { entry, text } => push_kept(&mut self.notes, (entry, text), NOTES_KEPT),
-            // The end is the feed's to tell (`Follow::ended`).
-            Body::Record { .. } | Body::Ended { .. } => {}
-        }
+        self.agent.poll()
     }
 
     /// The tool's view as the agent last left it.
     pub fn state(&self) -> Option<&Value> {
-        self.state.as_ref()
+        self.agent.state()
     }
 
     pub fn following(&self) -> bool {
-        self.selected.is_none()
-    }
-
-    /// The selected call's place: the latest while following.
-    fn selected(&self) -> usize {
-        self.selected.unwrap_or(self.calls.len().saturating_sub(1))
+        self.agent.following()
     }
 
     /// Stop following: the host's own navigation moved the view.
     pub fn pause(&mut self) {
-        self.selected = Some(self.selected());
+        self.agent.pause();
     }
 
     /// Follow again, from the latest call.
     pub fn resume(&mut self) {
-        self.selected = None;
+        self.agent.resume();
     }
 
     /// Whether the server is gone.
     pub fn ended(&self) -> bool {
-        self.ended
+        self.agent.ended()
     }
 
     /// Whether a note is being typed: the host should give the pane every
     /// key, its own (q) included.
     pub fn typing(&self) -> bool {
         self.typing.is_some()
-    }
-
-    /// The steering, while there is a server to steer.
-    fn steering(&self) -> Option<&Control> {
-        self.steer.as_ref().filter(|_| !self.ended)
-    }
-
-    /// What a stop or a note that did not go says.
-    fn not_sent(what: &str, e: &anyhow::Error) -> String {
-        format!("the {what} may not have reached the server ({e:#}); it may still take it")
     }
 
     /// The pane's answer to a key.
@@ -336,17 +242,8 @@ impl AgentPane {
                 KeyCode::Esc => self.typing = None,
                 KeyCode::Enter => {
                     let text = self.typing.take().unwrap_or_default();
-                    let text = text.trim();
-                    if !text.is_empty() {
-                        self.said = Some(match self.steering() {
-                            None => "the server has ended: the note did not go".into(),
-                            Some(c) => match c.note(text) {
-                                Ok(()) => {
-                                    "note left: the agent gets it with its next result".into()
-                                }
-                                Err(e) => Self::not_sent("note", &e),
-                            },
-                        });
+                    if !text.trim().is_empty() {
+                        self.said = Some(self.agent.note(&text));
                     }
                 }
                 KeyCode::Backspace => {
@@ -357,50 +254,22 @@ impl AgentPane {
             }
             return Handled::Consumed;
         }
-        let last = self.calls.len().saturating_sub(1);
-        let at = self.selected();
-        let to = match key.code {
-            KeyCode::Up | KeyCode::Char('k') => Some(at.saturating_sub(1)),
-            KeyCode::Down | KeyCode::Char('j') => Some(at + 1),
-            KeyCode::PageUp => Some(at.saturating_sub(10)),
-            KeyCode::PageDown => Some(at + 10),
-            KeyCode::Home => Some(0),
-            KeyCode::End => Some(last),
-            _ => None,
+        let Some(action) = self.keys.action(key.code) else {
+            return Handled::Ignored;
         };
-        if let Some(to) = to {
-            self.selected = Some(to.min(last));
-            return Handled::Consumed;
-        }
-        match key.code {
-            KeyCode::Char('f' | 'F') => {
-                self.resume();
+        match self.agent.act(action) {
+            Outcome::Done => Handled::Consumed,
+            Outcome::Open(c) => Handled::Open(c),
+            Outcome::Say(s) => {
+                self.said = Some(s);
                 Handled::Consumed
             }
-            KeyCode::Char('o') => match self.calls.get(at) {
-                Some(c) if c.status != Status::Running => Handled::Open(c.clone()),
-                _ => {
-                    self.said = Some("nothing to open on this call yet".into());
-                    Handled::Consumed
-                }
-            },
-            KeyCode::Char('s') if self.steering().is_some() => {
-                self.said = Some(match (self.calls.get(at), self.steering()) {
-                    (Some(c), Some(steer)) if c.status == Status::Running => {
-                        match steer.stop(&c.id) {
-                            Ok(()) => format!("asked to stop {} (call {})", c.tool, c.id),
-                            Err(e) => Self::not_sent("stop", &e),
-                        }
-                    }
-                    _ => "the selected call is not running".into(),
-                });
-                Handled::Consumed
-            }
-            KeyCode::Char('n') if self.steering().is_some() => {
+            Outcome::WriteNote => {
                 self.typing = Some(String::new());
                 Handled::Consumed
             }
-            _ => Handled::Ignored,
+            // Steering the view does not offer: the key is the host's.
+            Outcome::Unavailable => Handled::Ignored,
         }
     }
 
@@ -430,16 +299,19 @@ impl AgentPane {
     }
 
     fn render_head(&self, area: Rect, buf: &mut Buffer) {
-        let who = self
-            .meta
-            .as_ref()
-            .map_or_else(|| self.dir.display().to_string(), who);
-        let (live, style, follow) = if self.ended {
-            ("ended", Style::new().red(), "")
-        } else if self.following() {
-            ("live", Style::new().green(), " · following")
+        let a = &self.agent;
+        let who = a.meta().map_or_else(|| a.dir().display().to_string(), who);
+        let (live, style, follow) = if a.ended() {
+            ("ended", Style::new().red(), String::new())
+        } else if a.following() {
+            ("live", Style::new().green(), " · following".to_string())
         } else {
-            ("live", Style::new().green(), " · paused — F follows")
+            // Which key follows again, when one does.
+            let paused = match self.keys.name(Action::Follow) {
+                Some(k) => format!(" · paused — {k} follows"),
+                None => " · paused".to_string(),
+            };
+            ("live", Style::new().green(), paused)
         };
         Line::from(vec![
             Span::from(who).bold(),
@@ -451,38 +323,39 @@ impl AgentPane {
     }
 
     fn render_calls(&mut self, area: Rect, buf: &mut Buffer) {
-        let items: Vec<ListItem> = self
-            .calls
+        let calls = self.agent.calls();
+        let items: Vec<ListItem> = calls
             .iter()
             .map(|c| {
-                let (status, style) = c.status.shown();
                 ListItem::new(Line::from(vec![
                     Span::from(c.at.as_str()).dim(),
                     Span::from(" "),
                     Span::from(c.tool.as_str()).bold(),
                     Span::from(" "),
-                    Span::styled(status, style),
+                    Span::styled(c.status.label(), style(&c.status)),
                 ]))
             })
             .collect();
-        let selected = (!self.calls.is_empty()).then(|| self.selected());
-        self.list.select(selected);
-        let title = format!(" calls ({}) ", self.calls.len());
+        let title = format!(" calls ({}) ", calls.len());
+        self.list.select(self.agent.selected());
         StatefulWidget::render(list(items, title), area, buf, &mut self.list);
     }
 
     fn render_detail(&self, area: Rect, buf: &mut Buffer) {
         let block = Block::new().borders(Borders::ALL);
-        let Some(c) = self.calls.get(self.selected()) else {
+        let Some(c) = self
+            .agent
+            .selected()
+            .and_then(|i| self.agent.calls().get(i))
+        else {
             Paragraph::new("no calls yet")
                 .block(block)
                 .render(area, buf);
             return;
         };
-        let (status, style) = c.status.shown();
         let block = block.title(Line::from(vec![
             Span::from(" "),
-            Span::styled(status, style),
+            Span::styled(c.status.label(), style(&c.status)),
             Span::from(" "),
         ]));
         let inner = block.inner(area);
@@ -509,7 +382,7 @@ impl AgentPane {
                 .collect();
             Paragraph::new(lines).render(body, buf);
         } else {
-            let lines: Vec<Line> = c.text.lines().map(|l| Line::from(plain(l))).collect();
+            let lines: Vec<Line> = c.text.lines().map(|l| Line::from(text_line(l))).collect();
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
                 .render(body, buf);
@@ -518,16 +391,16 @@ impl AgentPane {
 
     fn render_notes(&self, area: Rect, buf: &mut Buffer) {
         let shown = area.height.saturating_sub(2) as usize;
-        let skip = self.notes.len().saturating_sub(shown);
-        let lines: Vec<Line> = self
-            .notes
-            .iter()
+        let notes: Vec<_> = self.agent.notes().collect();
+        let skip = notes.len().saturating_sub(shown);
+        let lines: Vec<Line> = notes
+            .into_iter()
             .skip(skip)
             .map(|(kind, text)| {
                 let first = text.lines().next().unwrap_or_default();
                 Line::from(vec![
                     Span::from(format!("{kind}: ")).bold(),
-                    Span::from(plain(first)),
+                    Span::from(text_line(first)),
                 ])
             })
             .collect();
@@ -545,10 +418,21 @@ impl AgentPane {
             ]),
             (None, Some(said)) => Line::from(said.as_str()),
             (None, None) => {
-                let mut keys: Vec<String> =
-                    ["↑↓ select", "F follow", "o open"].map(String::from).into();
-                if self.steering().is_some() {
-                    keys.extend(["s stop".into(), "n note".into()]);
+                let mut keys: Vec<String> = vec![];
+                if let (Some(p), Some(n)) = (
+                    self.keys.name(Action::Previous),
+                    self.keys.name(Action::Next),
+                ) {
+                    keys.push(format!("{p}{n} select"));
+                }
+                let mut named = vec![(Action::Follow, "follow"), (Action::Open, "open")];
+                if self.agent.can_steer() {
+                    named.extend([(Action::Stop, "stop"), (Action::Note, "note")]);
+                }
+                for (action, what) in named {
+                    if let Some(k) = self.keys.name(action) {
+                        keys.push(format!("{k} {what}"));
+                    }
                 }
                 keys.push("q quit".into());
                 // A session's own keys: how to leave it running, and to go to another.
@@ -578,10 +462,7 @@ pub fn run(
     // The servers to choose among, before any screen goes up.
     let mut servers: Vec<_> = match &dir {
         Some(_) => vec![],
-        None => super::live()
-            .into_iter()
-            .filter(|l| l.alive && l.meta.server == tool.name())
-            .collect(),
+        None => super::find(tool.name(), None),
     };
     let chosen = match (dir, servers.len()) {
         (Some(d), _) => Some(d),
@@ -683,13 +564,27 @@ fn pick(
 
 #[cfg(test)]
 mod tests {
-    use super::plain;
+    use super::*;
 
     #[test]
     fn a_line_reads_as_a_terminal_leaves_it() {
         // Columns stay apart; a redrawn bar shows its last state.
-        assert_eq!(plain("gene\tscore"), "gene    score");
-        assert_eq!(plain("10%\r20%\r30%"), "30%");
-        assert_eq!(plain("a\u{7}b"), "ab");
+        assert_eq!(text_line("gene\tscore"), "gene    score");
+        assert_eq!(text_line("10%\r20%\r30%"), "30%");
+        assert_eq!(text_line("a\u{7}b"), "ab");
+        // A result's brackets stay (a progress line's log head would not).
+        assert_eq!(text_line("[a, b] c"), "[a, b] c");
+    }
+
+    #[test]
+    fn keys_rebind_and_name_themselves() {
+        let keys = Keys::default()
+            .unbind(KeyCode::Char('F'))
+            .unbind(KeyCode::Char('f'))
+            .bind(KeyCode::Char('g'), Action::Follow);
+        assert_eq!(keys.action(KeyCode::Char('F')), None);
+        assert_eq!(keys.action(KeyCode::Char('g')), Some(Action::Follow));
+        assert_eq!(keys.name(Action::Follow).as_deref(), Some("g"));
+        assert_eq!(keys.name(Action::Previous).as_deref(), Some("↑"));
     }
 }

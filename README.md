@@ -82,6 +82,14 @@ with the agent's next tool result and goes into the notebook). The feed is
 for watching; the records below stay the account to redo the work from.
 `LEGUME_MCP_WATCH=off` writes none; a path puts the folders under it.
 
+A viewer follows with `watch::Agent`, which has no UI in it: the calls and
+their status, the notebook, the tool's view (`take_new_state` hands over the
+latest view once, when it changed since the last take), the steps recorded,
+following or paused, and steering through
+`act(Action)` and `note`. `lines(n, width)` gives a sidebar. With the `tui`
+feature, `watch::view::AgentPane` draws it as a pane, with keys the host can
+rebind (`Keys`), and `watch::view::run` gives `<tool> mcp watch`.
+
 ## Project records
 
 Every server keeps the same records under the project (its working
