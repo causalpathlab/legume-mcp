@@ -301,17 +301,17 @@ impl AgentPane {
     fn render_head(&self, area: Rect, buf: &mut Buffer) {
         let a = &self.agent;
         let who = a.meta().map_or_else(|| a.dir().display().to_string(), who);
-        let follow_key = self.keys.name(Action::Follow).unwrap_or_default();
         let (live, style, follow) = if a.ended() {
             ("ended", Style::new().red(), String::new())
         } else if a.following() {
             ("live", Style::new().green(), " · following".to_string())
         } else {
-            (
-                "live",
-                Style::new().green(),
-                format!(" · paused — {follow_key} follows"),
-            )
+            // Which key follows again, when one does.
+            let paused = match self.keys.name(Action::Follow) {
+                Some(k) => format!(" · paused — {k} follows"),
+                None => " · paused".to_string(),
+            };
+            ("live", Style::new().green(), paused)
         };
         Line::from(vec![
             Span::from(who).bold(),

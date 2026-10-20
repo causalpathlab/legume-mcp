@@ -97,6 +97,13 @@ fn an_agent_follows_a_server_without_a_screen() {
         .any(|c| c.starts_with("touch ") && c.ends_with("made.txt")));
     assert_eq!(agent.take_new_state(), Some(json!({ "focus": [3] })));
     assert_eq!(agent.take_new_state(), None, "a view is taken once");
+    // Opened after the view was published: it comes once, not again when
+    // the first poll replays the feed.
+    let mut late = Agent::new(&live.dir, false).unwrap();
+    assert_eq!(late.take_new_state(), Some(json!({ "focus": [3] })));
+    late.poll();
+    assert_eq!(late.take_new_state(), None, "the replay is not a new view");
+    assert_eq!(late.calls().len(), 2, "the feed so far is read when opened");
 
     // A sidebar's lines.
     let lines = agent.lines(3, 30);

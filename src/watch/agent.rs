@@ -136,20 +136,28 @@ impl Agent {
     /// [`super::find`]) from the start of its feed; `steer` offers stop and
     /// note.
     pub fn new(dir: &Path, steer: bool) -> Result<Self> {
-        let state = super::state(dir);
-        Ok(Self {
+        let mut agent = Self {
             dir: dir.to_path_buf(),
             feed: follow(dir, From::Start)?,
             meta: None,
             calls: vec![],
             notes: VecDeque::new(),
             records: VecDeque::new(),
-            state_new: state.is_some(),
-            state,
+            state: None,
+            state_new: false,
             ended: false,
             selected: None,
             steer: steer.then(|| control(dir)),
-        })
+        };
+        // The feed so far, read now: its views are one view, new once, and a
+        // later poll marks only the views after it. `state.json` stands in
+        // when the feed's own are gone.
+        agent.poll();
+        if agent.state.is_none() {
+            agent.state = super::state(dir);
+            agent.state_new = agent.state.is_some();
+        }
+        Ok(agent)
     }
 
     /// Take in what the feed has now, without waiting; whether anything
@@ -268,9 +276,9 @@ impl Agent {
         self.state.as_ref()
     }
 
-    /// The tool's view if it changed since the last take (the first take
-    /// gives the view the server had when it was opened): for a host that
-    /// applies each new view once.
+    /// The tool's latest view if it changed since the last take (the first
+    /// take gives the view the server had when it was opened; several views
+    /// between takes give the last): for a host that applies a view once.
     pub fn take_new_state(&mut self) -> Option<Value> {
         std::mem::take(&mut self.state_new)
             .then(|| self.state.clone())
@@ -416,7 +424,8 @@ impl Agent {
     }
 }
 
-/// `s` cut to `width` characters, an ellipsis marking the cut.
+/// `s` cut to `width` characters (not display columns: wide characters
+/// take two), an ellipsis marking the cut.
 fn fit(s: &str, width: usize) -> String {
     if s.chars().count() <= width {
         return s.into();
