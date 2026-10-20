@@ -24,9 +24,11 @@ struct Tools {
 
 impl Handler for Tools {
     fn tools(&self) -> Vec<ToolSpec> {
-        ["echo", "fail", "count", "child", "picture", "panic"]
-            .map(|n| ToolSpec::new(n, n, json!({ "type": "object" })))
-            .into()
+        [
+            "echo", "fail", "count", "child", "picture", "panic", "write",
+        ]
+        .map(|n| ToolSpec::new(n, n, json!({ "type": "object" })))
+        .into()
     }
 
     fn call(&mut self, name: &str, args: Value, cx: &Call) -> Result<Vec<Content>> {
@@ -41,6 +43,11 @@ impl Handler for Tools {
                 Ok(vec![Content::Text(cx.run(cmd)?)])
             }
             "picture" => Ok(vec![Content::Png(vec![0x89, b'P', b'N', b'G'])]),
+            "write" => {
+                let path = std::path::PathBuf::from(args["path"].as_str().unwrap());
+                cx.write_file(&path, args["text"].as_str().unwrap())?;
+                Ok(vec![])
+            }
             _ => panic!("boom"),
         }
     }
@@ -210,4 +217,71 @@ fn a_cancelled_call_is_killed_and_unanswered() {
     assert!(start.elapsed().as_secs() < 10, "the child was killed");
     assert!(msgs.iter().all(|m| m["id"] != json!(1)));
     assert_eq!(by_id(&msgs, 2)["result"]["content"][0]["text"], "2");
+}
+
+#[test]
+fn the_session_script_repeats_what_the_tools_wrote() {
+    let dir = std::env::temp_dir().join(format!("legume-mcp-journal-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("s.sh");
+    let made = dir.join("made it.txt");
+    let input: String = [
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
+        call(2, "echo", json!({ "a": 1 })),
+        call(
+            3,
+            "child",
+            json!({ "script": format!("printf 'x\\n' > '{}'", made.display()) }),
+        ),
+        call(4, "child", json!({ "script": "exit 2" })),
+        call(
+            5,
+            "write",
+            json!({ "path": dir.join("in.tsv"), "text": "a\tb\nLEGUME_MCP_EOF\n" }),
+        ),
+    ]
+    .iter()
+    .map(|l| format!("{l}\n"))
+    .collect();
+    let sink = Sink::default();
+    legume_mcp::serve_journaled(
+        Cursor::new(input),
+        sink.clone(),
+        ServerInfo::default(),
+        Some(script.clone()),
+        Tools { calls: 0 },
+    )
+    .unwrap();
+    let text = std::fs::read_to_string(&script).unwrap();
+    assert!(text.starts_with("#!/usr/bin/env bash\n"), "{text}");
+    assert!(text.contains("set -euo pipefail\ncd "), "{text}");
+    assert!(
+        text.contains(" echo {\"a\":1}\n"),
+        "every call is a comment: {text}"
+    );
+    assert!(
+        text.contains("\nsh -c 'printf "),
+        "a child is its command: {text}"
+    );
+    assert!(text.contains("# did not succeed ("), "{text}");
+    assert!(
+        text.contains("<<'LEGUME_MCP_EOF_'\na\tb\nLEGUME_MCP_EOF\nLEGUME_MCP_EOF_\n"),
+        "a written input is a heredoc that its contents cannot end: {text}"
+    );
+    let reply = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        reply.contains(&script.display().to_string()),
+        "the instructions name the script"
+    );
+
+    // The script redoes the work.
+    std::fs::remove_file(&made).unwrap();
+    let ran = Command::new("bash").arg(&script).status().unwrap();
+    assert!(ran.success());
+    assert_eq!(std::fs::read_to_string(&made).unwrap(), "x\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("in.tsv")).unwrap(),
+        "a\tb\nLEGUME_MCP_EOF\n"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }

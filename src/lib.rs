@@ -16,6 +16,10 @@
 //!   cancelled call gets no response, as the protocol asks.
 //! - [`Call::progress`] sends `notifications/progress` when the client
 //!   asked for them (a `progressToken`), and does nothing otherwise.
+//! - [`serve`] keeps a session script that repeats what the tools wrote
+//!   (see [`journal`]): tools that write run a child through [`Call::run`]
+//!   and write the inputs they make through [`Call::write_file`], so a user
+//!   can redo an agent's session without the agent.
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -23,11 +27,15 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+pub mod journal;
+use journal::Journal;
 
 /// Protocol revisions this server speaks, newest first. A client asking for
 /// one of them gets it; any other gets the newest.
@@ -89,6 +97,7 @@ pub trait Handler {
 type Out = Arc<Mutex<Box<dyn Write + Send>>>;
 /// Ids (as JSON text) of requests the client has cancelled.
 type Cancelled = Arc<Mutex<HashSet<String>>>;
+type Script = Option<Arc<Mutex<Journal>>>;
 
 fn send(out: &Out, msg: &Value) {
     let mut w = out.lock().unwrap_or_else(|e| e.into_inner());
@@ -117,9 +126,24 @@ pub struct Call {
     step: AtomicU64,
     out: Out,
     cancelled: Cancelled,
+    script: Script,
 }
 
 impl Call {
+    fn record(&self, f: impl FnOnce(&mut Journal)) {
+        if let Some(j) = &self.script {
+            f(&mut j.lock().unwrap_or_else(|e| e.into_inner()));
+        }
+    }
+
+    /// Write `contents` to `path`: an input the tool makes for a child (a
+    /// decisions file, say), kept in the session script as a heredoc.
+    pub fn write_file(&self, path: &Path, contents: &str) -> Result<()> {
+        std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
+        self.record(|j| j.file(path, contents));
+        Ok(())
+    }
+
     /// Whether the client has cancelled this call.
     pub fn is_cancelled(&self) -> bool {
         let set = self.cancelled.lock().unwrap_or_else(|e| e.into_inner());
@@ -143,7 +167,24 @@ impl Call {
     /// Run `cmd` to its end and return its stdout. Each stderr line is
     /// passed on as progress; a cancellation kills the child; a failure
     /// quotes the last lines of its stderr.
-    pub fn run(&self, mut cmd: Command) -> Result<String> {
+    /// The session script gets its command line, or a comment when it did
+    /// not succeed.
+    pub fn run(&self, cmd: Command) -> Result<String> {
+        let mut line = String::new();
+        self.record(|j| line = j.command_line(&cmd));
+        let result = self.run_child(cmd);
+        self.record(|j| match &result {
+            Ok(_) => j.append(&format!("{line}\n")),
+            Err(e) => {
+                let why = format!("{e:#}");
+                let why = why.lines().next().unwrap_or_default();
+                j.append(&format!("# did not succeed ({why}): {line}\n"));
+            }
+        });
+        result
+    }
+
+    fn run_child(&self, mut cmd: Command) -> Result<String> {
         let shown = format!("{cmd:?}");
         let mut child = cmd
             .stdin(Stdio::null())
@@ -199,27 +240,53 @@ impl Call {
     }
 }
 
-/// Serve `handler` on stdin and stdout until stdin closes.
+/// Serve `handler` on stdin and stdout until stdin closes, keeping the
+/// session script where [`journal::ENV`] says.
 pub fn serve(info: ServerInfo, handler: impl Handler) -> Result<()> {
-    serve_on(
+    let script = Journal::path_from_env(&info.name);
+    serve_journaled(
         BufReader::new(std::io::stdin()),
         std::io::stdout(),
         info,
+        script,
         handler,
     )
 }
 
-/// [`serve`] on any input and output (tests, sockets).
-pub fn serve_on<R, W>(
+/// [`serve`] on any input and output (tests, sockets), without a session
+/// script.
+pub fn serve_on<R, W>(input: R, output: W, info: ServerInfo, handler: impl Handler) -> Result<()>
+where
+    R: BufRead + Send + 'static,
+    W: Write + Send + 'static,
+{
+    serve_journaled(input, output, info, None, handler)
+}
+
+/// [`serve_on`], keeping the session script at `script` when given; the
+/// instructions tell the agent where it is.
+pub fn serve_journaled<R, W>(
     input: R,
     output: W,
-    info: ServerInfo,
+    mut info: ServerInfo,
+    script: Option<PathBuf>,
     mut handler: impl Handler,
 ) -> Result<()>
 where
     R: BufRead + Send + 'static,
     W: Write + Send + 'static,
 {
+    let script: Script = script.map(|p| {
+        let note = format!(
+            "This session's commands are kept in {}, a bash script that repeats what the tools wrote; tell the user where it is when the work is done.",
+            p.display()
+        );
+        info.instructions = Some(match info.instructions.take() {
+            Some(text) => format!("{text}\n\n{note}"),
+            None => note,
+        });
+        Arc::new(Mutex::new(Journal::new(p, &info.name, &info.version)))
+    });
     let out: Out = Arc::new(Mutex::new(Box::new(output)));
     let cancelled: Cancelled = Arc::default();
     let (tx, rx) = channel::<Value>();
@@ -293,7 +360,13 @@ where
                     Some(a) if !a.is_null() => a.clone(),
                     _ => json!({}),
                 };
+                if let Some(j) = &script {
+                    j.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .call(name, &args);
+                }
                 let cx = Call {
+                    script: script.clone(),
                     id: id.to_string(),
                     token: params["_meta"].get("progressToken").cloned(),
                     step: AtomicU64::new(0),
