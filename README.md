@@ -11,12 +11,6 @@ implements `Handler` (its tools and how each is called) and hands it to
 - `Call::progress` sends progress notifications when the client asks for them;
   `Call::run` runs a child process, passes its stderr on as progress, and kills
   it when the client cancels.
-- Each session leaves a bash script that repeats what its tools wrote: every
-  call as a comment, every `Call::run` command as run (the server's own binary
-  under its name), every `Call::write_file` input as a heredoc; failed and
-  cancelled steps stay as comments. It goes to `mcp-journal/{name}-{time}-{pid}.sh`
-  under the working directory, or where `LEGUME_MCP_JOURNAL` says (`off` for
-  none), and the server's instructions tell the agent where.
 - stdout carries the protocol: tools must log to stderr and run anything that
   prints as a child.
 - Only serde_json, anyhow, base64 and log; no async runtime.
@@ -42,3 +36,39 @@ fn main() -> anyhow::Result<()> {
 ```
 
 Register a server with a client, e.g. `claude mcp add lupin -- lupin mcp`.
+
+## Project records
+
+Every server keeps the same records under the project (its working
+directory, or `LEGUME_MCP_PROJECT`), laid out after Noble's guide to
+organizing computational biology projects [1], so an agent's work can be
+found again and redone without the agent:
+
+```text
+<project>/
+  data/README.md           an input's source and date, as tools import it (Call::provenance)
+  results/INDEX.tsv        one row per output: date, time, server, tool, output, summary
+  results/<YYYY-MM-DD>/    one folder per day, shared by every server
+    runall.sh              every step that wrote something, in order, from every server
+    notebook.md            the agents' account: plan, observations, conclusions
+    …                      outputs the agent did not name (Call::results_dir)
+```
+
+- `runall.sh` holds each tool call as a comment, each `Call::run` /
+  `Call::run_making` child as its command line (the server's binary under its
+  name, project paths relative, skipped when its outputs exist, their folders
+  made first), and each `Call::write_file` input as a heredoc (base64 when it
+  holds control bytes). Steps that did not succeed stay as comments. A copy of
+  the project replays it: `bash results/<day>/runall.sh`.
+- Environment values whose names look secret (`*TOKEN*`, `*KEY*`, …) are not
+  written down; the script asks for them at replay. The script is owner-only.
+- `notebook` is a built-in tool: the agent opens the day with a plan (the
+  question, the data, and how the result will be checked, after [2]), then
+  records what it did and saw, and its conclusions.
+- `LEGUME_MCP_JOURNAL=off` keeps no records.
+
+[1] W. S. Noble, "A quick guide to organizing computational biology projects",
+PLoS Comput Biol 5(7): e1000424 (2009). doi:10.1371/journal.pcbi.1000424
+
+[2] W. S. Noble, "Ten simple rules for defining a computational biology
+project", PLoS Comput Biol 19(1): e1010786 (2023). doi:10.1371/journal.pcbi.1010786

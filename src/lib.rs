@@ -16,10 +16,15 @@
 //!   cancelled call gets no response, as the protocol asks.
 //! - [`Call::progress`] sends `notifications/progress` when the client
 //!   asked for them (a `progressToken`), and does nothing otherwise.
-//! - [`serve`] keeps a session script that repeats what the tools wrote
-//!   (see [`journal`]): tools that write run a child through [`Call::run`]
-//!   and write the inputs they make through [`Call::write_file`], so a user
-//!   can redo an agent's session without the agent.
+//! - [`serve`] keeps the project's records (see [`project`], after Noble's
+//!   guide to organizing computational biology projects): a dated results
+//!   folder with a driver script that repeats every step that wrote
+//!   something, a lab notebook the agent writes through the built-in
+//!   `notebook` tool, an index of outputs, and the inputs' provenance. Tools
+//!   that write run a child through [`Call::run`] or [`Call::run_making`],
+//!   make their inputs through [`Call::write_file`], and put default
+//!   outputs under [`Call::results_dir`], so a user can find and redo an
+//!   agent's work without the agent.
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -34,8 +39,8 @@ use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub mod journal;
-use journal::Journal;
+pub mod project;
+use project::Project;
 
 /// Protocol revisions this server speaks, newest first. A client asking for
 /// one of them gets it; any other gets the newest.
@@ -97,7 +102,7 @@ pub trait Handler {
 type Out = Arc<Mutex<Box<dyn Write + Send>>>;
 /// Ids (as JSON text) of requests the client has cancelled.
 type Cancelled = Arc<Mutex<HashSet<String>>>;
-type Script = Option<Arc<Mutex<Journal>>>;
+type Records = Option<Arc<Project>>;
 
 fn send(out: &Out, msg: &Value) {
     let mut w = out.lock().unwrap_or_else(|e| e.into_inner());
@@ -126,22 +131,37 @@ pub struct Call {
     step: AtomicU64,
     out: Out,
     cancelled: Cancelled,
-    script: Script,
+    tool: String,
+    records: Records,
 }
 
 impl Call {
-    fn record(&self, f: impl FnOnce(&mut Journal)) {
-        if let Some(j) = &self.script {
-            f(&mut j.lock().unwrap_or_else(|e| e.into_inner()));
-        }
-    }
-
     /// Write `contents` to `path`: an input the tool makes for a child (a
-    /// decisions file, say), kept in the session script as a heredoc.
+    /// decisions file, say), kept in the driver script as a heredoc.
     pub fn write_file(&self, path: &Path, contents: &str) -> Result<()> {
         std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
-        self.record(|j| j.file(path, contents));
+        if let Some(p) = &self.records {
+            p.file(path, contents);
+        }
         Ok(())
+    }
+
+    /// Today's results folder (`results/YYYY-MM-DD` under the project),
+    /// where a tool puts the outputs the agent did not name; `None` when the
+    /// server keeps no records.
+    pub fn results_dir(&self) -> Option<PathBuf> {
+        let p = self.records.as_ref()?;
+        p.day_dir()
+            .inspect_err(|e| log::warn!("results folder under {}: {e}", p.root().display()))
+            .ok()
+    }
+
+    /// Note in `data/README.md` where input `path` came from (a URL, a
+    /// repository and version, a file it was converted from).
+    pub fn provenance(&self, path: &Path, source: &str) {
+        if let Some(p) = &self.records {
+            p.provenance(&self.tool, path, source);
+        }
     }
 
     /// Whether the client has cancelled this call.
@@ -166,21 +186,32 @@ impl Call {
 
     /// Run `cmd` to its end and return its stdout. Each stderr line is
     /// passed on as progress; a cancellation kills the child; a failure
-    /// quotes the last lines of its stderr.
-    /// The session script gets its command line, or a comment when it did
-    /// not succeed.
+    /// quotes the last lines of its stderr. The driver script gets its
+    /// command line, or a comment when it did not succeed.
     pub fn run(&self, cmd: Command) -> Result<String> {
-        let mut line = String::new();
-        self.record(|j| line = j.command_line(&cmd));
+        self.run_making(cmd, &[], "")
+    }
+
+    /// [`Self::run`] for a step that writes `outputs`: the driver script
+    /// skips it when they all exist, and `results/INDEX.tsv` lists each
+    /// with `summary` (one line: what was made, from what).
+    pub fn run_making(&self, cmd: Command, outputs: &[PathBuf], summary: &str) -> Result<String> {
+        let line = self.records.as_ref().map(|p| p.command_line(&cmd, outputs));
         let result = self.run_child(cmd);
-        self.record(|j| match &result {
-            Ok(_) => j.append(&format!("{line}\n")),
-            Err(e) => {
-                let why = format!("{e:#}");
-                let why = why.lines().next().unwrap_or_default();
-                j.append(&format!("# did not succeed ({why}): {line}\n"));
+        if let (Some(p), Some(line)) = (&self.records, line) {
+            match &result {
+                Ok(_) => {
+                    p.script(&format!("{line}\n"));
+                    p.index(&self.tool, outputs, summary);
+                }
+                Err(e) => {
+                    let why = format!("{e:#}");
+                    let why = why.lines().next().unwrap_or_default();
+                    let commented: String = line.lines().map(|l| format!("#   {l}\n")).collect();
+                    p.script(&format!("# did not succeed ({why}):\n{commented}"));
+                }
             }
-        });
+        }
         result
     }
 
@@ -241,51 +272,74 @@ impl Call {
 }
 
 /// Serve `handler` on stdin and stdout until stdin closes, keeping the
-/// session script where [`journal::ENV`] says.
+/// records of the project [`project::ROOT_ENV`] and [`project::OFF_ENV`] say.
 pub fn serve(info: ServerInfo, handler: impl Handler) -> Result<()> {
-    let script = Journal::path_from_env(&info.name);
-    serve_journaled(
+    serve_in(
         BufReader::new(std::io::stdin()),
         std::io::stdout(),
         info,
-        script,
+        Project::root_from_env(),
         handler,
     )
 }
 
-/// [`serve`] on any input and output (tests, sockets), without a session
-/// script.
+/// [`serve`] on any input and output (tests, sockets), keeping no records.
 pub fn serve_on<R, W>(input: R, output: W, info: ServerInfo, handler: impl Handler) -> Result<()>
 where
     R: BufRead + Send + 'static,
     W: Write + Send + 'static,
 {
-    serve_journaled(input, output, info, None, handler)
+    serve_in(input, output, info, None, handler)
 }
 
-/// [`serve_on`], keeping the session script at `script` when given; the
-/// instructions tell the agent where it is.
-pub fn serve_journaled<R, W>(
+/// What the agent is told about the records, after the server's own
+/// instructions.
+const RECORDS_NOTE: &str = "\
+Records (after Noble, PLoS Comput Biol 2009, doi:10.1371/journal.pcbi.1000424), \
+under the project {root}: outputs you do not name go to results/<today>/; every \
+step that writes is added to results/<today>/runall.sh, which repeats the work \
+without you; results/INDEX.tsv lists each output with a summary. Use the \
+`notebook` tool: before starting, a `plan` (the question, the data, and how the \
+result will be checked); then what you did and saw, and your conclusions. Tell \
+the user where these are when the work is done.";
+
+/// The built-in tool every server with records offers.
+fn notebook_spec() -> ToolSpec {
+    ToolSpec::new(
+        "notebook",
+        "Add an entry to today's lab notebook (results/<today>/notebook.md, shared by every legume server): your account of the work, kept beside the facts the tools record. Open with a `plan`.",
+        json!({
+            "type": "object",
+            "properties": {
+                "kind": { "type": "string", "enum": ["plan", "observation", "conclusion", "note"] },
+                "text": { "type": "string", "description": "Markdown" },
+            },
+            "required": ["kind", "text"],
+        }),
+    )
+}
+
+/// [`serve_on`], keeping the records of the project at `project` when
+/// given; the instructions tell the agent about them.
+pub fn serve_in<R, W>(
     input: R,
     output: W,
     mut info: ServerInfo,
-    script: Option<PathBuf>,
+    project: Option<PathBuf>,
     mut handler: impl Handler,
 ) -> Result<()>
 where
     R: BufRead + Send + 'static,
     W: Write + Send + 'static,
 {
-    let script: Script = script.map(|p| {
-        let note = format!(
-            "This session's commands are kept in {}, a bash script that repeats what the tools wrote; tell the user where it is when the work is done.",
-            p.display()
-        );
+    let records: Records = project.map(|root| {
+        let p = Project::new(root, &info.name, &info.version);
+        let note = RECORDS_NOTE.replace("{root}", &p.root().display().to_string());
         info.instructions = Some(match info.instructions.take() {
             Some(text) => format!("{text}\n\n{note}"),
             None => note,
         });
-        Arc::new(Mutex::new(Journal::new(p, &info.name, &info.version)))
+        Arc::new(p)
     });
     let out: Out = Arc::new(Mutex::new(Box::new(output)));
     let cancelled: Cancelled = Arc::default();
@@ -295,19 +349,39 @@ where
     let reader = {
         let (out, cancelled) = (out.clone(), cancelled.clone());
         std::thread::spawn(move || {
-            for line in input.lines() {
-                let line = match line {
-                    Ok(l) if l.trim().is_empty() => continue,
-                    Ok(l) => l,
+            let mut input = input;
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match input.read_until(b'\n', &mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
                     Err(e) => {
                         log::warn!("mcp: reading stdin: {e}");
                         break;
                     }
-                };
-                let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-                    fail(&out, &Value::Null, -32700, "parse error");
+                }
+                // A line that is not UTF-8 or not JSON is answered, and the
+                // session goes on.
+                let Some(msg) = std::str::from_utf8(&buf)
+                    .ok()
+                    .filter(|l| !l.trim().is_empty() || l.is_empty())
+                    .and_then(|l| serde_json::from_str::<Value>(l).ok())
+                else {
+                    if !buf.iter().all(u8::is_ascii_whitespace) {
+                        fail(&out, &Value::Null, -32700, "parse error");
+                    }
                     continue;
                 };
+                if !msg.is_object() || msg.get("method").is_some_and(|m| !m.is_string()) {
+                    fail(
+                        &out,
+                        &msg["id"],
+                        -32600,
+                        "invalid request (batches are not taken)",
+                    );
+                    continue;
+                }
                 match msg.get("method").and_then(Value::as_str) {
                     Some("ping") => respond(&out, &msg["id"], json!({})),
                     Some("notifications/cancelled") => {
@@ -326,7 +400,11 @@ where
             }
         })
     };
-    let specs = handler.tools();
+    let mut specs = handler.tools();
+    let builtin_notebook = records.is_some() && !specs.iter().any(|t| t.name == "notebook");
+    if builtin_notebook {
+        specs.push(notebook_spec());
+    }
     for msg in rx {
         let Some(method) = msg.get("method").and_then(Value::as_str) else {
             continue; // a response to a request we never send
@@ -360,13 +438,23 @@ where
                     Some(a) if !a.is_null() => a.clone(),
                     _ => json!({}),
                 };
-                if let Some(j) = &script {
-                    j.lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .call(name, &args);
+                if let Some(p) = &records {
+                    p.call(name, &args);
+                }
+                if let (true, Some(p)) = (builtin_notebook && name == "notebook", &records) {
+                    let result = match (args["kind"].as_str(), args["text"].as_str()) {
+                        (Some(kind), Some(text)) => {
+                            p.notebook(kind, text);
+                            Ok(vec![])
+                        }
+                        _ => Err(anyhow::anyhow!("`kind` and `text` are required")),
+                    };
+                    respond(&out, id, call_result(result));
+                    continue;
                 }
                 let cx = Call {
-                    script: script.clone(),
+                    tool: name.to_string(),
+                    records: records.clone(),
                     id: id.to_string(),
                     token: params["_meta"].get("progressToken").cloned(),
                     step: AtomicU64::new(0),

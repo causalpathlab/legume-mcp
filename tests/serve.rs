@@ -25,7 +25,7 @@ struct Tools {
 impl Handler for Tools {
     fn tools(&self) -> Vec<ToolSpec> {
         [
-            "echo", "fail", "count", "child", "picture", "panic", "write",
+            "echo", "fail", "count", "child", "picture", "panic", "write", "make",
         ]
         .map(|n| ToolSpec::new(n, n, json!({ "type": "object" })))
         .into()
@@ -46,6 +46,27 @@ impl Handler for Tools {
             "write" => {
                 let path = std::path::PathBuf::from(args["path"].as_str().unwrap());
                 cx.write_file(&path, args["text"].as_str().unwrap())?;
+                Ok(vec![])
+            }
+            "make" => {
+                let (out, from) = (
+                    args["out"].as_str().unwrap(),
+                    args["from"].as_str().unwrap(),
+                );
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", "cp \"$0\" \"$1\"", from, out]);
+                let out = std::path::PathBuf::from(out);
+                let name = std::path::Path::new(from)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                cx.run_making(
+                    cmd,
+                    std::slice::from_ref(&out),
+                    &format!("made from {name}"),
+                )?;
+                cx.provenance(&out, &format!("copied from {name}"));
                 Ok(vec![])
             }
             _ => panic!("boom"),
@@ -148,7 +169,9 @@ fn lists_and_calls_tools() {
 
 #[test]
 fn bad_lines_and_pings() {
-    let input = "not json\n\n{\"jsonrpc\":\"2.0\",\"id\":\"p\",\"method\":\"ping\"}\n";
+    let mut input =
+        b"not json\n\n\xff\xfe\n[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}]\n".to_vec();
+    input.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":\"p\",\"method\":\"ping\"}\n");
     let sink = Sink::default();
     serve_on(
         Cursor::new(input),
@@ -165,7 +188,12 @@ fn bad_lines_and_pings() {
     assert_eq!(msgs[0]["error"]["code"], -32700);
     assert_eq!(msgs[0]["id"], Value::Null);
     assert_eq!(
-        msgs[1],
+        msgs[1]["error"]["code"], -32700,
+        "not UTF-8: answered, and the session goes on"
+    );
+    assert_eq!(msgs[2]["error"]["code"], -32600, "no batches");
+    assert_eq!(
+        msgs[3],
         json!({ "jsonrpc": "2.0", "id": "p", "result": {} })
     );
 }
@@ -224,85 +252,151 @@ fn a_cancelled_call_is_killed_and_unanswered() {
 const ODD: &str = "x\nLEGUME_MCP_EOF\u{0}\ntouch pwned\r\nLEGUME_MCP_EOF\r\n";
 
 #[test]
-fn the_session_script_repeats_what_the_tools_wrote() {
-    let dir = std::env::temp_dir().join(format!("legume-mcp-journal-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let script = dir.join("s.sh");
-    let made = dir.join("made it.txt");
+fn the_records_redo_the_work_in_a_copy_of_the_project() {
+    let base = std::env::temp_dir().join(format!("legume-mcp-records-{}", std::process::id()));
+    let proj = base.join("proj");
+    std::fs::create_dir_all(proj.join("data")).unwrap();
+    let at = |p: &str| proj.join(p).to_string_lossy().into_owned();
+    let made = at("data/made.txt");
     let input: String = [
         json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
-        call(2, "echo", json!({ "a": 1 })),
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
         call(
             3,
-            "child",
-            json!({ "script": format!("printf 'x\\n' > '{}'", made.display()) }),
+            "notebook",
+            json!({ "kind": "plan", "text": "Check *x*." }),
         ),
-        call(4, "child", json!({ "script": "exit 2" })),
+        call(4, "echo", json!({ "a": 1 })),
         call(
             5,
             "write",
-            json!({ "path": dir.join("in.tsv"), "text": "a\tb\nLEGUME_MCP_EOF\n" }),
+            json!({ "path": at("in.tsv"), "text": "a\tb\nLEGUME_MCP_EOF\n" }),
         ),
-        call(
-            6,
-            "write",
-            json!({ "path": dir.join("odd.txt"), "text": ODD }),
-        ),
+        call(6, "write", json!({ "path": at("odd.txt"), "text": ODD })),
+        call(7, "make", json!({ "out": made, "from": at("in.tsv") })),
+        call(8, "child", json!({ "script": "exit 2" })),
+        call(9, "notebook", json!({ "kind": "plan" })),
     ]
     .iter()
     .map(|l| format!("{l}\n"))
     .collect();
     let sink = Sink::default();
-    legume_mcp::serve_journaled(
+    let info = ServerInfo {
+        name: "t".into(),
+        version: "0".into(),
+        instructions: None,
+    };
+    legume_mcp::serve_in(
         Cursor::new(input),
         sink.clone(),
-        ServerInfo::default(),
-        Some(script.clone()),
+        info,
+        Some(proj.clone()),
         Tools { calls: 0 },
     )
     .unwrap();
-    let text = std::fs::read_to_string(&script).unwrap();
-    assert!(text.starts_with("#!/usr/bin/env bash\n"), "{text}");
-    assert!(text.contains("set -euo pipefail\ncd "), "{text}");
-    assert!(
-        text.contains(" echo {\"a\":1}\n"),
-        "every call is a comment: {text}"
-    );
-    assert!(
-        text.contains("\nsh -c 'printf "),
-        "a child is its command: {text}"
-    );
-    assert!(text.contains("# did not succeed ("), "{text}");
-    assert!(
-        text.contains("<<'LEGUME_MCP_EOF_'\na\tb\nLEGUME_MCP_EOF\nLEGUME_MCP_EOF_\n"),
-        "a written input is a heredoc that its contents cannot end: {text}"
-    );
     let reply = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    let msgs: Vec<Value> = reply
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(by_id(&msgs, 1)["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("results/<today>/runall.sh"));
+    let tools = by_id(&msgs, 2)["result"]["tools"].as_array().unwrap();
     assert!(
-        reply.contains(&script.display().to_string()),
-        "the instructions name the script"
+        tools.iter().any(|t| t["name"] == "notebook"),
+        "the notebook is built in"
     );
+    assert_eq!(by_id(&msgs, 9)["result"]["isError"], true);
 
-    // The script redoes the work.
-    std::fs::remove_file(&made).unwrap();
-    let ran = Command::new("bash").arg(&script).status().unwrap();
-    assert!(ran.success());
-    assert_eq!(std::fs::read_to_string(&made).unwrap(), "x\n");
-    assert_eq!(
-        std::fs::read_to_string(dir.join("in.tsv")).unwrap(),
-        "a\tb\nLEGUME_MCP_EOF\n"
+    let day: Vec<_> = std::fs::read_dir(proj.join("results"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .collect();
+    assert_eq!(day.len(), 1, "one folder for the day");
+    let day = day[0].path();
+    let script = std::fs::read_to_string(day.join("runall.sh")).unwrap();
+    assert!(script.starts_with("#!/usr/bin/env bash\n"), "{script}");
+    assert!(
+        script.contains("cd \"$(dirname \"$0\")/../..\""),
+        "{script}"
     );
     assert!(
-        text.contains("base64 -d > "),
-        "control bytes go base64: {text}"
+        script.contains(" t echo {\"a\":1}\n"),
+        "every call is a comment: {script}"
     );
-    assert_eq!(std::fs::read_to_string(dir.join("odd.txt")).unwrap(), ODD);
-    assert!(!dir.join("pwned").exists(), "nothing past a false end ran");
+    assert!(
+        !script.contains(&proj.to_string_lossy().into_owned()),
+        "paths are relative: {script}"
+    );
+    assert!(
+        script.contains("if [ ! -e data/made.txt ]; then\n  mkdir -p data\n  sh -c "),
+        "restartable: {script}"
+    );
+    assert!(script.contains("# did not succeed ("), "{script}");
+    assert!(
+        script.contains("<<'LEGUME_MCP_EOF_'\na\tb\nLEGUME_MCP_EOF\nLEGUME_MCP_EOF_\n"),
+        "{script}"
+    );
+    assert!(
+        script.contains("base64 -d > odd.txt"),
+        "control bytes go base64: {script}"
+    );
+    let notebook = std::fs::read_to_string(day.join("notebook.md")).unwrap();
+    assert!(
+        notebook.contains(" · t · plan\n\nCheck *x*.\n"),
+        "{notebook}"
+    );
+    let index = std::fs::read_to_string(proj.join("results/INDEX.tsv")).unwrap();
+    let rows: Vec<&str> = index.lines().collect();
+    assert_eq!(rows[0], "date\ttime\tserver\ttool\toutput\tsummary");
+    assert!(
+        rows[1].ends_with("\tt\tmake\tdata/made.txt\tmade from in.tsv"),
+        "{index}"
+    );
+    let readme = std::fs::read_to_string(proj.join("data/README.md")).unwrap();
+    assert!(
+        readme.contains("`data/made.txt`: copied from in.tsv (t 0 make)"),
+        "{readme}"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&script).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "the script is the user's to read");
+        let mode = std::fs::metadata(day.join("runall.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "the script is the user's");
     }
-    std::fs::remove_dir_all(&dir).unwrap();
+
+    // A copy of the project, elsewhere and without the outputs, redoes them.
+    let copy = base.join("copy");
+    let rel_day = day.strip_prefix(&proj).unwrap();
+    std::fs::create_dir_all(copy.join(rel_day)).unwrap();
+    std::fs::copy(day.join("runall.sh"), copy.join(rel_day).join("runall.sh")).unwrap();
+    let ran = Command::new("bash")
+        .arg(copy.join(rel_day).join("runall.sh"))
+        .status()
+        .unwrap();
+    assert!(ran.success());
+    assert_eq!(
+        std::fs::read_to_string(copy.join("data/made.txt")).unwrap(),
+        "a\tb\nLEGUME_MCP_EOF\n"
+    );
+    assert_eq!(std::fs::read_to_string(copy.join("odd.txt")).unwrap(), ODD);
+    assert!(!copy.join("pwned").exists(), "nothing past a false end ran");
+    // Run again: the step whose output exists is skipped.
+    std::fs::write(copy.join("data/made.txt"), "kept").unwrap();
+    assert!(Command::new("bash")
+        .arg(copy.join(rel_day).join("runall.sh"))
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(
+        std::fs::read_to_string(copy.join("data/made.txt")).unwrap(),
+        "kept"
+    );
+    std::fs::remove_dir_all(&base).unwrap();
 }
