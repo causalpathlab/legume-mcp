@@ -9,6 +9,7 @@
 
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -53,6 +54,8 @@ pub(crate) struct Job {
     pub(crate) id: String,
     tool: String,
     summary: String,
+    /// What it writes, absolute: reserved while it runs.
+    outputs: Vec<PathBuf>,
     started_at: String,
     started: Instant,
     progress: Mutex<Progress>,
@@ -125,13 +128,15 @@ pub(crate) struct Jobs {
 }
 
 impl Jobs {
-    /// A new running job of `tool`'s: `summary` says what it makes.
-    pub(crate) fn add(&self, tool: &str, summary: &str) -> Arc<Job> {
+    /// A new running job of `tool`'s, writing `outputs`: `summary` says what
+    /// it makes.
+    pub(crate) fn add(&self, tool: &str, summary: &str, outputs: &[PathBuf]) -> Arc<Job> {
         let n = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         let job = Arc::new(Job {
             id: format!("job-{n}"),
             tool: tool.into(),
             summary: summary.into(),
+            outputs: outputs.iter().map(|o| absolute(o)).collect(),
             started_at: crate::project::rfc3339(),
             started: Instant::now(),
             progress: Mutex::new(Progress {
@@ -146,6 +151,22 @@ impl Jobs {
         let mut all = self.all.lock().unwrap_or_else(|e| e.into_inner());
         all.insert(n, job.clone());
         job
+    }
+
+    /// A running job writing one of `outputs` (the same path, or one inside
+    /// the other): its id and the path. A job's outputs are free again once
+    /// it ends, however it ends.
+    pub(crate) fn holder(&self, outputs: &[PathBuf]) -> Option<(String, PathBuf)> {
+        let wanted: Vec<PathBuf> = outputs.iter().map(|o| absolute(o)).collect();
+        let all = self.all.lock().unwrap_or_else(|e| e.into_inner());
+        all.values().filter(|j| j.running()).find_map(|j| {
+            let hit = j.outputs.iter().find(|held| {
+                wanted
+                    .iter()
+                    .any(|w| w.starts_with(held) || held.starts_with(w))
+            })?;
+            Some((j.id.clone(), hit.clone()))
+        })
     }
 
     fn get(&self, id: &str) -> Option<Arc<Job>> {
@@ -212,4 +233,9 @@ impl Jobs {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+/// `p` absolute, against the working directory, without touching the disk.
+fn absolute(p: &Path) -> PathBuf {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
 }

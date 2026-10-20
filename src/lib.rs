@@ -55,6 +55,8 @@ pub const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26
 
 /// Lines of a failed child's stderr quoted in its error.
 const STDERR_TAIL: usize = 20;
+/// Lines of a child's stderr kept to find its error in.
+const STDERR_KEPT: usize = 400;
 /// How often a waiting child run looks for a cancellation.
 const POLL: Duration = Duration::from_millis(100);
 
@@ -237,10 +239,30 @@ impl Call {
     /// skips it when they all exist, and `results/INDEX.tsv` lists each
     /// with `summary` (one line: what was made, from what).
     pub fn run_making(&self, cmd: Command, outputs: &[PathBuf], summary: &str) -> Result<String> {
+        self.not_held(outputs)?;
         let bare = self.records.as_ref().map(|p| p.command(&cmd));
-        let result = self.run_child(cmd);
+        let result = self
+            .run_child(cmd)
+            .and_then(|out| made(outputs).map(|()| out));
         record_step(&self.records, &self.tool, bare, outputs, summary, &result);
         result
+    }
+
+    /// Refuse `outputs` a running job is writing, naming the job.
+    fn not_held(&self, outputs: &[PathBuf]) -> Result<()> {
+        match self.jobs.holder(outputs) {
+            None => Ok(()),
+            Some((job, path)) => {
+                let shown = path.display().to_string();
+                let shown = self
+                    .records
+                    .as_ref()
+                    .map_or(shown.clone(), |p| p.rel(&shown));
+                anyhow::bail!(
+                    "{shown} is being written by {job}: job_wait for it, or choose another out"
+                )
+            }
+        }
     }
 
     /// [`Self::run_making`] in the background, for a step longer than a
@@ -250,7 +272,8 @@ impl Call {
     /// id (a person can stop it there too); it is recorded when it ends, as
     /// a step that ran.
     pub fn spawn_job(&self, cmd: Command, outputs: &[PathBuf], summary: &str) -> Result<String> {
-        let job = self.jobs.add(&self.tool, summary);
+        self.not_held(outputs)?;
+        let job = self.jobs.add(&self.tool, summary, outputs);
         let id = job.id.clone();
         if let Some(f) = &self.feed {
             f.emit(Body::Call {
@@ -279,7 +302,8 @@ impl Call {
                         });
                     }
                 };
-                let result = run_child(cmd, &|| job.cancelled() || stopped(), &progress);
+                let result = run_child(cmd, &|| job.cancelled() || stopped(), &progress)
+                    .and_then(|out| made(&outputs).map(|()| out));
                 record_step(&records, &tool, bare, &outputs, &summary, &result);
                 let (state, text) = match &result {
                     Ok(out) => (JobState::Done, out.clone()),
@@ -341,14 +365,73 @@ fn record_step(
     }
 }
 
+/// Fail a step that exited well but left one of its `outputs` unwritten.
+fn made(outputs: &[PathBuf]) -> Result<()> {
+    let missing: Vec<String> = outputs
+        .iter()
+        .filter(|o| !o.exists())
+        .map(|o| o.display().to_string())
+        .collect();
+    anyhow::ensure!(
+        missing.is_empty(),
+        "finished without writing {}",
+        missing.join(", ")
+    );
+    Ok(())
+}
+
+/// What a failed child's stderr is quoted as, [`STDERR_TAIL`] lines at
+/// most: its last lines; or, when its last `Error:` (or panic) line is
+/// followed closely by a backtrace (a Rust program failing with backtraces
+/// on), from that line to where the backtrace starts. An error line with
+/// other output after it (a retry that went on to fail otherwise) is not the
+/// end, so the tail is.
+fn quote(lines: &VecDeque<String>) -> String {
+    // A panic ends a Rust program the way an error does.
+    let is_error = |l: &str| {
+        let l = l.trim_start();
+        l.starts_with("Error:") || l.starts_with("error:") || l.contains("' panicked at ")
+    };
+    let is_backtrace = |l: &str| {
+        let l = l.trim_start().to_ascii_lowercase();
+        l.starts_with("stack backtrace:")
+    };
+    let tail = lines.len().saturating_sub(STDERR_TAIL);
+    let (from, to) = match lines.iter().rposition(|l| is_error(l)) {
+        Some(e) => match lines.iter().skip(e).position(|l| is_backtrace(l)) {
+            // The error, up to its backtrace.
+            Some(b) if b <= STDERR_TAIL => (e, e + b),
+            // The error near the end: it is how the child ended.
+            _ if e >= tail => (e, lines.len()),
+            _ => (tail, lines.len()),
+        },
+        None => (tail, lines.len()),
+    };
+    let picked: Vec<&str> = lines
+        .iter()
+        .skip(from)
+        .take(to.saturating_sub(from).min(STDERR_TAIL))
+        .map(String::as_str)
+        .collect();
+    picked.join("\n")
+}
+
 /// Run `cmd` to its end and return its stdout; each stderr line goes to
 /// `progress`; `cancelled` is asked as it runs, and kills the child when
-/// it says so; a failure quotes the last lines of its stderr.
+/// it says so; a failure quotes its error ([`quote`]). A Rust child prints
+/// no backtrace unless the tool asks for one: the agent reads the error.
 fn run_child(
     mut cmd: Command,
     cancelled: &dyn Fn() -> bool,
     progress: &dyn Fn(&str),
 ) -> Result<String> {
+    // Left as the tool has it when it set the variable, or removed it
+    // (get_envs lists a removal too).
+    for var in ["RUST_BACKTRACE", "RUST_LIB_BACKTRACE"] {
+        if !cmd.get_envs().any(|(k, _)| k == var) {
+            cmd.env(var, "0");
+        }
+    }
     let shown = format!("{cmd:?}");
     let mut child = cmd
         .stdin(Stdio::null())
@@ -370,7 +453,7 @@ fn run_child(
             }
         }
     });
-    let mut tail = VecDeque::with_capacity(STDERR_TAIL);
+    let mut tail = VecDeque::with_capacity(STDERR_KEPT);
     let status = loop {
         if cancelled() {
             let _ = child.kill();
@@ -380,7 +463,7 @@ fn run_child(
         match rx.recv_timeout(POLL) {
             Ok(line) => {
                 progress(&line);
-                if tail.len() == STDERR_TAIL {
+                if tail.len() == STDERR_KEPT {
                     tail.pop_front();
                 }
                 tail.push_back(line);
@@ -397,8 +480,7 @@ fn run_child(
         .join()
         .map_err(|_| anyhow::anyhow!("reading the child's stdout"))??;
     if !status.success() {
-        let tail: Vec<String> = tail.into();
-        anyhow::bail!("{shown} failed ({status}):\n{}", tail.join("\n"));
+        anyhow::bail!("{shown} failed ({status}):\n{}", quote(&tail));
     }
     Ok(out)
 }
@@ -892,4 +974,76 @@ fn call_result(result: Result<Vec<Content>>) -> Value {
         v["structuredContent"] = Value::Object(m);
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(text: &[&str]) -> VecDeque<String> {
+        text.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_rust_error_is_quoted_up_to_its_backtrace() {
+        let mut l = vec![
+            "loading",
+            "Error: no section matches qc",
+            "",
+            "Stack backtrace:",
+        ];
+        let frames: Vec<String> = (0..40).map(|i| format!("  {i}: frame")).collect();
+        l.extend(frames.iter().map(String::as_str));
+        assert_eq!(quote(&lines(&l)), "Error: no section matches qc\n");
+    }
+
+    #[test]
+    fn an_error_the_child_went_on_from_is_not_its_end() {
+        // A retry logged as an error, then much more, then the real end.
+        let mut l = vec!["error: fetch failed, retrying"];
+        let more: Vec<String> = (0..30).map(|i| format!("step {i}")).collect();
+        l.extend(more.iter().map(String::as_str));
+        l.push("fatal: out of disk");
+        let q = quote(&lines(&l));
+        assert!(q.ends_with("fatal: out of disk"), "{q}");
+        assert!(!q.contains("retrying"), "{q}");
+    }
+
+    #[test]
+    fn an_error_near_the_end_is_quoted_from() {
+        let l = ["a", "b", "Error: bad input", "caused by: x"];
+        assert_eq!(quote(&lines(&l)), "Error: bad input\ncaused by: x");
+    }
+
+    #[test]
+    fn a_panic_after_an_early_error_is_the_end_quoted() {
+        // A retry logged as an error, much more, then a panic with backtrace.
+        let mut l = vec!["error: fetch failed, retrying"];
+        let more: Vec<String> = (0..30).map(|i| format!("step {i}")).collect();
+        l.extend(more.iter().map(String::as_str));
+        l.extend([
+            "thread 'main' panicked at src/fit.rs:7:5:",
+            "index out of bounds",
+            "stack backtrace:",
+            "  0: frame",
+        ]);
+        let q = quote(&lines(&l));
+        assert_eq!(
+            q,
+            "thread 'main' panicked at src/fit.rs:7:5:\nindex out of bounds"
+        );
+    }
+
+    #[test]
+    fn an_error_far_from_a_backtrace_is_not_paired_with_it() {
+        // An error, then far more than a quote, then a backtrace with no
+        // error line of its own: the tail is quoted, not the old error.
+        let mut l = vec!["error: fetch failed, retrying"];
+        let more: Vec<String> = (0..30).map(|i| format!("step {i}")).collect();
+        l.extend(more.iter().map(String::as_str));
+        l.extend(["stack backtrace:", "  0: frame"]);
+        let q = quote(&lines(&l));
+        assert!(!q.contains("retrying"), "{q}");
+        assert!(q.ends_with("  0: frame"), "{q}");
+    }
 }
