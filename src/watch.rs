@@ -38,6 +38,8 @@ const TEXT_CAP: usize = 4096;
 const KEEP_ENDED: Duration = Duration::from_secs(24 * 3600);
 /// How often a follower at the end of the feed looks for more.
 const POLL: Duration = Duration::from_millis(200);
+/// How long the control socket waits on one client's command or reply.
+const CONTROL_WAIT: Duration = Duration::from_secs(2);
 
 /// One line of the feed: when, and what.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -447,6 +449,13 @@ impl Feed {
         let feed = self.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
+                // A client that connects and goes quiet (killed mid-write)
+                // must not hold every later stop and note.
+                if stream.set_read_timeout(Some(CONTROL_WAIT)).is_err()
+                    || stream.set_write_timeout(Some(CONTROL_WAIT)).is_err()
+                {
+                    continue;
+                }
                 let mut line = String::new();
                 let Ok(mut reader) = stream.try_clone().map(BufReader::new) else {
                     continue;

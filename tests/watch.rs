@@ -90,6 +90,9 @@ fn a_person_follows_stops_and_leaves_a_note() {
         std::iter::from_fn(|| feed.try_next())
             .find(|e| matches!(&e.body, Body::Progress { id, message } if id == "a" && message == "started"))
     });
+    // A client that connects and says nothing does not hold up the rest.
+    #[cfg(unix)]
+    let _quiet = std::os::unix::net::UnixStream::connect(dir.join("control.sock")).unwrap();
     let control = watch::control(&dir);
     control.note("look at cluster 3").unwrap();
     control.stop("a").unwrap();
