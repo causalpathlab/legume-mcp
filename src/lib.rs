@@ -239,7 +239,7 @@ impl Call {
     /// skips it when they all exist, and `results/INDEX.tsv` lists each
     /// with `summary` (one line: what was made, from what).
     pub fn run_making(&self, cmd: Command, outputs: &[PathBuf], summary: &str) -> Result<String> {
-        self.not_held(outputs)?;
+        self.ensure_free(outputs)?;
         let bare = self.records.as_ref().map(|p| p.command(&cmd));
         let result = self
             .run_child(cmd)
@@ -248,8 +248,12 @@ impl Call {
         result
     }
 
-    /// Refuse `outputs` a running job is writing, naming the job.
-    fn not_held(&self, outputs: &[PathBuf]) -> Result<()> {
+    /// Refuse `outputs` a running job is writing (the same file, or one
+    /// inside the other, however spelled), naming the job. [`Self::run_making`]
+    /// and [`Self::spawn_job`] check this themselves; a tool calls it first
+    /// when it writes beside the outputs before the step (a step's input
+    /// file), or to skip a held name when it chooses one.
+    pub fn ensure_free(&self, outputs: &[PathBuf]) -> Result<()> {
         match self.jobs.holder(outputs) {
             None => Ok(()),
             Some((job, path)) => {
@@ -272,7 +276,7 @@ impl Call {
     /// id (a person can stop it there too); it is recorded when it ends, as
     /// a step that ran.
     pub fn spawn_job(&self, cmd: Command, outputs: &[PathBuf], summary: &str) -> Result<String> {
-        self.not_held(outputs)?;
+        self.ensure_free(outputs)?;
         let job = self.jobs.add(&self.tool, summary, outputs);
         let id = job.id.clone();
         if let Some(f) = &self.feed {

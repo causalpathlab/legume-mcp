@@ -14,11 +14,18 @@ struct Tools;
 
 impl Handler for Tools {
     fn tools(&self) -> Vec<ToolSpec> {
-        vec![ToolSpec::new("fit", "fit", json!({ "type": "object" }))]
+        vec![
+            ToolSpec::new("fit", "fit", json!({ "type": "object" })),
+            ToolSpec::new("free", "is out free", json!({ "type": "object" })),
+        ]
     }
 
-    fn call(&mut self, _name: &str, args: Value, cx: &Call) -> Result<Vec<Content>> {
+    fn call(&mut self, name: &str, args: Value, cx: &Call) -> Result<Vec<Content>> {
         let out = PathBuf::from(args["out"].as_str().unwrap());
+        if name == "free" {
+            cx.ensure_free(&[out])?;
+            return Ok(vec![Content::Json(json!({ "free": true }))]);
+        }
         let mut cmd = Command::new("sh");
         // `write: false` exits well without writing its output.
         let touch = if args["write"] == false {
@@ -158,6 +165,11 @@ fn a_long_step_runs_as_a_job_and_is_recorded_when_it_ends() {
         why.contains(&format!("is being written by {first}")),
         "{why}"
     );
+    // A tool asks the same before writing anything of its own.
+    let spelled = project.join("sub/../held/part");
+    assert_eq!(c.call("free", json!({ "out": spelled }))["isError"], true);
+    let free = c.call("free", json!({ "out": project.join("other") }));
+    assert_eq!(structured(&free)["free"], true, "{free}");
     c.call("job_cancel", json!({ "id": first }));
     c.call("job_wait", json!({ "id": first, "seconds": 10 }));
     let again = c.call("fit", json!({ "out": held, "seconds": 0 }));
