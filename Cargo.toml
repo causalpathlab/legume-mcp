@@ -1,0 +1,27 @@
+[package]
+name = "legume-mcp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+license = "MIT"
+authors = ["Yongjin Park <ypp@stat.ubc.ca> <yongjin.park@ubc.ca>"]
+description = "A small stdio Model Context Protocol server for legume tools: tools, progress, cancellation and child runs"
+repository = "https://github.com/causalpathlab/legume-mcp"
+homepage = "https://github.com/causalpathlab/legume-mcp"
+readme = "README.md"
+keywords = ["mcp", "agent", "json-rpc", "genomics"]
+categories = ["science", "command-line-utilities"]
+exclude = [
+    "**/.claude/**",
+    "**/.DS_Store",
+]
+
+[lib]
+name = "legume_mcp"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+log = "0.4"
+serde_json = "1.0"
