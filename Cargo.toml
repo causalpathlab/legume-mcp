@@ -1,6 +1,6 @@
 [package]
 name = "legume-mcp"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT"
@@ -28,7 +28,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # The terminal session the view runs in (`<tool> mcp watch`).
-legume-tui = { version = "0.3.13", default-features = false, optional = true }
+legume-tui = { version = "0.3.15", default-features = false, optional = true }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }
 
 # A tool's command line as an agent sets it (`legume_mcp::cli`).
@@ -49,7 +49,7 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 # The stand-in TUI a session job runs, and the terminal that attaches to it.
-legume-tui = { version = "0.3.14", default-features = false, features = ["clap", "testing"] }
+legume-tui = { version = "0.3.15", default-features = false, features = ["clap", "testing"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 
 [[example]]
