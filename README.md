@@ -86,6 +86,32 @@ until the job ends. `run_making` and `spawn_job` check this themselves; a tool
 that writes an input file beside its outputs first, or chooses an output name
 itself, asks `Call::ensure_free(outputs)` before it does.
 
+## A tool's command line
+
+Most tools run their own CLI as the child of a step. A few helpers keep that
+the same from server to server:
+
+- `serve_in_project(info, handler)` is `serve` from inside the project: the
+  server changes into `project::root()` first, so the relative paths an agent
+  gives are read from the project, as the records are. `project::enter` does
+  that step alone (making the folder when it is new), for a server built on
+  `serve_with`; `project::root_from_env` gives the records' root as an
+  absolute path.
+- `parse_args(args)` reads a call's arguments into the tool's type, or says
+  what is wrong with them; `shown_path` gives a path from the root, and
+  `command_line(argv)` a line to paste into a shell.
+- `Call::free_prefix(base, plan, taken)` picks the first of `base`, `base-2`,
+  ... in today's results folder whose planned outputs neither exist nor are
+  held by a job, for a run the agent did not name.
+
+With the `clap` feature, `legume_mcp::cli` lists a clap command's flags for the
+agent (`settable`, `describe`) and turns the agent's JSON map of flags into the
+words clap reads (`to_argv`: switches named when true, values as one
+`--flag=value` word, lists by the flag's delimiter, null left at the default;
+the tool's own arguments, such as its data files and output prefix, pointed
+to by name). `check` parses the result as the tool would, returning clap's
+error as it renders it.
+
 ## Watching and steering
 
 While an agent works, each server writes what it is doing to an owner-only

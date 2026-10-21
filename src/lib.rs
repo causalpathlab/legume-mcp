@@ -42,6 +42,8 @@ use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(feature = "clap")]
+pub mod cli;
 mod jobs;
 pub mod project;
 pub mod watch;
@@ -52,6 +54,9 @@ use watch::{Body, Feed, Steer};
 /// Protocol revisions this server speaks, newest first. A client asking for
 /// one of them gets it; any other gets the newest.
 pub const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// Names [`Call::free_prefix`] tries before it gives up.
+const FREE_NAMES: usize = 1000;
 
 /// Lines of a failed child's stderr quoted in its error.
 const STDERR_TAIL: usize = 20;
@@ -267,6 +272,47 @@ impl Call {
                 )
             }
         }
+    }
+
+    /// The first of `base`, `base-2`, `base-3`, ... in today's results
+    /// folder ([`Self::results_dir`]) that a run may write to, as an
+    /// absolute prefix, with the outputs `plan` says a run there writes. A
+    /// name is skipped when one of its outputs exists, a running job holds
+    /// one ([`Self::ensure_free`]), or `taken` says so (files a tool finds
+    /// by itself). It fails when the server keeps no records (there is no
+    /// folder to pick in) or a thousand names are taken: the tool then asks
+    /// the agent to name the output.
+    pub fn free_prefix(
+        &self,
+        base: &str,
+        plan: impl Fn(&str) -> Result<Vec<PathBuf>>,
+        taken: impl Fn(&str) -> bool,
+    ) -> Result<(String, Vec<PathBuf>)> {
+        let project = self
+            .records
+            .as_ref()
+            .context("the server keeps no records here")?;
+        let dir = project.day_dir().with_context(|| {
+            format!(
+                "making today's results folder under {}",
+                project.root().display()
+            )
+        })?;
+        for k in 1..=FREE_NAMES {
+            let name = match k {
+                1 => base.to_string(),
+                k => format!("{base}-{k}"),
+            };
+            let out = dir.join(name).to_string_lossy().into_owned();
+            if taken(&out) {
+                continue;
+            }
+            let outputs = plan(&out)?;
+            if !outputs.iter().any(|p| p.exists()) && self.jobs.holder(&outputs).is_none() {
+                return Ok((out, outputs));
+            }
+        }
+        anyhow::bail!("{base} to {base}-{FREE_NAMES} are all taken today")
     }
 
     /// [`Self::run_making`] in the background, for a step longer than a
@@ -515,14 +561,56 @@ where
     Ok(cmd)
 }
 
+/// A call's arguments as the tool's type `T`, or what is wrong with them.
+pub fn parse_args<T: serde::de::DeserializeOwned>(args: Value) -> Result<T> {
+    serde_json::from_value(args).map_err(|e| anyhow::anyhow!("arguments: {e}"))
+}
+
+/// `p` as a tool's results show paths: from the root.
+pub fn shown_path(p: &Path) -> String {
+    absolute(p).to_string_lossy().into_owned()
+}
+
+/// `p` absolute, against the working directory, without touching the disk.
+pub(crate) fn absolute(p: &Path) -> PathBuf {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// `argv` as one line to paste into a shell, each word quoted as the driver
+/// script quotes it.
+pub fn command_line<S: AsRef<str>>(argv: &[S]) -> String {
+    argv.iter()
+        .map(|w| project::quote(w.as_ref()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// [`serve`] from inside the project: the server changes into it first
+/// ([`project::enter`]), so the relative paths an agent gives are read from
+/// the project, as its records are.
+pub fn serve_in_project(info: ServerInfo, handler: impl Handler) -> Result<()> {
+    // The feed's folder first: a relative one is where the server started.
+    let watch = watch::base();
+    let options = Options {
+        project: project::enter()?,
+        watch,
+    };
+    serve_stdio(info, options, handler)
+}
+
 /// Serve `handler` on stdin and stdout until stdin closes, keeping the
 /// records of the project [`project::ROOT_ENV`] and [`project::OFF_ENV`] say,
 /// and a feed to follow where [`watch::ENV`] says.
 pub fn serve(info: ServerInfo, handler: impl Handler) -> Result<()> {
     let options = Options {
-        project: Project::root_from_env(),
+        project: project::root_from_env(),
         watch: watch::base(),
     };
+    serve_stdio(info, options, handler)
+}
+
+/// [`serve_with`] on stdin and stdout.
+fn serve_stdio(info: ServerInfo, options: Options, handler: impl Handler) -> Result<()> {
     serve_with(
         BufReader::new(std::io::stdin()),
         std::io::stdout(),

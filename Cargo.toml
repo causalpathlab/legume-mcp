@@ -1,6 +1,6 @@
 [package]
 name = "legume-mcp"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT"
@@ -31,8 +31,12 @@ serde_json = "1.0"
 legume-tui = { version = "0.3.13", default-features = false, optional = true }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }
 
+# A tool's command line as an agent sets it (`legume_mcp::cli`).
+clap = { version = "4.5", optional = true }
+
 [features]
 tui = ["dep:legume-tui", "dep:ratatui"]
+clap = ["dep:clap"]
 
 [target.'cfg(unix)'.dependencies]
 # geteuid and O_NOFOLLOW, to leave alone record files this user does not own.
@@ -44,3 +48,7 @@ tempfile = "3"
 [[test]]
 name = "watch_view"
 required-features = ["tui"]
+
+[[test]]
+name = "cli"
+required-features = ["clap"]
