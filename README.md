@@ -117,7 +117,10 @@ the same from server to server:
   `command_line(argv)` a line to paste into a shell.
 - `Call::free_prefix(base, plan, taken)` picks the first of `base`, `base-2`,
   ... in today's results folder whose planned outputs neither exist nor are
-  held by a job, for a run the agent did not name.
+  held by a job, for a run the agent did not name. `free_prefix(dir, base,
+  plan, taken)` picks the same way in any folder (the same closures, no job
+  holds), for a tool's own screen with no server, so its runs number as an
+  agent's do.
 
 With the `clap` feature, `legume_mcp::cli` lists a clap command's flags for the
 agent (`settable`, `describe`) and turns the agent's JSON map of flags into the
