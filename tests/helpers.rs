@@ -2,7 +2,8 @@
 //! command lines it shows, and a free name for a run's outputs.
 
 use anyhow::Result;
-use legume_mcp::{command_line, parse_args, serve_in, shown_path, Call, Content, Handler};
+use legume_mcp::{command_line, free_prefix, parse_args, serve_in, shown_path};
+use legume_mcp::{Call, Content, Handler};
 use legume_mcp::{ServerInfo, ToolSpec};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -133,6 +134,39 @@ fn a_free_prefix_skips_names_written_held_or_taken() {
         r[3]["result"]["structuredContent"]["outputs"],
         json!([format!("{fit}-4.a.bin")])
     );
+}
+
+#[test]
+fn a_folder_s_free_prefix_is_the_one_a_call_picks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().to_path_buf();
+    let fit = out_of(&session(Some(project.clone()), &[call(1, "pick", json!({}))])[0]);
+    let day = PathBuf::from(&fit).parent().unwrap().to_path_buf();
+    for name in ["fit", "fit-2"] {
+        std::fs::write(day.join(format!("{name}.a.bin")), "").unwrap();
+    }
+    let plan = |out: &str| Ok(vec![PathBuf::from(format!("{out}.a.bin"))]);
+    let skip3 = |out: &str| out.ends_with("/fit-3");
+    let (out, outputs) = free_prefix(&day, "fit", plan, skip3).unwrap();
+    assert_eq!(out, format!("{fit}-4"));
+    assert_eq!(outputs, [PathBuf::from(format!("{fit}-4.a.bin"))]);
+    let r = session(
+        Some(project),
+        &[call(1, "pick", json!({ "skip": ["fit-3"] }))],
+    );
+    let picked = out_of(&r[0]);
+    // Past midnight the server picks in the next day's folder.
+    if PathBuf::from(&picked).parent() == Some(day.as_path()) {
+        assert_eq!(picked, out, "the server picks as the folder does");
+    }
+}
+
+#[test]
+fn a_folder_s_free_prefix_gives_up_when_every_name_is_taken() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = |out: &str| Ok(vec![PathBuf::from(out)]);
+    let e = free_prefix(tmp.path(), "fit", plan, |_| true).unwrap_err();
+    assert!(e.to_string().contains("all taken"), "{e}");
 }
 
 #[test]

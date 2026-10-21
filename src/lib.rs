@@ -63,7 +63,7 @@ use watch::{Body, Feed, Steer};
 /// one of them gets it; any other gets the newest.
 pub const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
-/// Names [`Call::free_prefix`] tries before it gives up.
+/// Names [`free_prefix`] tries before it gives up.
 const FREE_NAMES: usize = 1000;
 
 /// Lines of a failed child's stderr quoted in its error.
@@ -290,14 +290,13 @@ impl Call {
         }
     }
 
-    /// The first of `base`, `base-2`, `base-3`, ... in today's results
-    /// folder ([`Self::results_dir`]) that a run may write to, as an
-    /// absolute prefix, with the outputs `plan` says a run there writes. A
-    /// name is skipped when one of its outputs exists, a running job holds
-    /// one ([`Self::ensure_free`]), or `taken` says so (files a tool finds
-    /// by itself). It fails when the server keeps no records (there is no
-    /// folder to pick in) or a thousand names are taken: the tool then asks
-    /// the agent to name the output.
+    /// [`free_prefix`] in today's results folder ([`Self::results_dir`]),
+    /// as an absolute prefix: a name is also skipped when a running job
+    /// holds one of its outputs ([`Self::ensure_free`]). It fails when the
+    /// server keeps no records (there is no folder to pick in) or a
+    /// thousand names are taken, and the tool then asks the agent to name
+    /// the output; also when today's folder cannot be made, or `plan`
+    /// fails.
     pub fn free_prefix(
         &self,
         base: &str,
@@ -314,21 +313,9 @@ impl Call {
                 project.root().display()
             )
         })?;
-        for k in 1..=FREE_NAMES {
-            let name = match k {
-                1 => base.to_string(),
-                k => format!("{base}-{k}"),
-            };
-            let out = dir.join(name).to_string_lossy().into_owned();
-            if taken(&out) {
-                continue;
-            }
-            let outputs = plan(&out)?;
-            if !outputs.iter().any(|p| p.exists()) && self.jobs.holder(&outputs).is_none() {
-                return Ok((out, outputs));
-            }
-        }
-        anyhow::bail!("{base} to {base}-{FREE_NAMES} are all taken today")
+        pick_free(&dir, base, plan, taken, |outputs| {
+            self.jobs.holder(outputs).is_some()
+        })
     }
 
     /// [`Self::run_making`] in the background, for a step longer than a
@@ -561,6 +548,51 @@ where
     let mut cmd = Command::new(exe);
     cmd.args(args);
     Ok(cmd)
+}
+
+/// The first of `base`, `base-2`, `base-3`, ... in `dir` that a run may
+/// write to, as a prefix under `dir` (absolute when `dir` is), with the
+/// outputs `plan` says a run there writes. A name is skipped when `taken`
+/// says so (files a tool finds by itself; asked before `plan`) or one of
+/// its outputs exists. It fails when `dir` is not UTF-8, `plan` fails, or a
+/// thousand names are taken. [`Call::free_prefix`] picks the same way in
+/// today's results folder; a tool with no server (its own screen) calls
+/// this, so the names it picks number as an agent's do.
+pub fn free_prefix(
+    dir: &Path,
+    base: &str,
+    plan: impl Fn(&str) -> Result<Vec<PathBuf>>,
+    taken: impl Fn(&str) -> bool,
+) -> Result<(String, Vec<PathBuf>)> {
+    pick_free(dir, base, plan, taken, |_| false)
+}
+
+/// [`free_prefix`], a name also skipped when `held` says another run is
+/// writing its outputs.
+fn pick_free(
+    dir: &Path,
+    base: &str,
+    plan: impl Fn(&str) -> Result<Vec<PathBuf>>,
+    taken: impl Fn(&str) -> bool,
+    held: impl Fn(&[PathBuf]) -> bool,
+) -> Result<(String, Vec<PathBuf>)> {
+    dir.to_str()
+        .with_context(|| format!("{} is not UTF-8: name the output", dir.display()))?;
+    for k in 1..=FREE_NAMES {
+        let name = match k {
+            1 => base.to_string(),
+            k => format!("{base}-{k}"),
+        };
+        let out = dir.join(name).to_string_lossy().into_owned();
+        if taken(&out) {
+            continue;
+        }
+        let outputs = plan(&out)?;
+        if !outputs.iter().any(|p| p.exists()) && !held(&outputs) {
+            return Ok((out, outputs));
+        }
+    }
+    anyhow::bail!("{base} to {base}-{FREE_NAMES} are all taken")
 }
 
 /// A call's arguments as the tool's type `T`, or what is wrong with them.
