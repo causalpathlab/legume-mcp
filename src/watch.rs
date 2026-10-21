@@ -140,9 +140,19 @@ pub struct Live {
 pub fn base() -> Option<PathBuf> {
     match std::env::var(ENV) {
         Ok(v) if v.eq_ignore_ascii_case("off") => None,
+        _ => default_base(),
+    }
+}
+
+/// [`base`], `off` or not: the folder [`ENV`] names, else the runtime
+/// directory's.
+pub(crate) fn default_base() -> Option<PathBuf> {
+    match std::env::var(ENV) {
         // Absolute, so a server that then changes folder writes where a
         // viewer started beside it looks.
-        Ok(v) if !v.is_empty() => Some(crate::absolute(Path::new(&v))),
+        Ok(v) if !v.is_empty() && !v.eq_ignore_ascii_case("off") => {
+            Some(crate::absolute(Path::new(&v)))
+        }
         _ => Some(match std::env::var_os("XDG_RUNTIME_DIR") {
             Some(d) => PathBuf::from(d).join("legume-mcp"),
             None => dirs_cache()?.join("legume-mcp").join("run"),
@@ -572,7 +582,7 @@ impl Drop for Feed {
 }
 
 /// `dir`, made if missing, and owner-only.
-fn private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {

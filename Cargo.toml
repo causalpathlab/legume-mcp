@@ -37,6 +37,10 @@ clap = { version = "4.6", optional = true }
 [features]
 tui = ["dep:legume-tui", "dep:ratatui"]
 clap = ["dep:clap"]
+# Background steps that run in a detachable session of the tool's own TUI
+# (`Call::start_session_job`): a person attaches to watch them, and they
+# outlive the server.
+sessions = ["dep:legume-tui"]
 
 [target.'cfg(unix)'.dependencies]
 # geteuid and O_NOFOLLOW, to leave alone record files this user does not own.
@@ -44,6 +48,17 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# The stand-in TUI a session job runs, and the terminal that attaches to it.
+legume-tui = { version = "0.3.14", default-features = false, features = ["clap", "testing"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+
+[[example]]
+name = "session_job"
+required-features = ["sessions"]
+
+[[test]]
+name = "session_jobs"
+required-features = ["sessions"]
 
 [[test]]
 name = "watch_view"

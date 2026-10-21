@@ -77,8 +77,23 @@ Every server offers the agent `job_status`, `job_wait` (blocks up to 120 s; call
 again while it runs) and `job_cancel`, and its instructions say how to use
 them. A job's log goes to the feed under its id, where a person can stop it
 too; a job that succeeds is recorded when it ends, like any step (`runall.sh`,
-`INDEX.tsv`); one cancelled or failed is not. Jobs end with their server: a
-step longer than a client session is the tool's own command line's to run.
+`INDEX.tsv`); one cancelled or failed is not. These jobs end with their
+server.
+
+With feature `sessions` (Unix), a tool can run the step in a detached session
+of its own TUI instead: `Call::start_session_job(SessionJob { tool, screen,
+label, watch, record, outputs, summary })` starts `watch` (the tool's own
+binary, as `senna run` or `lupin annotate` runs it on screen) in a new
+legume-tui session and returns the job's id and the session's. A person runs
+`<tool> attach <session>` to see the usual screen; the agent follows it with
+the same `job_status`, `job_wait` and `job_cancel` (its status adds `session`
+and `attach`), and a cancel stops the session as `<tool> kill` does. The TUI
+reports through `job::Reporter::from_env()`: `line` for its log, and `finish`
+with how it ended, which records the step (`record`, the command without the
+screen) as `spawn_job` does: run only when it is done and every output is
+there. Such a job outlives its server: it records itself as it ends, and the
+next server for the same project takes up the ones still running or ended
+unseen. Their folders are in `jobs` beside the watch folders.
 
 While a job runs, its outputs are held: a step writing one of them (the same
 file, or one inside the other, however spelled) is refused, naming the job,
