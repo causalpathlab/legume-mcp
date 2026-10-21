@@ -49,6 +49,42 @@ pub const ROOT_ENV: &str = "LEGUME_MCP_PROJECT";
 /// `off` keeps no records.
 pub const OFF_ENV: &str = "LEGUME_MCP_RECORDS";
 
+/// The project's folder: [`ROOT_ENV`], else the working directory, as an
+/// absolute path (records kept or not).
+pub fn root() -> Option<PathBuf> {
+    match std::env::var_os(ROOT_ENV) {
+        Some(v) if !v.is_empty() => std::path::absolute(v).ok(),
+        _ => std::env::current_dir().ok(),
+    }
+}
+
+/// The project whose records a server keeps, as [`ROOT_ENV`] and
+/// [`OFF_ENV`] say: [`root`], or none when records are `off`. Absolute, so
+/// a server that changes into it reads the same folder from inside.
+pub fn root_from_env() -> Option<PathBuf> {
+    records_on().then(root).flatten()
+}
+
+/// Whether records are kept: [`OFF_ENV`] is not `off`.
+fn records_on() -> bool {
+    !std::env::var(OFF_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("off"))
+}
+
+/// Change into the project's folder ([`root`]), making it when it is not
+/// there yet, and return the records' root ([`root_from_env`]): what a
+/// server does first so the relative paths an agent gives are the project's.
+pub fn enter() -> anyhow::Result<Option<PathBuf>> {
+    // Resolved once, before the change: a relative root read again from
+    // inside would name a folder a level deeper.
+    let root = root();
+    if let Some(root) = &root {
+        std::fs::create_dir_all(root)
+            .and_then(|()| std::env::set_current_dir(root))
+            .map_err(|e| anyhow::anyhow!("entering the project {}: {e}", root.display()))?;
+    }
+    Ok(root.filter(|_| records_on()))
+}
+
 pub(crate) struct Project {
     root: PathBuf,
     name: String,
@@ -105,7 +141,7 @@ pub(crate) fn rfc3339() -> String {
 impl Project {
     pub(crate) fn new(root: PathBuf, name: &str, version: &str) -> Self {
         Self {
-            root: std::path::absolute(&root).unwrap_or(root),
+            root: crate::absolute(&root),
             name: name.into(),
             version: version.into(),
             feed: None,
@@ -116,17 +152,6 @@ impl Project {
     pub(crate) fn watched(mut self, feed: Option<Arc<Feed>>) -> Self {
         self.feed = feed;
         self
-    }
-
-    /// The project [`ROOT_ENV`] and [`OFF_ENV`] say: none when `off`.
-    pub(crate) fn root_from_env() -> Option<PathBuf> {
-        if std::env::var(OFF_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("off")) {
-            return None;
-        }
-        match std::env::var(ROOT_ENV) {
-            Ok(v) if !v.is_empty() => Some(PathBuf::from(v)),
-            _ => std::env::current_dir().ok(),
-        }
     }
 
     pub(crate) fn root(&self) -> &Path {

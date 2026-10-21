@@ -7,6 +7,7 @@
 //! when it ends. Jobs end with their server: a step longer than a client
 //! session is the tool's own command line's to run.
 
+use crate::absolute;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -242,11 +243,6 @@ impl Jobs {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-}
-
-/// `p` absolute, against the working directory, without touching the disk.
-fn absolute(p: &Path) -> PathBuf {
-    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Links followed before a path is taken as it is spelled (a loop).

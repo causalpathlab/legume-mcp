@@ -140,7 +140,9 @@ pub struct Live {
 pub fn base() -> Option<PathBuf> {
     match std::env::var(ENV) {
         Ok(v) if v.eq_ignore_ascii_case("off") => None,
-        Ok(v) if !v.is_empty() => Some(PathBuf::from(v)),
+        // Absolute, so a server that then changes folder writes where a
+        // viewer started beside it looks.
+        Ok(v) if !v.is_empty() => Some(crate::absolute(Path::new(&v))),
         _ => Some(match std::env::var_os("XDG_RUNTIME_DIR") {
             Some(d) => PathBuf::from(d).join("legume-mcp"),
             None => dirs_cache()?.join("legume-mcp").join("run"),
