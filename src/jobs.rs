@@ -4,8 +4,9 @@
 //! the built-in `job_status`, `job_wait` and `job_cancel`; a person following
 //! the server sees each as a call of its own (`job-N`) and can stop it. A
 //! job that succeeds is recorded like any step (`runall.sh`, `INDEX.tsv`)
-//! when it ends. Jobs end with their server: a step longer than a client
-//! session is the tool's own command line's to run.
+//! when it ends. A plain job ends with its server; one a tool starts in a
+//! session of its own TUI ([`crate::Call::start_session_job`]) runs on, and
+//! the next server takes it up.
 
 use crate::absolute;
 use serde_json::{json, Value};
@@ -42,6 +43,17 @@ impl State {
     }
 }
 
+/// A job that runs in a session of the tool's TUI: what a person types to
+/// watch it, and how it is stopped.
+pub(crate) struct Session {
+    /// The session's id.
+    pub id: String,
+    /// The command that attaches to it (`tool attach ID`).
+    pub attach: String,
+    /// Ask the session to stop; it returns at once.
+    pub stop: Box<dyn Fn() + Send + Sync>,
+}
+
 struct Progress {
     state: State,
     tail: VecDeque<String>,
@@ -63,11 +75,22 @@ pub(crate) struct Job {
     progress: Mutex<Progress>,
     ended: Condvar,
     cancel: AtomicBool,
+    session: Option<Session>,
 }
 
 impl Job {
     pub(crate) fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Ask it to stop: a session job's session is asked, a child is killed
+    /// by its thread.
+    pub(crate) fn ask_to_stop(&self) {
+        if !self.cancel.swap(true, Ordering::Relaxed) {
+            if let Some(s) = &self.session {
+                (s.stop)();
+            }
+        }
     }
 
     pub(crate) fn line(&self, line: &str) {
@@ -78,6 +101,33 @@ impl Job {
         p.tail.push_back(line.into());
     }
 
+    /// The job is over, as `state` and `text` say (its output, or why it
+    /// did not succeed): told to whoever follows the server in `feed`,
+    /// with who stopped it (`by_user`, else the client) when it was, then
+    /// ended.
+    pub(crate) fn conclude(
+        &self,
+        feed: Option<&crate::watch::Feed>,
+        state: State,
+        text: String,
+        by_user: bool,
+    ) {
+        use crate::watch::Body;
+        if let Some(f) = feed {
+            if state == State::Cancelled {
+                let by = if by_user { "user" } else { "client" };
+                f.emit(Body::Cancelled {
+                    id: self.id.clone(),
+                    by: by.into(),
+                });
+            }
+            let ok = state == State::Done;
+            let result = json!({ "content": [{ "type": "text", "text": text }], "isError": !ok });
+            f.result(&self.id, &result, self.ms());
+        }
+        self.end(state, text);
+    }
+
     /// The job is over: `state`, with `out` (stdout, or the error).
     pub(crate) fn end(&self, state: State, out: String) {
         let mut p = self.progress.lock().unwrap_or_else(|e| e.into_inner());
@@ -85,6 +135,12 @@ impl Job {
         p.out = out;
         p.ms = Some(self.started.elapsed().as_millis() as u64);
         self.ended.notify_all();
+    }
+
+    /// How long it ran, or has run so far, in milliseconds.
+    pub(crate) fn ms(&self) -> u64 {
+        let p = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        p.ms.unwrap_or_else(|| self.started.elapsed().as_millis() as u64)
     }
 
     fn running(&self) -> bool {
@@ -113,7 +169,13 @@ impl Job {
             "seconds": p.ms.unwrap_or_else(|| self.started.elapsed().as_millis() as u64) / 1000,
             "last_lines": p.tail.iter().rev().take(5).rev().collect::<Vec<_>>(),
         });
+        if let Some(s) = &self.session {
+            v["session"] = json!(s.id);
+            v["attach"] = json!(s.attach);
+        }
         match p.state {
+            // Asked to stop, and stopping.
+            State::Running if self.cancelled() => v["stopping"] = json!(true),
             State::Running => {}
             State::Done => v["output"] = json!(out),
             State::Failed | State::Cancelled => v["error"] = json!(out),
@@ -131,16 +193,31 @@ pub(crate) struct Jobs {
 
 impl Jobs {
     /// A new running job of `tool`'s, writing `outputs`: `summary` says what
-    /// it makes.
-    pub(crate) fn add(&self, tool: &str, summary: &str, outputs: &[PathBuf]) -> Arc<Job> {
+    /// it makes; one running in `session` when given, started `ago` (at
+    /// the time given, that long ago; now when None).
+    pub(crate) fn add(
+        &self,
+        tool: &str,
+        summary: &str,
+        outputs: &[PathBuf],
+        session: Option<Session>,
+        ago: Option<(String, Duration)>,
+    ) -> Arc<Job> {
         let n = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+        let (started_at, started) = match ago {
+            Some((at, ago)) => (
+                at,
+                Instant::now().checked_sub(ago).unwrap_or_else(Instant::now),
+            ),
+            None => (crate::project::rfc3339(), Instant::now()),
+        };
         let job = Arc::new(Job {
             id: format!("job-{n}"),
             tool: tool.into(),
             summary: summary.into(),
             outputs: outputs.iter().map(|o| (absolute(o), hold_key(o))).collect(),
-            started_at: crate::project::rfc3339(),
-            started: Instant::now(),
+            started_at,
+            started,
             progress: Mutex::new(Progress {
                 state: State::Running,
                 tail: VecDeque::new(),
@@ -149,6 +226,7 @@ impl Jobs {
             }),
             ended: Condvar::new(),
             cancel: AtomicBool::new(false),
+            session,
         });
         let mut all = self.all.lock().unwrap_or_else(|e| e.into_inner());
         all.insert(n, job.clone());
@@ -177,6 +255,11 @@ impl Jobs {
             })?;
             Some((j.id.clone(), given.clone()))
         })
+    }
+
+    /// Whether this server has job `id`.
+    pub(crate) fn has(&self, id: &str) -> bool {
+        self.get(id).is_some()
     }
 
     fn get(&self, id: &str) -> Option<Arc<Job>> {
@@ -221,22 +304,28 @@ impl Jobs {
         Ok(job.status())
     }
 
-    /// `job_cancel`: ask job `id` to stop; its child is killed shortly.
+    /// `job_cancel`: ask job `id` to stop; its child is killed, or its
+    /// session stopped, shortly.
     pub(crate) fn cancel(&self, id: &str) -> anyhow::Result<Value> {
         let job = self.get(id).ok_or_else(|| Self::unknown(id))?;
-        job.cancel.store(true, Ordering::Relaxed);
+        if job.running() {
+            job.ask_to_stop();
+        }
         Ok(job.status())
     }
 
-    /// The server is ending: stop the jobs still running, and give them a
-    /// moment to.
+    /// The server is ending: stop the plain jobs still running, and give
+    /// them a moment to. Session jobs run on.
     pub(crate) fn stop_all(&self) {
         let running: Vec<Arc<Job>> = {
             let all = self.all.lock().unwrap_or_else(|e| e.into_inner());
-            all.values().filter(|j| j.running()).cloned().collect()
+            all.values()
+                .filter(|j| j.running() && j.session.is_none())
+                .cloned()
+                .collect()
         };
         for j in &running {
-            j.cancel.store(true, Ordering::Relaxed);
+            j.ask_to_stop();
         }
         let deadline = Instant::now() + Duration::from_secs(3);
         while running.iter().any(|j| j.running()) && Instant::now() < deadline {
@@ -304,7 +393,7 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir(root.join("runs")).unwrap();
         let jobs = Jobs::default();
-        jobs.add("fit", "a fit", &[root.join("runs/../fit")]);
+        jobs.add("fit", "a fit", &[root.join("runs/../fit")], None, None);
         assert_eq!(held_by(&jobs, &root.join("fit")).as_deref(), Some("job-1"));
         assert_eq!(
             held_by(&jobs, &root.join("./fit/x")).as_deref(),
@@ -339,7 +428,7 @@ mod tests {
         // A relative link to a folder not made yet.
         symlink("target", root.join("link")).unwrap();
         let jobs = Jobs::default();
-        jobs.add("fit", "a fit", &[root.join("link/fit")]);
+        jobs.add("fit", "a fit", &[root.join("link/fit")], None, None);
         assert_eq!(
             held_by(&jobs, &root.join("target/fit")).as_deref(),
             Some("job-1")

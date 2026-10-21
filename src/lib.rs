@@ -44,7 +44,15 @@ use std::time::Duration;
 
 #[cfg(feature = "clap")]
 pub mod cli;
+pub mod job;
 mod jobs;
+#[cfg(all(feature = "sessions", unix))]
+mod session;
+#[cfg(not(all(feature = "sessions", unix)))]
+#[path = "session_off.rs"]
+mod session;
+#[cfg(all(feature = "sessions", unix))]
+pub use session::{SessionJob, Started};
 pub mod project;
 pub mod watch;
 use jobs::{Jobs, State as JobState};
@@ -152,6 +160,14 @@ pub struct Call {
     feed: Option<Arc<Feed>>,
     steer: Arc<Mutex<Steer>>,
     jobs: Arc<Jobs>,
+    /// The server, as its session jobs know it.
+    #[cfg(all(feature = "sessions", unix))]
+    server: Arc<session::Server>,
+}
+
+/// `m`'s guard, also when a thread panicked holding it.
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl Call {
@@ -323,7 +339,7 @@ impl Call {
     /// a step that ran.
     pub fn spawn_job(&self, cmd: Command, outputs: &[PathBuf], summary: &str) -> Result<String> {
         self.ensure_free(outputs)?;
-        let job = self.jobs.add(&self.tool, summary, outputs);
+        let job = self.jobs.add(&self.tool, summary, outputs, None, None);
         let id = job.id.clone();
         if let Some(f) = &self.feed {
             f.emit(Body::Call {
@@ -335,7 +351,6 @@ impl Call {
         let bare = self.records.as_ref().map(|p| p.command(&cmd));
         let (records, feed, steer) = (self.records.clone(), self.feed.clone(), self.steer.clone());
         let (tool, outputs, summary) = (self.tool.clone(), outputs.to_vec(), summary.to_string());
-        let started = std::time::Instant::now();
         std::thread::Builder::new()
             .name(id.clone())
             .spawn(move || {
@@ -358,24 +373,11 @@ impl Call {
                 let (state, text) = match &result {
                     Ok(out) => (JobState::Done, out.clone()),
                     Err(_) if job.cancelled() || stopped() => {
-                        if let Some(f) = &feed {
-                            let by = if stopped() { "user" } else { "client" };
-                            f.emit(Body::Cancelled {
-                                id: job.id.clone(),
-                                by: by.into(),
-                            });
-                        }
                         (JobState::Cancelled, "cancelled".to_string())
                     }
                     Err(e) => (JobState::Failed, format!("{e:#}")),
                 };
-                if let Some(f) = &feed {
-                    let ok = state == JobState::Done;
-                    let result =
-                        json!({ "content": [{ "type": "text", "text": text }], "isError": !ok });
-                    f.result(&job.id, &result, started.elapsed().as_millis() as u64);
-                }
-                job.end(state, text);
+                job.conclude(feed.as_deref(), state, text, stopped());
             })
             .context("starting a job")?;
         Ok(id)
@@ -684,7 +686,15 @@ const JOBS_NOTE: &str = "\
 A tool may run a long step as a background job and return its id (job-N) at \
 once: follow it with job_status or job_wait (wait again while it runs), and \
 stop it with job_cancel. Its outputs exist once it is done; do not use them \
-before. Jobs end when this server does.";
+before.";
+/// How jobs end, after [`JOBS_NOTE`].
+#[cfg(all(feature = "sessions", unix))]
+const JOBS_END: &str = " A job whose status names a session runs in that \
+session of the tool's own screen: tell the user the `attach` command in its \
+status, which shows it; it goes on when this server ends, and the next one \
+lists it. Other jobs end when this server does.";
+#[cfg(not(all(feature = "sessions", unix)))]
+const JOBS_END: &str = " Jobs end when this server does.";
 
 /// The built-in tool every server with records offers.
 fn notebook_spec() -> ToolSpec {
@@ -734,6 +744,7 @@ where
     R: BufRead + Send + 'static,
     W: Write + Send + 'static,
 {
+    let options_watch = options.watch.clone();
     let feed: Option<Arc<Feed>> = options.watch.as_deref().and_then(|base| {
         let meta = watch::Meta {
             server: info.name.clone(),
@@ -837,10 +848,22 @@ where
     if builtin_jobs {
         specs.extend(job_specs());
         info.instructions = Some(match info.instructions.take() {
-            Some(text) => format!("{text}\n\n{JOBS_NOTE}"),
-            None => JOBS_NOTE.to_string(),
+            Some(text) => format!("{text}\n\n{JOBS_NOTE}{JOBS_END}"),
+            None => format!("{JOBS_NOTE}{JOBS_END}"),
         });
     }
+    let server = Arc::new(session::Server::new(
+        &info,
+        options_watch.as_deref(),
+        feed.clone(),
+        steer.clone(),
+    ));
+    // The session jobs no server follows (a server before this one left
+    // them running, or ended unseen) are this one's: looked for as it
+    // starts, and again when the agent asks after all jobs, or one this
+    // server does not know.
+    let project = records.as_ref().map(|p| p.root().to_path_buf());
+    server.adopt(&jobs, project.as_deref(), true);
     for msg in rx {
         let Some(method) = msg.get("method").and_then(Value::as_str) else {
             continue; // a response to a request we never send
@@ -896,6 +919,9 @@ where
                 };
                 if builtin_jobs && JOB_TOOLS.contains(&name) {
                     let id = args["id"].as_str();
+                    if id.is_none_or(|id| !jobs.has(id)) {
+                        server.adopt(&jobs, project.as_deref(), false);
+                    }
                     let result = match (name, id) {
                         ("job_status", id) => jobs.status(id),
                         ("job_wait", Some(id)) => {
@@ -928,6 +954,8 @@ where
                     feed: feed.clone(),
                     steer: steer.clone(),
                     jobs: jobs.clone(),
+                    #[cfg(all(feature = "sessions", unix))]
+                    server: server.clone(),
                     token: params["_meta"].get("progressToken").cloned(),
                     step: AtomicU64::new(0),
                     out: out.clone(),
@@ -968,8 +996,10 @@ where
     let result = reader
         .join()
         .map_err(|_| anyhow::anyhow!("the stdin reader panicked"));
-    // Jobs end with their server.
+    // Plain jobs end with their server; session jobs run on, for the next
+    // server to follow.
     jobs.stop_all();
+    server.end();
     if let Some(f) = &feed {
         f.emit(Body::Ended { ok: result.is_ok() });
     }
