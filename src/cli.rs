@@ -5,6 +5,7 @@
 //! in the refusals.
 
 use anyhow::Result;
+use clap::error::{ContextKind, ErrorKind};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use serde_json::{json, Map, Value};
 
@@ -188,10 +189,58 @@ pub fn to_argv(
 }
 
 /// `argv` (without the program's name) parsed as `cmd` parses it, or clap's
-/// error as it renders it.
+/// error as [`one_line`] gives it.
 pub fn check(cmd: &Command, argv: &[String]) -> Result<ArgMatches> {
     cmd.clone()
         .no_binary_name(true)
         .try_get_matches_from(argv)
-        .map_err(|e| anyhow::anyhow!("{}", e.to_string().trim_end()))
+        .map_err(|e| one_line(e, cmd, argv))
+}
+
+/// clap's error on one line under the name of the command it refuses (`app
+/// sub` for a subcommand): what is wrong, the choices and clap's tips,
+/// without the usage and the pointer to `--help`, which are for a person at
+/// a shell. Help or a version asked for comes back whole.
+fn one_line(mut e: clap::Error, cmd: &Command, argv: &[String]) -> anyhow::Error {
+    if matches!(
+        e.kind(),
+        ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    ) {
+        return anyhow::anyhow!("{}", e.to_string().trim_end());
+    }
+    e.remove(ContextKind::Usage);
+    let rendered = e.to_string();
+    let mut said = rendered.trim_end();
+    // clap has no switch for its pointer to --help: it is cut from the end,
+    // so that a value of the agent's in the message is never cut.
+    if let Some((rest, _)) = said
+        .rsplit_once("\n\n")
+        .filter(|(_, last)| last.starts_with("For more information"))
+    {
+        said = rest;
+    }
+    said = said.strip_prefix("error: ").unwrap_or(said);
+    let words: Vec<&str> = said
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    anyhow::anyhow!("{}: {}", command_path(cmd, argv), words.join(" "))
+}
+
+/// The command `argv` runs under `cmd`: its name, then each subcommand the
+/// leading words name.
+fn command_path(cmd: &Command, argv: &[String]) -> String {
+    let mut path = vec![cmd.get_name()];
+    let mut at = cmd;
+    for word in argv {
+        let Some(sub) = at.find_subcommand(word) else {
+            break;
+        };
+        path.push(sub.get_name());
+        at = sub;
+    }
+    path.join(" ")
 }

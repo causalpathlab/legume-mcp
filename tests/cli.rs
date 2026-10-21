@@ -198,9 +198,48 @@ fn a_flag_that_cannot_be_set_says_why() {
     assert!(e.contains("--nope") && e.contains("tool_flags"), "{e}");
 }
 
+/// `words` as `cmd` refuses them: one line, with no usage or pointer to
+/// --help, which are for a person at a shell.
+fn refusal(cmd: &Command, words: &[&str]) -> String {
+    let words: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+    let e = check(cmd, &words).unwrap_err().to_string();
+    assert!(!e.contains('\n') && !e.contains("--help"), "{e}");
+    assert!(!e.contains("Usage: tool"), "{e}");
+    e
+}
+
 #[test]
 fn a_command_line_clap_refuses_comes_back_as_its_error() {
-    let words = vec!["--device=gpu".to_string()];
-    let e = format!("{}", check(&tool(), &words).unwrap_err());
-    assert!(e.contains("gpu") && e.contains("--device"), "{e}");
+    let e = refusal(&tool(), &["--device=gpu"]);
+    assert!(
+        e.starts_with("tool: invalid value") && e.contains("--device"),
+        "{e}"
+    );
+    assert!(
+        e.contains("gpu") && e.contains("cuda"),
+        "the choices stay: {e}"
+    );
+
+    let e = refusal(&tool(), &["--one=a", "--verbos"]);
+    assert!(e.starts_with("tool: ") && e.contains("--verbos"), "{e}");
+    assert!(e.contains("--verbose"), "the tip stays: {e}");
+
+    // A value of the agent's own is never cut, whatever it holds.
+    let e = refusal(&tool(), &["--device=a\n\nUsage: x"]);
+    assert!(e.contains("Usage: x") && e.contains("cuda"), "{e}");
+}
+
+#[test]
+fn a_refused_subcommand_is_named() {
+    let app = Command::new("app").subcommand(tool());
+    let e = refusal(&app, &["tool", "--device=gpu"]);
+    assert!(e.starts_with("app tool: invalid value"), "{e}");
+}
+
+#[test]
+fn help_asked_for_comes_back_whole() {
+    let e = check(&tool(), &["--help".to_string()])
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("Usage: tool") && e.contains('\n'), "{e}");
 }

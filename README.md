@@ -110,7 +110,9 @@ words clap reads (`to_argv`: switches named when true, values as one
 `--flag=value` word, lists by the flag's delimiter, null left at the default;
 the tool's own arguments, such as its data files and output prefix, pointed
 to by name). `check` parses the result as the tool would, returning clap's
-error as it renders it.
+error on one line under the name of the command it refuses (`app sub` for
+a subcommand): what is wrong, the choices and clap's tips, without the usage
+and the pointer to `--help`; help asked for comes back whole.
 
 ## Watching and steering
 
