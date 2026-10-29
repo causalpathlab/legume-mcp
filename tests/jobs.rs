@@ -108,11 +108,21 @@ fn a_long_step_runs_as_a_job_and_is_recorded_when_it_ends() {
     assert_eq!(job, "job-1");
     let s = c.call("job_status", json!({ "id": job }));
     assert_eq!(structured(&s)["state"], "running");
+    assert_eq!(s["_meta"]["legume/next"][0]["tool"], "job_wait", "{s}");
 
     // Waited on, it ends done, with its output; recorded as it ends.
     let w = c.call("job_wait", json!({ "id": job, "seconds": 20 }));
     assert_eq!(structured(&w)["state"], "done", "{w}");
     assert_eq!(structured(&w)["output"], "fitted");
+    let next = &w["_meta"]["legume/next"][0];
+    assert_eq!(next["args"], json!({ "kind": "observation" }), "{w}");
+    assert!(
+        w["content"][1]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Next, if the person agrees"),
+        "{w}"
+    );
     assert!(made.exists());
     let day = std::fs::read_dir(project.join("results"))
         .unwrap()

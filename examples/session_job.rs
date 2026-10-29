@@ -7,6 +7,7 @@
 //! `session_job attach|sessions|kill [ID]` are the session handlers.
 
 use legume_mcp::job::{End, Reporter};
+use legume_mcp::Fact;
 use legume_tui::cli::{AttachArgs, KillArgs};
 use legume_tui::{Options, Round, Tool};
 use ratatui::widgets::Paragraph;
@@ -58,7 +59,8 @@ fn run(mode: &str, out: PathBuf) -> std::io::Result<()> {
     };
     session.restore();
     if let Some(r) = reporter {
-        r.finish(end);
+        // The key numbers of the step, for its row in INDEX.tsv.
+        r.finish_with(end, vec![Fact::count("steps", step)]);
     }
     Ok(())
 }

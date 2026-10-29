@@ -21,12 +21,13 @@
 //!
 //! The step is recorded as the job ends, as `Call::spawn_job` records one:
 //! its line in `runall.sh` and its outputs in `INDEX.tsv` when it
-//! succeeded, a commented line saying why when it did not. The TUI does it
+//! succeeded (with the facts the TUI gives [`Reporter::finish_with`]), a commented line saying why when it did not. The TUI does it
 //! ([`Reporter::finish`]), so it is recorded whether or not a server is
 //! still there to see it end.
 
 use crate::project::Project;
 use crate::watch::Feed;
+use crate::{Fact, Step};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -57,6 +58,9 @@ pub(crate) struct Spec {
     pub summary: String,
     /// What it writes, absolute.
     pub outputs: Vec<PathBuf>,
+    /// What it reads, absolute (none from a server before 0.5.0).
+    #[serde(default)]
+    pub inputs: Vec<PathBuf>,
     /// The step as the driver script repeats it.
     pub record: Option<String>,
     /// When it started: RFC 3339, and seconds since the epoch.
@@ -117,7 +121,12 @@ pub(crate) fn replace(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<(
 /// a step (one that ran only when it is done and every output is there; a
 /// job done without one failed), with what it records told to `feed`,
 /// then said in `end.json`. How it ended, as said, by whoever said first.
-pub(crate) fn conclude(dir: &Path, end: End, feed: Option<Arc<Feed>>) -> Option<End> {
+pub(crate) fn conclude(
+    dir: &Path,
+    end: End,
+    facts: Vec<Fact>,
+    feed: Option<Arc<Feed>>,
+) -> Option<End> {
     let first = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -155,12 +164,13 @@ pub(crate) fn conclude(dir: &Path, end: End, feed: Option<Arc<Feed>>) -> Option<
             End::Failed(why) => Err(anyhow::anyhow!("{why}")),
             End::Cancelled => Err(anyhow::anyhow!("cancelled")),
         };
+        let mut step = Step::new(&spec.outputs, &spec.summary).inputs(&spec.inputs);
+        step.facts = facts;
         crate::record_step(
             &spec.records(feed),
             &spec.tool,
             spec.record.clone(),
-            &spec.outputs,
-            &spec.summary,
+            &step,
             &result,
         );
     }
@@ -210,11 +220,17 @@ impl Reporter {
     /// server. A job done without one of its outputs failed. Said once:
     /// a later word changes nothing, and lines after it go nowhere.
     pub fn finish(&self, end: End) {
+        self.finish_with(end, Vec::new());
+    }
+
+    /// [`Self::finish`] with the key numbers the step made, for its row in
+    /// `INDEX.tsv` (kept only when it is done).
+    pub fn finish_with(&self, end: End, facts: Vec<Fact>) {
         if !self
             .finished
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            conclude(&self.dir, end, None);
+            conclude(&self.dir, end, facts, None);
         }
     }
 }

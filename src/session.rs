@@ -244,6 +244,7 @@ impl Call {
             tui: job.tool.name().into(),
             session: String::new(),
             summary: job.summary.clone(),
+            inputs: crate::inputs_of(&job.record, &outputs),
             outputs,
             record: self.records.as_ref().map(|p| p.command(&job.record)),
             started: crate::project::rfc3339(),
@@ -474,7 +475,7 @@ impl Following {
             ))
         };
         job::read_end(dir)
-            .or_else(|| job::conclude(dir, end.clone(), self.feed.clone()))
+            .or_else(|| job::conclude(dir, end.clone(), Vec::new(), self.feed.clone()))
             .unwrap_or(end)
     }
 

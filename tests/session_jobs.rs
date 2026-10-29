@@ -197,7 +197,8 @@ fn a_session_job_is_watched_followed_cancelled_and_outlives_its_server() {
     until("gone", || TOOL.find(session).unwrap().is_none());
     assert!(script(&project).contains("fitter"), "{}", script(&project));
     assert!(
-        index(&project).contains("model.bin\ta model fit"),
+        index(&project).contains("model.bin\ta model fit")
+            && index(&project).contains(r#"[{"name":"steps","value":"#),
         "{}",
         index(&project)
     );

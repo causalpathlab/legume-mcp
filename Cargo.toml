@@ -29,7 +29,7 @@ serde_json = "1.0"
 
 # The terminal session the view runs in (`<tool> mcp watch`).
 legume-tui = { version = "0.3.15", default-features = false, optional = true }
-ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "unstable-rendered-line-info"], optional = true }
 
 # A tool's command line as an agent sets it (`legume_mcp::cli`).
 clap = { version = "4.6", optional = true }
@@ -41,6 +41,13 @@ clap = ["dep:clap"]
 # (`Call::start_session_job`): a person attaches to watch them, and they
 # outlive the server.
 sessions = ["dep:legume-tui"]
+# `legume chat`: the tools with a model on this machine, through an
+# OpenAI-compatible server (no new dependency).
+chat = []
+# `legume chat` on a screen of its own, the conversation beside the
+# project's records, in a session the person can leave and come back to
+# (`legume attach`).
+screen = ["chat", "tui", "legume-tui/clap"]
 
 [target.'cfg(unix)'.dependencies]
 # geteuid and O_NOFOLLOW, to leave alone record files this user does not own.
@@ -67,3 +74,15 @@ required-features = ["tui"]
 [[test]]
 name = "cli"
 required-features = ["clap"]
+
+[[test]]
+name = "chat"
+required-features = ["chat"]
+
+[[test]]
+name = "chat_consent"
+required-features = ["chat"]
+
+[[test]]
+name = "chat_screen"
+required-features = ["screen"]
