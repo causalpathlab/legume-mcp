@@ -42,10 +42,20 @@ use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+pub mod brain;
+#[cfg(feature = "chat")]
+pub mod chat;
 #[cfg(feature = "clap")]
 pub mod cli;
+mod evidence;
+mod hints;
+pub use hints::{Annotations, Next, Prompt, PromptArg};
+mod graph;
 pub mod job;
 mod jobs;
+mod notebook;
+mod records;
+pub mod report;
 #[cfg(all(feature = "sessions", unix))]
 mod session;
 #[cfg(not(all(feature = "sessions", unix)))]
@@ -54,6 +64,8 @@ mod session;
 #[cfg(all(feature = "sessions", unix))]
 pub use session::{SessionJob, Started};
 pub mod project;
+mod step;
+pub use step::{inputs_of, Fact, Step};
 pub mod watch;
 use jobs::{Jobs, State as JobState};
 use project::Project;
@@ -90,6 +102,9 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    /// How it behaves, for the client: set with [`Self::read_only`],
+    /// [`Self::writes`] and the like.
+    pub annotations: Annotations,
 }
 
 impl ToolSpec {
@@ -98,7 +113,47 @@ impl ToolSpec {
             name: name.into(),
             description: description.into(),
             input_schema,
+            annotations: Annotations::default(),
         }
+    }
+
+    /// It changes nothing: it reads, draws or reports.
+    pub fn read_only(mut self) -> Self {
+        self.annotations.read_only = Some(true);
+        self
+    }
+
+    /// It writes new files and replaces none, as every legume step does.
+    pub fn writes(mut self) -> Self {
+        self.annotations.read_only = Some(false);
+        self.annotations.destructive = Some(false);
+        self
+    }
+
+    /// It may remove or stop something (cancel a job, delete a file).
+    pub fn destructive(mut self) -> Self {
+        self.annotations.read_only = Some(false);
+        self.annotations.destructive = Some(true);
+        self
+    }
+
+    /// Calling it again with the same arguments does nothing more (a step
+    /// whose outputs exist is not run again).
+    pub fn idempotent(mut self) -> Self {
+        self.annotations.idempotent = Some(true);
+        self
+    }
+
+    /// It reaches outside the project: a web service, a download.
+    pub fn open_world(mut self) -> Self {
+        self.annotations.open_world = Some(true);
+        self
+    }
+
+    /// A title for people, where the name is for agents.
+    pub fn titled(mut self, title: &str) -> Self {
+        self.annotations.title = Some(title.into());
+        self
     }
 }
 
@@ -111,6 +166,9 @@ pub enum Content {
     Json(Value),
     /// A PNG image, sent base64-encoded.
     Png(Vec<u8>),
+    /// The calls that could come next, as text for the agent and, for a
+    /// client that reads them, under the result's `_meta` as `legume/next`.
+    Next(Vec<Next>),
 }
 
 /// A tool binary's side of the server: its tools, and a call to one of them
@@ -119,6 +177,11 @@ pub enum Content {
 pub trait Handler {
     fn tools(&self) -> Vec<ToolSpec>;
     fn call(&mut self, name: &str, args: Value, cx: &Call) -> Result<Vec<Content>>;
+    /// Recipes for whole pieces of work with this tool, as MCP prompts:
+    /// none unless the tool has some.
+    fn prompts(&self) -> Vec<Prompt> {
+        Vec::new()
+    }
 }
 
 type Out = Arc<Mutex<Box<dyn Write + Send>>>;
@@ -258,14 +321,26 @@ impl Call {
 
     /// [`Self::run`] for a step that writes `outputs`: the driver script
     /// skips it when they all exist, and `results/INDEX.tsv` lists each
-    /// with `summary` (one line: what was made, from what).
+    /// with `summary` (one line: what was made, from what). [`Self::run_step`]
+    /// with the step's inputs read from `cmd`.
     pub fn run_making(&self, cmd: Command, outputs: &[PathBuf], summary: &str) -> Result<String> {
-        self.ensure_free(outputs)?;
+        self.run_step(cmd, Step::new(outputs, summary))
+    }
+
+    /// [`Self::run`] for `step`: the driver script skips it when its outputs
+    /// all exist, and `results/INDEX.tsv` lists each with the step's
+    /// summary, inputs and facts (those found once it is done too).
+    pub fn run_step(&self, cmd: Command, mut step: Step) -> Result<String> {
+        self.ensure_free(&step.outputs)?;
+        step.resolve_inputs(&cmd);
         let bare = self.records.as_ref().map(|p| p.command(&cmd));
         let result = self
             .run_child(cmd)
-            .and_then(|out| made(outputs).map(|()| out));
-        record_step(&self.records, &self.tool, bare, outputs, summary, &result);
+            .and_then(|out| made(&step.outputs).map(|()| out));
+        if let Ok(out) = &result {
+            step.conclude(out);
+        }
+        record_step(&self.records, &self.tool, bare, &step, &result);
         result
     }
 
@@ -325,7 +400,15 @@ impl Call {
     /// id (a person can stop it there too); it is recorded when it ends, as
     /// a step that ran.
     pub fn spawn_job(&self, cmd: Command, outputs: &[PathBuf], summary: &str) -> Result<String> {
-        self.ensure_free(outputs)?;
+        self.spawn_step(cmd, Step::new(outputs, summary))
+    }
+
+    /// [`Self::run_step`] in the background, as [`Self::spawn_job`] runs a
+    /// step: the facts it finds once done are found in the job's thread.
+    pub fn spawn_step(&self, cmd: Command, mut step: Step) -> Result<String> {
+        self.ensure_free(&step.outputs)?;
+        step.resolve_inputs(&cmd);
+        let (outputs, summary) = (&step.outputs, step.summary.as_str());
         let job = self.jobs.add(&self.tool, summary, outputs, None, None);
         let id = job.id.clone();
         if let Some(f) = &self.feed {
@@ -337,7 +420,7 @@ impl Call {
         }
         let bare = self.records.as_ref().map(|p| p.command(&cmd));
         let (records, feed, steer) = (self.records.clone(), self.feed.clone(), self.steer.clone());
-        let (tool, outputs, summary) = (self.tool.clone(), outputs.to_vec(), summary.to_string());
+        let tool = self.tool.clone();
         std::thread::Builder::new()
             .name(id.clone())
             .spawn(move || {
@@ -355,8 +438,11 @@ impl Call {
                     }
                 };
                 let result = run_child(cmd, &|| job.cancelled() || stopped(), &progress)
-                    .and_then(|out| made(&outputs).map(|()| out));
-                record_step(&records, &tool, bare, &outputs, &summary, &result);
+                    .and_then(|out| made(&step.outputs).map(|()| out));
+                if let Ok(out) = &result {
+                    step.conclude(out);
+                }
+                record_step(&records, &tool, bare, &step, &result);
                 let (state, text) = match &result {
                     Ok(out) => (JobState::Done, out.clone()),
                     Err(_) if job.cancelled() || stopped() => {
@@ -375,25 +461,24 @@ impl Call {
     }
 }
 
-/// Record a step that ran `bare` (when records are kept): its guarded line
-/// in the driver script and its outputs in the index when it succeeded, a
-/// commented line saying why when it did not.
+/// Record `step`, which ran `bare` (when records are kept): its guarded
+/// line in the driver script and its outputs in the index when it
+/// succeeded, a commented line saying why when it did not.
 fn record_step(
     records: &Records,
     tool: &str,
     bare: Option<String>,
-    outputs: &[PathBuf],
-    summary: &str,
+    step: &Step,
     result: &Result<String>,
 ) {
     let (Some(p), Some(bare)) = (records, bare) else {
         return;
     };
-    let line = p.guarded(&bare, outputs);
+    let line = p.guarded(&bare, &step.outputs);
     match result {
         Ok(_) => {
             p.script_step(&format!("{line}\n"), Some(&bare));
-            p.index(tool, outputs, summary);
+            p.index(tool, step);
         }
         Err(e) => {
             let why = p.rel(&format!("{e:#}"));
@@ -605,6 +690,16 @@ pub fn shown_path(p: &Path) -> String {
     absolute(p).to_string_lossy().into_owned()
 }
 
+/// `name` in a folder of the PATH; a relative folder (`.`) is passed over,
+/// so a project's own files are never taken for a program.
+pub(crate) fn on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+}
+
 /// `p` absolute, against the working directory, without touching the disk.
 pub(crate) fn absolute(p: &Path) -> PathBuf {
     std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
@@ -629,7 +724,16 @@ pub fn serve_in_project(info: ServerInfo, handler: impl Handler) -> Result<()> {
         project: project::enter()?,
         watch,
     };
-    serve_stdio(info, options, handler)
+    serve_stdio(info, options, Role::Tool, handler)
+}
+
+/// Which notebook a server keeps: a tool's (plan, observations, notes), or
+/// the `legume` server's, which keeps the reasoning across tools too
+/// ([`brain`]).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Role {
+    Tool,
+    Brain,
 }
 
 /// Serve `handler` on stdin and stdout until stdin closes, keeping the
@@ -640,16 +744,22 @@ pub fn serve(info: ServerInfo, handler: impl Handler) -> Result<()> {
         project: project::root_from_env(),
         watch: watch::base(),
     };
-    serve_stdio(info, options, handler)
+    serve_stdio(info, options, Role::Tool, handler)
 }
 
-/// [`serve_with`] on stdin and stdout.
-fn serve_stdio(info: ServerInfo, options: Options, handler: impl Handler) -> Result<()> {
-    serve_with(
+/// [`serve_with`] on stdin and stdout, as `role`.
+pub(crate) fn serve_stdio(
+    info: ServerInfo,
+    options: Options,
+    role: Role,
+    handler: impl Handler,
+) -> Result<()> {
+    serve_as(
         BufReader::new(std::io::stdin()),
         std::io::stdout(),
         info,
         options,
+        role,
         handler,
     )
 }
@@ -673,15 +783,6 @@ where
 
 /// What the agent is told about the records, after the server's own
 /// instructions.
-const RECORDS_NOTE: &str = "\
-Records (after Noble, PLoS Comput Biol 2009, doi:10.1371/journal.pcbi.1000424), \
-under the project {root}: outputs you do not name go to results/<today>/; every \
-step that writes is added to results/<today>/runall.sh, which repeats the work \
-without you; results/INDEX.tsv lists each output with a summary. Use the \
-`notebook` tool: before starting, a `plan` (the question, the data, and how the \
-result will be checked); then what you did and saw, and your conclusions. Tell \
-the user where these are when the work is done.";
-
 /// The built-in tools that follow jobs ([`Call::spawn_job`]).
 const JOB_TOOLS: [&str; 3] = ["job_status", "job_wait", "job_cancel"];
 
@@ -692,7 +793,8 @@ fn job_specs() -> Vec<ToolSpec> {
             "job_status",
             "A background job's state (running, done, failed, cancelled), its last log lines and, once done, its output; without `id`, every job of this server.",
             json!({ "type": "object", "properties": { "id": id } }),
-        ),
+        )
+        .read_only(),
         ToolSpec::new(
             "job_wait",
             "Wait for a background job to end, up to `seconds` (30; at most 120), then its status as job_status gives it. Call again while it is still running.",
@@ -704,13 +806,40 @@ fn job_specs() -> Vec<ToolSpec> {
                 },
                 "required": ["id"],
             }),
-        ),
+        )
+        .read_only(),
         ToolSpec::new(
             "job_cancel",
             "Stop a background job: its child is killed, and nothing it would have written is recorded.",
             json!({ "type": "object", "properties": { "id": id }, "required": ["id"] }),
-        ),
+        )
+        .destructive()
+        .idempotent(),
     ]
+}
+
+/// What could follow a job's status: wait while it runs, say what it made
+/// once done.
+fn job_next(status: &Value) -> Vec<Next> {
+    let id = status["id"].as_str().unwrap_or_default();
+    match status["state"].as_str() {
+        Some("running") => vec![Next::new(
+            "job_wait",
+            json!({ "id": id }),
+            "it is still running; its outputs do not exist yet",
+        )],
+        Some("done") => vec![Next::new(
+            "notebook",
+            json!({ "kind": "observation" }),
+            "say what it made and what you see in it, with the numbers",
+        )],
+        Some("failed") => vec![Next::new(
+            "notebook",
+            json!({ "kind": "observation" }),
+            "say why it failed (its last lines), and change the call before running it again",
+        )],
+        _ => Vec::new(),
+    }
 }
 
 /// What the agent is told about jobs, after the server's instructions.
@@ -727,22 +856,6 @@ status, which shows it; it goes on when this server ends, and the next one \
 lists it. Other jobs end when this server does.";
 #[cfg(not(all(feature = "sessions", unix)))]
 const JOBS_END: &str = " Jobs end when this server does.";
-
-/// The built-in tool every server with records offers.
-fn notebook_spec() -> ToolSpec {
-    ToolSpec::new(
-        "notebook",
-        "Add an entry to today's lab notebook (results/<today>/notebook.md, shared by every legume server): your account of the work, kept beside the facts the tools record. Open with a `plan`.",
-        json!({
-            "type": "object",
-            "properties": {
-                "kind": { "type": "string", "enum": ["plan", "observation", "conclusion", "note"] },
-                "text": { "type": "string", "description": "Markdown" },
-            },
-            "required": ["kind", "text"],
-        }),
-    )
-}
 
 /// [`serve_on`], keeping the records of the project at `project` when
 /// given; the instructions tell the agent about them.
@@ -768,14 +881,31 @@ where
 pub fn serve_with<R, W>(
     input: R,
     output: W,
+    info: ServerInfo,
+    options: Options,
+    handler: impl Handler,
+) -> Result<()>
+where
+    R: BufRead + Send + 'static,
+    W: Write + Send + 'static,
+{
+    serve_as(input, output, info, options, Role::Tool, handler)
+}
+
+/// [`serve_with`], keeping the notebook of `role`.
+pub(crate) fn serve_as<R, W>(
+    input: R,
+    output: W,
     mut info: ServerInfo,
     options: Options,
+    role: Role,
     mut handler: impl Handler,
 ) -> Result<()>
 where
     R: BufRead + Send + 'static,
     W: Write + Send + 'static,
 {
+    let full = role == Role::Brain;
     let options_watch = options.watch.clone();
     let feed: Option<Arc<Feed>> = options.watch.as_deref().and_then(|base| {
         let meta = watch::Meta {
@@ -792,7 +922,12 @@ where
     });
     let records: Records = options.project.map(|root| {
         let p = Project::new(root, &info.name, &info.version).watched(feed.clone());
-        let note = RECORDS_NOTE.replace("{root}", &p.root().display().to_string());
+        let rest = if full {
+            notebook::REASONING_NOTE
+        } else {
+            notebook::TOOL_NOTE
+        };
+        let note = notebook::RECORDS_NOTE.replace("{root}", &p.root().display().to_string()) + rest;
         info.instructions = Some(match info.instructions.take() {
             Some(text) => format!("{text}\n\n{note}"),
             None => note,
@@ -871,12 +1006,13 @@ where
         })
     };
     let mut specs = handler.tools();
+    let prompts = handler.prompts();
     let builtin_notebook = records.is_some() && !specs.iter().any(|t| t.name == "notebook");
     if builtin_notebook {
-        specs.push(notebook_spec());
+        specs.push(notebook::notebook_spec(full));
     }
     let jobs: Arc<Jobs> = Arc::default();
-    let builtin_jobs = !specs.iter().any(|t| JOB_TOOLS.contains(&t.name.as_str()));
+    let builtin_jobs = !full && !specs.iter().any(|t| JOB_TOOLS.contains(&t.name.as_str()));
     if builtin_jobs {
         specs.extend(job_specs());
         info.instructions = Some(match info.instructions.take() {
@@ -905,19 +1041,37 @@ where
         };
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
         match method {
-            "initialize" => respond(&out, id, initialize(&info, &params)),
+            "initialize" => respond(&out, id, initialize(&info, &params, !prompts.is_empty())),
             "tools/list" => {
                 let tools: Vec<Value> = specs
                     .iter()
                     .map(|t| {
-                        json!({
+                        let mut v = json!({
                             "name": t.name,
                             "description": t.description,
                             "inputSchema": t.input_schema,
-                        })
+                        });
+                        if let Some(a) = t.annotations.to_json() {
+                            v["annotations"] = a;
+                        }
+                        v
                     })
                     .collect();
                 respond(&out, id, json!({ "tools": tools }));
+            }
+            "prompts/list" if !prompts.is_empty() => {
+                let listed: Vec<Value> = prompts.iter().map(Prompt::listed).collect();
+                respond(&out, id, json!({ "prompts": listed }));
+            }
+            "prompts/get" if !prompts.is_empty() => {
+                let name = params["name"].as_str().unwrap_or_default();
+                match prompts.iter().find(|p| p.name == name) {
+                    None => fail(&out, id, -32602, &format!("unknown prompt: {name}")),
+                    Some(p) => match p.get(&params["arguments"]) {
+                        Ok(v) => respond(&out, id, v),
+                        Err(e) => fail(&out, id, -32602, &format!("{e:#}")),
+                    },
+                }
             }
             "tools/call" => {
                 let name = params["name"].as_str().unwrap_or_default();
@@ -963,18 +1117,24 @@ where
                         ("job_cancel", Some(id)) => jobs.cancel(id),
                         _ => Err(anyhow::anyhow!("`id` is required")),
                     };
-                    done.respond(call_result(result.map(|v| vec![Content::Json(v)])));
+                    let result = result.map(|v| {
+                        let next = job_next(&v);
+                        let mut pieces = vec![Content::Json(v)];
+                        if !next.is_empty() {
+                            pieces.push(Content::Next(next));
+                        }
+                        pieces
+                    });
+                    done.respond(call_result(result));
                     continue;
                 }
                 if builtin_notebook && name == "notebook" {
                     let p = records.as_ref().expect("a built-in notebook has records");
-                    let result = match (args["kind"].as_str(), args["text"].as_str()) {
-                        (Some(kind), Some(text)) => {
-                            p.notebook(kind, text);
-                            Ok(vec![])
-                        }
-                        _ => Err(anyhow::anyhow!("`kind` and `text` are required")),
-                    };
+                    let result =
+                        notebook::notebook_entry(&args, p, full).map(|(label, text, told)| {
+                            p.notebook(&label, &text);
+                            told.map(Content::Text).into_iter().collect()
+                        });
                     done.respond(call_result(result));
                     continue;
                 }
@@ -1075,7 +1235,7 @@ impl Done<'_> {
     }
 }
 
-fn initialize(info: &ServerInfo, params: &Value) -> Value {
+fn initialize(info: &ServerInfo, params: &Value, prompts: bool) -> Value {
     let asked = params["protocolVersion"].as_str().unwrap_or_default();
     let version = PROTOCOL_VERSIONS
         .iter()
@@ -1086,6 +1246,9 @@ fn initialize(info: &ServerInfo, params: &Value) -> Value {
         "capabilities": { "tools": { "listChanged": false } },
         "serverInfo": { "name": info.name, "version": info.version },
     });
+    if prompts {
+        v["capabilities"]["prompts"] = json!({ "listChanged": false });
+    }
     if let Some(text) = &info.instructions {
         v["instructions"] = json!(text);
     }
@@ -1103,6 +1266,7 @@ fn call_result(result: Result<Vec<Content>>) -> Value {
         }
     };
     let mut structured: Option<Map<String, Value>> = None;
+    let mut next: Vec<Next> = Vec::new();
     let content: Vec<Value> = pieces
         .into_iter()
         .map(|c| match c {
@@ -1121,9 +1285,17 @@ fn call_result(result: Result<Vec<Content>>) -> Value {
                 "mimeType": "image/png",
                 "data": base64::engine::general_purpose::STANDARD.encode(bytes),
             }),
+            Content::Next(n) => {
+                let text = hints::next_text(&n);
+                next.extend(n);
+                json!({ "type": "text", "text": text })
+            }
         })
         .collect();
     let mut v = json!({ "content": content, "isError": false });
+    if !next.is_empty() {
+        v["_meta"] = json!({ "legume/next": next });
+    }
     if let Some(m) = structured {
         v["structuredContent"] = Value::Object(m);
     }

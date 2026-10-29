@@ -6,3 +6,5 @@
 .idea/
 .vscode/
 *.log
+# Records of the MCP servers when this repo is their project
+/results/
