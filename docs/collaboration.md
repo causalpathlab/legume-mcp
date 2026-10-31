@@ -789,7 +789,7 @@ The result of exploring is **hypotheses**, not findings. Say so.
 | Hypotheses H1, H2, ... with rivals and what would nullify each (`HYPOTHESES.tsv`); evidence with the person's reason (`EVIDENCE.tsv`); the table, its verb and the sources not yet used (section 8.5) | New in legume-mcp 0.5.0 |
 | Data verdicts (`DATA.tsv`) and figures kept for the paper (`FIGURES.tsv`) | New in legume-mcp 0.5.0 |
 | Key numbers (`facts`, flagged ones in `status`) and `inputs` for every step, in `INDEX.tsv` | New in legume-mcp 0.5.0; each tool adds its own numbers |
-| The day's slides: `report.pdf` (typeset by legume, nothing to install) and `report.md`, with the trail graph | New in legume-mcp 0.5.0 |
+| The day's slides: `report.pdf` (typeset by legume when built with `--features pdf`, nothing else to install) and `report.md`, figures in place, with the trail graph | New in legume-mcp 0.5.0 |
 | Recipes as MCP prompts on the `legume` server: `explore`, `triangulate` | New in legume-mcp 0.5.0 |
 | `next` hints in results ("Next, if the person agrees"); tool annotations (read-only, writes, destructive) | New in legume-mcp 0.5.0; the job tools give them, each tool adds its own |
 | Testing on outside data (section 9): `plan` and data-beans `import` | Available with 0.5.0 |

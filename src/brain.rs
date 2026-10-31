@@ -261,7 +261,7 @@ impl Handler for Brain {
             .read_only(),
             ToolSpec::new(
                 "report",
-                "The day's work as slides, built from the records, in results/<day>/report/: report.pdf, the same slides as text in report.md, and the trail of the day's steps in graph.svg. The person's summary of the day, their question, the data, the steps and their numbers, the figures with the commands that made them, what was seen, each hypothesis's triangulation table, and how to replay it. Every word is read from the records or is the person's own; you write none of it. Build it when the person asks for a report or the day's work ends, and show them where it is.",
+                "The day's work as slides, built from the records, in results/<day>/report/: report.pdf (when legume is built with PDFs), the same slides in report.md with the figures in place, and the trail of the day's steps in graph.svg. The person's summary of the day, their question, the data, the steps and their numbers, the figures with the commands that made them, what was seen, each hypothesis's triangulation table, and how to replay it. Every word is read from the records or is the person's own; you write none of it. Build it when the person asks for a report or the day's work ends, and show them where it is.",
                 json!({
                     "type": "object",
                     "properties": {

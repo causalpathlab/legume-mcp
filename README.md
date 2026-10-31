@@ -14,11 +14,12 @@ implements `Handler` (its tools and how each is called) and hands it to
   it when the client cancels.
 - stdout carries the protocol: tools must log to stderr and run anything that
   prints as a child.
-- Only serde_json, anyhow, base64 and log, and no async runtime, for a tool
-  that takes the library with `default-features = false`. The default
-  feature, `pdf`, typesets `legume report`'s slides with Typst (Rust 1.92).
+- Only serde_json, anyhow, base64 and log; no async runtime. Each feature is
+  opt-in: `pdf` (Typst, Rust 1.92) typesets `legume report`'s slides, for the
+  `legume` binary only.
 
-`cargo install legume-mcp` installs the `legume` command: `legume init`
+`cargo install legume-mcp --features pdf` installs the `legume` command
+(without `--features pdf`, its report is Markdown only): `legume init`
 connects a project to the agents (Claude Code, Codex, Cursor, VS Code,
 Gemini CLI, Antigravity, opencode) ([below](#connecting-a-project-legume-init)),
 and the agents start the [legume server](#the-legume-server) (`legume mcp`).
@@ -157,8 +158,10 @@ Then ask it to look at your data: AGENTS.md tells it how to work with you.
 
 The `legume` server's `report` makes a day's work into slides, from the
 records alone, in `results/<day>/report/`: `report.pdf`, typeset by `legume`
-itself (Typst is built in, with its fonts: nothing to install; feature
-`pdf`, on by default), `report.md`, the same slides as text for any editor,
+itself (Typst is built in, with its fonts: nothing else to install; feature
+`pdf`, as `cargo install legume-mcp --features pdf` builds it), `report.md`,
+the same slides for any Markdown viewer, figures shown in place (a PDF
+figure by the PNG or SVG beside it, and linked),
 and `graph.svg`, the trail of the day. The folder is the report's
 own: it replaces no tool's output, and building again replaces only what it
 made. In order:
