@@ -49,11 +49,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --features tui,clap,sessions
 
+  # The library as the tools take it (`default-features = false`) keeps
+  # 1.91; the report's PDF (`pdf`, Typst 0.15) needs 1.92.
   msrv:
     name: MSRV 1.91
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.91
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --no-default-features --features tui,clap,sessions
+
+  msrv-pdf:
+    name: MSRV 1.92 (pdf)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --features tui,clap,sessions
