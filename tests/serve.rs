@@ -276,11 +276,6 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
     let input: String = [
         json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
         json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
-        call(
-            3,
-            "notebook",
-            json!({ "kind": "plan", "text": "Check *x*." }),
-        ),
         call(4, "echo", json!({ "a": 1 })),
         call(
             5,
@@ -291,7 +286,6 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
         call(7, "make", json!({ "out": made, "from": at("in.tsv") })),
         call(8, "child", json!({ "script": "exit 2" })),
         call(10, "peek", json!({})),
-        call(9, "notebook", json!({ "kind": "plan" })),
     ]
     .iter()
     .map(|l| format!("{l}\n"))
@@ -321,10 +315,9 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
         .contains("results/<today>/runall.sh"));
     let tools = by_id(&msgs, 2)["result"]["tools"].as_array().unwrap();
     assert!(
-        tools.iter().any(|t| t["name"] == "notebook"),
-        "the notebook is built in"
+        !tools.iter().any(|t| t["name"] == "notebook"),
+        "the notebook is the legume server's"
     );
-    assert_eq!(by_id(&msgs, 9)["result"]["isError"], true);
 
     let day: Vec<_> = std::fs::read_dir(proj.join("results"))
         .unwrap()
@@ -363,11 +356,6 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
     assert!(
         script.contains("base64 -d > odd.txt"),
         "control bytes go base64: {script}"
-    );
-    let notebook = std::fs::read_to_string(day.join("notebook.md")).unwrap();
-    assert!(
-        notebook.contains(" · t · plan\n\nCheck *x*.\n"),
-        "{notebook}"
     );
     let index = std::fs::read_to_string(proj.join("results/INDEX.tsv")).unwrap();
     let rows: Vec<&str> = index.lines().collect();
@@ -449,243 +437,230 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
     std::fs::remove_dir_all(&base).unwrap();
 }
 
-#[test]
-fn the_notebook_numbers_readings_and_keeps_who_decided() {
-    let base = std::env::temp_dir().join(format!("legume-mcp-notebook-{}", std::process::id()));
-    let proj = base.join("proj");
-    std::fs::create_dir_all(&proj).unwrap();
-    let note = |id, args| call(id, "notebook", args);
-    let ifn = json!({
-        "claim": "Topic 7 is an interferon response",
-        "evidence": [{ "kind": "marker", "term": "ISG15" }, { "kind": "marker", "term": "MX1" }],
-        "alternatives": [{ "label": "batch", "why_not": "it spans\nboth runs" }],
-        "rationale": "3x higher in treated donors",
-        "check": "pseudobulk per donor",
-    });
-    let batch = json!({ "claim": "Topic 7 is run B", "rationale": "run B has more", "check": "within-run test" });
-    let input: String = [
-        note(10, json!({ "kind": "answer", "chose": [2], "words": "2" })),
-        note(
-            1,
-            json!({ "kind": "interpretation", "readings": [ifn, batch] }),
-        ),
-        note(2, json!({ "kind": "interpretation", "text": "One idea." })),
-        note(
-            3,
-            json!({ "kind": "interpretation", "readings": [ifn, { "claim": "x" }] }),
-        ),
-        note(4, json!({ "kind": "conclusion", "text": "Old name." })),
-        note(11, json!({ "kind": "answer", "chose": [3], "words": "3" })),
-        note(12, json!({ "kind": "answer", "chose": [1] })),
-        note(
-            5,
-            json!({ "kind": "answer", "chose": [1], "words": "R1, with care." }),
-        ),
-        // Answered once only; a new proposal is answered anew.
-        note(23, json!({ "kind": "answer", "chose": [2], "words": "continue" })),
-        note(
-            21,
-            json!({ "kind": "interpretation", "readings": [ifn, batch] }),
-        ),
-        note(13, json!({ "kind": "choice", "chose": [1], "words": "1" })),
-        note(
-            6,
-            json!({ "kind": "answer", "words": "Neither: doublets.\nSeen it before." }),
-        ),
-        note(7, json!({ "kind": "note", "text": "Mine.", "by": "user" })),
-        note(
-            8,
-            json!({ "kind": "note", "text": "Who?", "by": "someone" }),
-        ),
-        note(9, json!({ "kind": "observation" })),
-        note(14, json!({ "kind": "offer", "options": ["Stop here"] })),
-        note(
-            15,
-            json!({ "kind": "note", "text": "Lines.", "options": ["a", "b"] }),
-        ),
-        note(
-            16,
-            json!({ "kind": "offer", "text": "Next lines for R1.", "options": ["Replication on donors 5-6", "Stop here"] }),
-        ),
-        note(17, json!({ "kind": "answer", "chose": [1], "words": "1" })),
-        note(18, json!({ "kind": "choice", "chose": [3], "words": "3" })),
-        note(
-            19,
-            json!({ "kind": "choice", "chose": [1], "words": "1, then stop" }),
-        ),
-        note(
-            22,
-            json!({ "kind": "offer", "options": ["Look again", "Stop here"] }),
-        ),
-        note(20, json!({ "kind": "choice", "words": "not now" })),
-    ]
-    .iter()
-    .map(|l| format!("{l}\n"))
-    .collect();
+/// The `legume` server's answers to `calls`, made in `proj`.
+fn brain(proj: &std::path::Path, calls: &[Value]) -> Vec<Value> {
+    let input: String = calls.iter().map(|l| format!("{l}\n")).collect();
     let sink = Sink::default();
-    legume_mcp::brain::serve_in(Cursor::new(input), sink.clone(), Some(proj.clone())).unwrap();
+    legume_mcp::brain::serve_in(Cursor::new(input), sink.clone(), Some(proj.to_path_buf()))
+        .unwrap();
     let reply = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-    let msgs: Vec<Value> = reply
+    reply
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
+        .collect()
+}
+
+/// The text of call `id`'s result.
+fn said(msgs: &[Value], id: u64) -> String {
+    by_id(msgs, id)["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[test]
+fn the_notebook_keeps_the_persons_words_and_numbers_their_hypotheses() {
+    let base = tempfile::tempdir().unwrap();
+    let proj = base.path().join("proj");
+    std::fs::create_dir_all(proj.join("data")).unwrap();
+    std::fs::write(proj.join("data/a.h5"), "x").unwrap();
+    let note = |id, args| call(id, "notebook", args);
+    let msgs = brain(
+        &proj,
+        &[
+            note(
+                1,
+                json!({ "kind": "plan", "text": "The agent's question." }),
+            ),
+            note(
+                2,
+                json!({ "kind": "plan", "words": "Why topic 7, rather than topic 2?\nNot if donors split it." }),
+            ),
+            note(
+                3,
+                json!({ "kind": "observation", "text": "QC kept 9,812 of 11,204 cells." }),
+            ),
+            note(
+                4,
+                json!({ "kind": "hypothesis", "words": "Topic 7 is an interferon response" }),
+            ),
+            note(
+                5,
+                json!({ "kind": "hypothesis", "hypothesis": "H1", "rivals": ["batch", "a donor"], "nullify": "no ISGs in donors 5-6" }),
+            ),
+            note(
+                6,
+                json!({ "kind": "hypothesis", "hypothesis": "H5", "rivals": ["x"] }),
+            ),
+            note(7, json!({ "kind": "interpretation", "text": "It is IFN." })),
+            note(8, json!({ "kind": "note", "text": "Mine.", "by": "user" })),
+            note(
+                9,
+                json!({ "kind": "data", "path": "data/a.h5", "words": "the core's 10x run", "verdict": "fine" }),
+            ),
+            note(
+                10,
+                json!({ "kind": "data", "path": "data/a.h5", "words": "the core's 10x run", "verdict": "caveats" }),
+            ),
+            note(
+                11,
+                json!({ "kind": "summary", "words": "Topic 7 looks like IFN; one donor only." }),
+            ),
+            call(12, "status", json!({})),
+        ],
+    );
     for (id, refused) in [
-        (1, false),
-        (2, true),
-        (3, true),
+        (1, true),
+        (2, false),
+        (3, false),
         (4, false),
         (5, false),
-        (6, false),
-        (7, false),
-        (8, true),
+        (6, true),
+        (7, true),
+        (8, false),
         (9, true),
-        (10, true),
-        (11, true),
-        (12, true),
-        (13, true),
-        (14, true),
-        (15, true),
-        (16, false),
-        (17, true),
-        (18, true),
-        (19, false),
-        (20, false),
-        (21, false),
-        (22, false),
-        (23, true),
+        (10, false),
+        (11, false),
     ] {
-        assert_eq!(by_id(&msgs, id)["result"]["isError"], refused, "call {id}");
+        assert_eq!(
+            by_id(&msgs, id)["result"]["isError"],
+            refused,
+            "call {id}: {}",
+            said(&msgs, id)
+        );
     }
-    let refusal = |id| {
-        by_id(&msgs, id)["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .to_string()
-    };
-    assert!(refusal(10).contains("no proposal today"), "{}", refusal(10));
     assert!(
-        refusal(23).contains("has its reply already"),
+        said(&msgs, 1).contains("`words` is required"),
         "{}",
-        refusal(23)
-    );
-    assert!(refusal(11).contains("(1 to 2), not 3"), "{}", refusal(11));
-    assert!(
-        refusal(12).contains("`words` is required"),
-        "{}",
-        refusal(12)
+        said(&msgs, 1)
     );
     assert!(
-        refusal(13).contains("the latest question today is the proposal of"),
+        said(&msgs, 4).contains("what else could explain it"),
         "{}",
-        refusal(13)
+        said(&msgs, 4)
+    );
+    assert_eq!(said(&msgs, 5), "Recorded as H1.");
+    assert!(
+        said(&msgs, 6).contains("there is no hypothesis H5"),
+        "{}",
+        said(&msgs, 6)
     );
     assert!(
-        refusal(14).contains("two or more `options`"),
+        said(&msgs, 7).contains("`kind` is one of"),
         "{}",
-        refusal(14)
+        said(&msgs, 7)
     );
-    assert!(
-        refusal(15).contains("`options` go with kind `offer`"),
-        "{}",
-        refusal(15)
-    );
-    assert!(
-        refusal(17).contains("the latest question today is the offer of"),
-        "{}",
-        refusal(17)
-    );
-    assert!(
-        refusal(18).contains("option numbers of the offer of")
-            && refusal(18).contains("(1 to 2), not 3"),
-        "{}",
-        refusal(18)
-    );
-    assert!(by_id(&msgs, 3)["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("`rationale` is missing"));
+    let status = said(&msgs, 12);
+    for want in [
+        "data/a.h5 (1 kB): \"the core's 10x run\"; the person's verdict: caveats",
+        "H1. Topic 7 is an interferon response",
+    ] {
+        assert!(status.contains(want), "{want} in {status}");
+    }
+    assert!(!status.contains("Open for the person"), "{status}");
 
-    let day = std::fs::read_dir(proj.join("results"))
+    let results = proj.join("results");
+    let hyps = std::fs::read_to_string(results.join("HYPOTHESES.tsv")).unwrap();
+    assert!(
+        hyps.starts_with("date\ttime\tserver\tid\tfrom\tclaim\trivals\tnullify\n"),
+        "{hyps}"
+    );
+    assert!(
+        hyps.contains("\tH1\tthe person, notebook ")
+            && hyps.ends_with(
+                "\tTopic 7 is an interferon response\tbatch; a donor\tno ISGs in donors 5-6\n"
+            ),
+        "{hyps}"
+    );
+    let day = std::fs::read_dir(&results)
         .unwrap()
         .flatten()
         .find(|e| e.path().is_dir())
         .unwrap()
         .path();
     let notebook = std::fs::read_to_string(day.join("notebook.md")).unwrap();
-    assert!(
-        notebook.contains(
-            " · legume · interpretation (proposed)\n\n\
-             **R1. Topic 7 is an interferon response**\n\
-             - Evidence: marker ISG15; marker MX1\n\
-             - Not batch: it spans both runs\n\
-             - Rationale: 3x higher in treated donors\n\
-             - Check: pseudobulk per donor\n\n\
-             **R2. Topic 7 is run B**\n\
-             - Rationale: run B has more\n\
-             - Check: within-run test\n"
-        ),
-        "{notebook}"
-    );
-    for heading in [
-        " · legume · interpretation (proposed)\n\nOld name.\n",
-        " (legume): chose R1. Hypotheses: R1 = H1.\n\n> R1, with care.\n",
-        " (legume): set aside.\n\n> Neither: doublets.\n> Seen it before.\n",
-        " · legume · interpretation (accepted by the user)\n\nAnswers the proposal of ",
-        " · legume · interpretation (user override)\n\nAnswers the proposal of ",
-        " · legume · note (user)\n\nMine.\n",
-        " · legume · offer\n\nNext lines for R1.\n\n- **1.** Replication on donors 5-6\n- **2.** Stop here\n",
-        " · legume · choice (user)\n\nAnswers the offer of ",
-        " (legume): chose 1.\n\n> 1, then stop\n",
-        " (legume): chose none.\n\n> not now\n",
+    for part in [
+        " · legume · plan\n\n> Why topic 7, rather than topic 2?\n> Not if donors split it.\n",
+        " · legume · hypothesis H1\n\n> Topic 7 is an interferon response\n",
+        " · legume · hypothesis H1 (revised)\n\n> Topic 7 is an interferon response\n\nRivals they named: batch; a donor\n\nWould nullify it: no ISGs in donors 5-6\n",
+        " · legume · note (user)\n\n> Mine.\n",
+        " · legume · data\n\n`data/a.h5`, verdict: caveats\n\n> the core's 10x run\n",
+        " · legume · summary\n\n> Topic 7 looks like IFN; one donor only.\n",
     ] {
-        assert!(notebook.contains(heading), "{heading:?} in {notebook}");
+        assert!(notebook.contains(part), "{part:?} in {notebook}");
     }
-    for refused in ["One idea.", "Who?", "Lines."] {
-        assert!(!notebook.contains(refused), "{notebook}");
-    }
-    std::fs::remove_dir_all(&base).unwrap();
+    assert!(!notebook.contains("The agent's question"), "{notebook}");
 }
 
 #[test]
 fn evidence_builds_each_hypothesis_triangulation_table() {
-    let base = std::env::temp_dir().join(format!("legume-mcp-evidence-{}", std::process::id()));
-    let proj = base.join("proj");
+    let base = tempfile::tempdir().unwrap();
+    let proj = base.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
     let note = |id, args| call(id, "notebook", args);
-    let reading = |claim: &str| json!({ "claim": claim, "rationale": "r", "check": "c" });
-    let ev = |h: &str, source: &str, class: &str, verdict: &str, text: &str| json!({ "kind": "evidence", "hypothesis": h, "source": source, "class": class, "verdict": verdict, "text": text });
-    let input: String = [
-        note(1, json!({ "kind": "evidence", "hypothesis": "H1", "source": "s", "class": "our_cells", "verdict": "agrees", "text": "t" })),
-        note(2, json!({ "kind": "interpretation", "readings": [reading("IFN drives topic 7"), reading("Two donors carry topic 7")] })),
-        note(3, json!({ "kind": "answer", "chose": [1, 2], "words": "both" })),
-        note(4, ev("H9", "s", "our_cells", "agrees", "t")),
-        note(5, ev("H1", "s", "cells", "agrees", "t")),
-        note(6, ev("H1", "s", "our_cells", "agrees", " ")),
-        note(7, ev("H1", "donors 1-4", "our_cells", "agrees", "ISG15, MX1 top markers; cocoa 212 genes at FDR < 0.1")),
-        note(8, ev("h1", "donors 5-6", "other_donors", "agrees", "5 of 6 donors higher")),
-        note(9, ev("1", "donors 5-6", "other_study", "agrees", "t")),
-        note(10, ev("H1", "eQTL catalogue", "genetics", "agrees", "IRF7 eQTL in monocytes")),
-        note(11, ev("H2", "donors 1-4", "our_cells", "disagrees", "both treated donors above both controls")),
-        note(12, json!({ "kind": "note", "text": "x", "hypothesis": "H1" })),
-        note(13, json!({ "kind": "interpretation", "readings": [reading("Something else"), reading("IFN drives topic 7")] })),
-        note(14, json!({ "kind": "answer", "chose": [2, 1], "words": "2 and 1" })),
-    ]
-    .iter()
-    .map(|l| format!("{l}\n"))
-    .collect();
-    let sink = Sink::default();
-    legume_mcp::brain::serve_in(Cursor::new(input), sink.clone(), Some(proj.clone())).unwrap();
-    let reply = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-    let msgs: Vec<Value> = reply
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    let text = |id| {
-        by_id(&msgs, id)["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string()
-    };
+    let ev = |h: &str, source: &str, class: &str, verdict: &str, text: &str| json!({ "kind": "evidence", "hypothesis": h, "source": source, "class": class, "verdict": verdict, "text": text, "words": format!("{verdict}, as I read it") });
+    let msgs = brain(
+        &proj,
+        &[
+            note(1, ev("H1", "s", "our_cells", "agrees", "t")),
+            note(
+                2,
+                json!({ "kind": "hypothesis", "words": "IFN drives topic 7", "nullify": "no ISGs in held-out donors" }),
+            ),
+            note(
+                3,
+                json!({ "kind": "hypothesis", "words": "Two donors carry topic 7" }),
+            ),
+            note(4, ev("H9", "s", "our_cells", "agrees", "t")),
+            note(5, ev("H1", "s", "cells", "agrees", "t")),
+            note(6, ev("H1", "s", "our_cells", "agrees", " ")),
+            note(
+                7,
+                ev(
+                    "H1",
+                    "donors 1-4",
+                    "our_cells",
+                    "agrees",
+                    "ISG15, MX1 top markers; cocoa 212 genes at FDR < 0.1",
+                ),
+            ),
+            note(
+                8,
+                ev(
+                    "h1",
+                    "donors 5-6",
+                    "other_donors",
+                    "agrees",
+                    "5 of 6 donors higher",
+                ),
+            ),
+            note(9, ev("1", "donors 5-6", "other_study", "agrees", "t")),
+            note(
+                10,
+                ev(
+                    "H1",
+                    "eQTL catalogue",
+                    "genetics",
+                    "agrees",
+                    "IRF7 eQTL in monocytes",
+                ),
+            ),
+            note(
+                11,
+                ev(
+                    "H2",
+                    "donors 1-4",
+                    "our_cells",
+                    "disagrees",
+                    "both treated donors above both controls",
+                ),
+            ),
+            note(
+                12,
+                json!({ "kind": "evidence", "hypothesis": "H1", "source": "x", "class": "our_cells", "verdict": "agrees", "text": "t" }),
+            ),
+        ],
+    );
     for (id, refused) in [
         (1, true),
         (2, false),
@@ -699,22 +674,20 @@ fn evidence_builds_each_hypothesis_triangulation_table() {
         (10, false),
         (11, false),
         (12, true),
-        (13, false),
-        (14, false),
     ] {
         assert_eq!(
             by_id(&msgs, id)["result"]["isError"],
             refused,
             "call {id}: {}",
-            text(id)
+            said(&msgs, id)
         );
     }
+    let text = |id| said(&msgs, id);
     assert!(
         text(1).contains("there is no hypothesis H1 (the hypotheses are none yet"),
         "{}",
         text(1)
     );
-    assert!(text(3).starts_with("R1 = H1, R2 = H2."), "{}", text(3));
     assert!(
         text(4).contains("the hypotheses are H1 to H2"),
         "{}",
@@ -742,7 +715,6 @@ fn evidence_builds_each_hypothesis_triangulation_table() {
         "{}",
         text(8)
     );
-    assert!(text(8).contains("used for H1, those that would raise the verb first: genetics (`genetics`); perturbation"), "{}", text(8));
     assert!(
         text(9).contains("was recorded as class `other_donors`"),
         "{}",
@@ -754,20 +726,14 @@ fn evidence_builds_each_hypothesis_triangulation_table() {
         text(10)
     );
     assert!(text(11).contains("Standing: no source agrees. Name with the verb what does not agree: donors 1-4 (disagrees)."), "{}", text(11));
-    assert!(text(12).contains("go with kind `evidence`"), "{}", text(12));
-    assert!(text(14).starts_with("R2 = H1, R1 = H3."), "{}", text(14));
+    assert!(
+        text(11).contains("has not said what would nullify H2"),
+        "{}",
+        text(11)
+    );
+    assert!(text(12).contains("`words` is required"), "{}", text(12));
 
     let results = proj.join("results");
-    let hyps = std::fs::read_to_string(results.join("HYPOTHESES.tsv")).unwrap();
-    assert!(
-        hyps.starts_with("date\ttime\tserver\tid\tfrom\tclaim\n"),
-        "{hyps}"
-    );
-    assert_eq!(hyps.lines().count(), 4, "{hyps}");
-    assert!(
-        hyps.contains("\tlegume\tH3\tR1 of the proposal of "),
-        "{hyps}"
-    );
     let evidence = std::fs::read_to_string(results.join("EVIDENCE.tsv")).unwrap();
     assert_eq!(
         evidence.lines().count(),
@@ -775,10 +741,9 @@ fn evidence_builds_each_hypothesis_triangulation_table() {
         "only the evidence taken: {evidence}"
     );
     assert!(
-        evidence.contains("\tlegume\tH1\tdonors 5-6\tother_donors\tagrees\t5 of 6 donors higher\n"),
+        evidence.contains("\tlegume\tH1\tdonors 5-6\tother_donors\tagrees\t5 of 6 donors higher\tagrees, as I read it\n"),
         "{evidence}"
     );
-
     let day = std::fs::read_dir(&results)
         .unwrap()
         .flatten()
@@ -787,9 +752,8 @@ fn evidence_builds_each_hypothesis_triangulation_table() {
         .path();
     let notebook = std::fs::read_to_string(day.join("notebook.md")).unwrap();
     for part in [
-        " (legume): chose R1, R2. Hypotheses: R1 = H1, R2 = H2.\n\n> both\n",
-        " · legume · evidence\n\nH1 from donors 5-6 (other donors): agrees.\n\n5 of 6 donors higher\n\n**H1. IFN drives topic 7**\n",
-        "| donors 5-6 | other donors, same study | lab, platform | agrees | 5 of 6 donors higher |\n",
+        " · legume · evidence H1\n\nH1 from donors 5-6 (other donors, same study): agrees.\n\n5 of 6 donors higher\n\n> agrees, as I read it\n\n**H1. IFN drives topic 7**\n",
+        "| donors 5-6 | other donors, same study | lab, platform | agrees | 5 of 6 donors higher | agrees, as I read it |\n",
     ] {
         assert!(notebook.contains(part), "{part:?} in {notebook}");
     }
@@ -797,43 +761,25 @@ fn evidence_builds_each_hypothesis_triangulation_table() {
         !notebook.contains("Sources not yet used"),
         "the hints are for the agent: {notebook}"
     );
-    std::fs::remove_dir_all(&base).unwrap();
 }
 
 #[test]
-fn a_tools_notebook_leaves_the_reasoning_to_the_legume_server() {
-    let base = std::env::temp_dir().join(format!("legume-mcp-roles-{}", std::process::id()));
-    let proj = base.join("proj");
+fn the_notebook_is_the_legume_servers_alone() {
+    let base = tempfile::tempdir().unwrap();
+    let proj = base.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
     let init = json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } });
     let list = json!({ "jsonrpc": "2.0", "id": 99, "method": "tools/list" });
-    let lines = |calls: &[Value]| -> String {
-        std::iter::once(&init)
-            .chain(calls)
-            .chain(std::iter::once(&list))
-            .map(|l| format!("{l}\n"))
-            .collect()
-    };
-    let reading = |claim: &str| json!({ "claim": claim, "rationale": "r", "check": "c" });
 
-    // A tool's server: plan, observation and note only.
-    let tool = lines(&[
-        call(
-            1,
-            "notebook",
-            json!({ "kind": "plan", "text": "Question: why topic 7?" }),
-        ),
-        call(
-            2,
-            "notebook",
-            json!({ "kind": "interpretation", "readings": [reading("a"), reading("b")] }),
-        ),
-        call(
-            3,
-            "notebook",
-            json!({ "kind": "conclusion", "text": "Old name, still taken." }),
-        ),
-    ]);
+    // A tool's server: no notebook of its own.
+    let tool: String = [
+        init.clone(),
+        call(1, "notebook", json!({ "kind": "plan", "words": "w" })),
+        list.clone(),
+    ]
+    .iter()
+    .map(|l| format!("{l}\n"))
+    .collect();
     let sink = Sink::default();
     let info = ServerInfo {
         name: "t".into(),
@@ -853,28 +799,14 @@ fn a_tools_notebook_leaves_the_reasoning_to_the_legume_server() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(by_id(&msgs, 1)["result"]["isError"], false);
-    assert_eq!(by_id(&msgs, 2)["result"]["isError"], true);
-    let refusal = by_id(&msgs, 2)["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap();
-    assert!(
-        refusal.contains("goes to the `legume` server's notebook"),
-        "{refusal}"
-    );
-    assert_eq!(by_id(&msgs, 3)["result"]["isError"], false);
     let instructions = by_id(&msgs, 0)["result"]["instructions"].as_str().unwrap();
     assert!(
-        instructions.contains("in the notebook of the `legume` server"),
+        instructions.contains("The notebook is the `legume` server's")
+            && instructions.contains("not the job's id"),
         "{instructions}"
     );
-    assert!(!instructions.contains("`evidence`"), "{instructions}");
     let tools = by_id(&msgs, 99)["result"]["tools"].as_array().unwrap();
-    let notebook = tools.iter().find(|t| t["name"] == "notebook").unwrap();
-    assert_eq!(
-        notebook["inputSchema"]["properties"]["kind"]["enum"],
-        json!(["plan", "observation", "note"])
-    );
+    assert!(!tools.iter().any(|t| t["name"] == "notebook"));
     assert!(tools.iter().any(|t| t["name"] == "job_wait"));
     let cancel = tools.iter().find(|t| t["name"] == "job_cancel").unwrap();
     assert_eq!(
@@ -888,82 +820,70 @@ fn a_tools_notebook_leaves_the_reasoning_to_the_legume_server() {
         "a tool that says nothing of how it behaves sends no hints"
     );
 
-    // The legume server: the reasoning, the guide, the project's standing.
-    let brain = lines(&[
-        call(1, "guide", json!({})),
-        call(2, "guide", json!({ "section": "8.3" })),
-        call(
-            3,
-            "notebook",
-            json!({ "kind": "interpretation", "readings": [reading("IFN drives topic 7"), reading("Donor 2 carries topic 7")] }),
-        ),
-        call(4, "status", json!({})),
-        call(
-            5,
-            "notebook",
-            json!({ "kind": "answer", "chose": [1], "words": "1" }),
-        ),
-        call(
-            6,
-            "notebook",
-            json!({ "kind": "evidence", "hypothesis": "H1", "source": "donors 1-4", "class": "our_cells", "verdict": "agrees", "text": "ISGs top" }),
-        ),
-        call(7, "status", json!({})),
-        call(8, "hypotheses", json!({})),
-        call(9, "hypotheses", json!({ "id": "H1" })),
-        call(10, "hypotheses", json!({ "id": "H2" })),
-        json!({ "jsonrpc": "2.0", "id": 11, "method": "prompts/list" }),
-        json!({ "jsonrpc": "2.0", "id": 12, "method": "prompts/get",
-                "params": { "name": "explore", "arguments": { "question": "why topic 7?" } } }),
-        json!({ "jsonrpc": "2.0", "id": 13, "method": "prompts/get",
-                "params": { "name": "triangulate" } }),
-        json!({ "jsonrpc": "2.0", "id": 14, "method": "prompts/get", "params": { "name": "nope" } }),
-    ]);
-    let sink = Sink::default();
-    legume_mcp::brain::serve_in(Cursor::new(brain), sink.clone(), Some(proj.clone())).unwrap();
-    let msgs: Vec<Value> = String::from_utf8(sink.0.lock().unwrap().clone())
-        .unwrap()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    let text = |id| {
-        by_id(&msgs, id)["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string()
-    };
+    // The legume server: the notebook, the guide, the project's standing.
+    let msgs = brain(
+        &proj,
+        &[
+            init,
+            call(1, "guide", json!({})),
+            call(2, "guide", json!({ "section": "8.3" })),
+            call(
+                3,
+                "notebook",
+                json!({ "kind": "hypothesis", "words": "IFN drives topic 7" }),
+            ),
+            call(
+                4,
+                "notebook",
+                json!({ "kind": "evidence", "hypothesis": "H1", "source": "donors 1-4", "class": "our_cells", "verdict": "agrees", "text": "ISGs top", "words": "clear in all four" }),
+            ),
+            call(5, "status", json!({})),
+            call(6, "status", json!({ "hypothesis": "H1" })),
+            call(7, "status", json!({ "hypothesis": "H2" })),
+            json!({ "jsonrpc": "2.0", "id": 11, "method": "prompts/list" }),
+            json!({ "jsonrpc": "2.0", "id": 12, "method": "prompts/get",
+                    "params": { "name": "explore", "arguments": { "question": "why topic 7?" } } }),
+            json!({ "jsonrpc": "2.0", "id": 13, "method": "prompts/get",
+                    "params": { "name": "triangulate" } }),
+            json!({ "jsonrpc": "2.0", "id": 14, "method": "prompts/get", "params": { "name": "nope" } }),
+            list,
+        ],
+    );
     assert_eq!(by_id(&msgs, 0)["result"]["serverInfo"]["name"], "legume");
     let instructions = by_id(&msgs, 0)["result"]["instructions"].as_str().unwrap();
     assert!(
-        instructions.contains("Quick card for agents:"),
+        instructions.contains("Quick card for agents:")
+            && instructions.contains("The person thinks; you run the tools"),
         "{instructions}"
     );
-    assert!(
-        instructions.contains("record what each source says of it as\n`evidence`")
-            || instructions.contains("`evidence`"),
-        "{instructions}"
-    );
-    let names: Vec<&str> = by_id(&msgs, 99)["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["name"].as_str().unwrap())
-        .collect();
+    let listed = by_id(&msgs, 99)["result"]["tools"].as_array().unwrap();
+    let names: Vec<&str> = listed.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(
         names,
-        ["guide", "status", "hypotheses", "report", "notebook"],
+        ["guide", "status", "report", "notebook"],
         "no job tools: the legume server runs no steps"
     );
-    // How each behaves, for the client; and the recipes, as prompts.
-    let listed = by_id(&msgs, 99)["result"]["tools"].as_array().unwrap();
     assert_eq!(listed[0]["annotations"], json!({ "readOnlyHint": true }));
     assert_eq!(
-        listed[3]["annotations"],
+        listed[2]["annotations"],
         json!({ "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true })
     );
     assert_eq!(
-        listed[4]["annotations"],
+        listed[3]["annotations"],
         json!({ "readOnlyHint": false, "destructiveHint": false })
+    );
+    assert_eq!(
+        listed[3]["inputSchema"]["properties"]["kind"]["enum"],
+        json!([
+            "plan",
+            "data",
+            "observation",
+            "hypothesis",
+            "evidence",
+            "figure",
+            "summary",
+            "note"
+        ])
     );
     assert_eq!(
         by_id(&msgs, 0)["result"]["capabilities"]["prompts"],
@@ -981,7 +901,8 @@ fn a_tools_notebook_leaves_the_reasoning_to_the_legume_server() {
         .unwrap();
     assert!(
         explore.contains("Question: why topic 7?\nData: not given\n")
-            && explore.contains("Call `status`"),
+            && explore.contains("Call `status`")
+            && explore.contains("Never say what a result means"),
         "{explore}"
     );
     let tri = by_id(&msgs, 13)["result"]["messages"][0]["content"]["text"]
@@ -990,49 +911,34 @@ fn a_tools_notebook_leaves_the_reasoning_to_the_legume_server() {
     assert!(tri.contains("Hypothesis: not given\n"), "{tri}");
     assert_eq!(by_id(&msgs, 14)["error"]["code"], -32602);
     assert!(
-        text(1).contains("8.3        Sources of evidence"),
+        said(&msgs, 1).contains("8.3        Sources of evidence"),
         "{}",
-        text(1)
+        said(&msgs, 1)
     );
     assert!(
-        text(2).starts_with("8.3 Sources of evidence\n"),
+        said(&msgs, 2).starts_with("8.3 Sources of evidence\n"),
         "{}",
-        text(2)
+        said(&msgs, 2)
+    );
+    let status = said(&msgs, 5);
+    assert!(status.contains("H1. IFN drives topic 7 (one group of cells, not replicated; sources: 1 agree, 0 disagree, 0 mixed)"), "{status}");
+    assert!(
+        status.contains("Open for the person (ask, in plain words):\n  H1: what else could explain it?\n  H1: what result would make you drop it?"),
+        "{status}"
     );
     assert!(
-        text(4).contains("Waiting for the user: the proposal of "),
+        said(&msgs, 6).contains(
+            "| donors 1-4 | our cells | everything | agrees | ISGs top | clear in all four |"
+        ),
         "{}",
-        text(4)
+        said(&msgs, 6)
     );
     assert!(
-        text(4).contains("R1. IFN drives topic 7 / R2. Donor 2 carries topic 7"),
+        said(&msgs, 6).contains("Sources not yet used for H1"),
         "{}",
-        text(4)
+        said(&msgs, 6)
     );
-    assert!(
-        text(4).contains("Question: why topic 7?") || text(4).contains("· t · plan"),
-        "{}",
-        text(4)
-    );
-    assert!(!text(7).contains("Waiting for the user"), "{}", text(7));
-    assert!(text(7).contains("H1. IFN drives topic 7 (one group of cells, not replicated; sources: 1 agree, 0 disagree, 0 mixed)"), "{}", text(7));
-    assert!(
-        text(8).starts_with("H1. IFN drives topic 7 ("),
-        "{}",
-        text(8)
-    );
-    assert!(
-        text(9).contains("| donors 1-4 | our cells | everything | agrees | ISGs top |"),
-        "{}",
-        text(9)
-    );
-    assert!(
-        text(9).contains("Sources not yet used for H1"),
-        "{}",
-        text(9)
-    );
-    assert_eq!(by_id(&msgs, 10)["result"]["isError"], true);
-    std::fs::remove_dir_all(&base).unwrap();
+    assert_eq!(by_id(&msgs, 7)["result"]["isError"], true);
 }
 
 #[test]
@@ -1070,73 +976,4 @@ fn a_tool_that_asks_for_a_backtrace_keeps_it() {
         json!({ "script": script, "backtrace": "1" }),
     )]);
     assert_eq!(by_id(&msgs, 1)["result"]["content"][0]["text"], "1/0");
-}
-
-#[test]
-fn an_answer_numbers_each_chosen_reading_once() {
-    let base = tempfile::tempdir().unwrap();
-    let proj = base.path().join("proj");
-    std::fs::create_dir_all(&proj).unwrap();
-    let reading = |claim: &str| json!({ "claim": claim, "rationale": "r", "check": "c" });
-    let propose = |id, a: &str, b: &str| {
-        call(
-            id,
-            "notebook",
-            json!({ "kind": "interpretation", "readings": [reading(a), reading(b)] }),
-        )
-    };
-    let input: String = [
-        json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {} }),
-        propose(1, "A", "B"),
-        call(
-            2,
-            "notebook",
-            json!({ "kind": "answer", "chose": [1, 2, 1], "words": "1, 2" }),
-        ),
-        propose(3, "C", "A"),
-        call(
-            4,
-            "notebook",
-            json!({ "kind": "answer", "chose": "both", "words": "both" }),
-        ),
-        call(
-            5,
-            "notebook",
-            json!({ "kind": "answer", "chose": 2, "words": "2" }),
-        ),
-    ]
-    .iter()
-    .map(|l| format!("{l}\n"))
-    .collect();
-    let sink = Sink::default();
-    legume_mcp::brain::serve_in(Cursor::new(input), sink.clone(), Some(proj.clone())).unwrap();
-    let msgs: Vec<Value> = String::from_utf8(sink.0.lock().unwrap().clone())
-        .unwrap()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    let text = |id| {
-        by_id(&msgs, id)["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .to_string()
-    };
-    assert!(text(2).starts_with("R1 = H1, R2 = H2."), "{}", text(2));
-    assert_eq!(
-        by_id(&msgs, 4)["result"]["isError"],
-        true,
-        "a word is not a number"
-    );
-    assert!(text(4).contains("`chose` is a list"), "{}", text(4));
-    assert!(
-        text(5).starts_with("R2 = H1."),
-        "one number is one choice: {}",
-        text(5)
-    );
-    let ledger = std::fs::read_to_string(proj.join("results/HYPOTHESES.tsv")).unwrap();
-    assert_eq!(
-        ledger.lines().count(),
-        3,
-        "a header and two hypotheses: {ledger}"
-    );
 }

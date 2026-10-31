@@ -1,8 +1,9 @@
-//! The lab notebook: the built-in `notebook` tool of every server with
-//! records, for the plan, the observations and notes, and the full one of
-//! the `legume` server, which also keeps the reasoning across tools: the
-//! readings an agent proposes, the user's answers, the evidence for each
-//! hypothesis ([`crate::evidence`]), and the offers and choices.
+//! The lab notebook: the `legume` server's `notebook` tool, the one notebook
+//! of a project. The agent records what was done and seen; everything that
+//! interprets is the person's, in their own words: their plan, where data
+//! came from and whether it is good, their hypotheses with the rivals they
+//! named and what would nullify each, their judgement of each source of
+//! evidence, the figures they keep, and the summary of their day.
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -15,142 +16,76 @@ pub(crate) const RECORDS_NOTE: &str = "\
 Records (after Noble, PLoS Comput Biol 2009, doi:10.1371/journal.pcbi.1000424), \
 under the project {root}: outputs you do not name go to results/<today>/; every \
 step that writes is added to results/<today>/runall.sh, which repeats the work \
-without you; results/INDEX.tsv lists each output with a summary. Use the \
-`notebook` tool: before starting, a `plan` (the question, the data, and how the \
-result will be checked); then what you did and saw, as `observation`s. ";
+without you; results/INDEX.tsv lists each output with a summary, its inputs and \
+its key numbers. ";
 
-/// What a tool's server adds: the reasoning is the `legume` server's.
+/// What a tool's server adds: the notebook is the `legume` server's.
 pub(crate) const TOOL_NOTE: &str = "\
-What the results mean is the user's to say: propose readings, and record the \
-user's answers and the evidence for each hypothesis, in the notebook of the \
-`legume` server (its `guide` says how; if it is not connected, ask the user to \
-add it: `legume mcp`). Tell the user where the records are when the work is done.";
+The notebook is the `legume` server's (`legume init` connects it): record there \
+the person's plan, what you did and saw, and everything the person decides, in \
+their words. Speak to the person plainly: what is running and about how long, \
+not job ids; when they can watch a step, the command that shows it.";
 
-/// What the `legume` server adds: how the reasoning is kept.
+/// What the `legume` server adds: who writes what.
 pub(crate) const REASONING_NOTE: &str = "\
-What the results mean is the user's to say: propose two or more `readings` in an \
-`interpretation` (each a claim, its evidence, the alternatives and why not, a \
-rationale, and the check that would tell it from the others; they are numbered \
-R1, R2, ...), then ask the user which hold, so a number or a short line is an \
-answer (as a multiple-choice question when your client offers one), and record \
-their reply as an `answer`: `chose` with the numbers of the readings they chose \
-(none when they chose none) and `words` with their reply exactly as they gave it. \
-A reply that does not say which readings hold (\"ok\", \"continue\") is not an \
-answer: ask again. The readings they choose become hypotheses H1, H2, ... for the \
-whole project. Test each against sources of evidence that share little with the \
-data it came from (other donors, another study, genetics, a perturbation; several \
-tools on the same cells are one source), and record what each source says of it as \
-`evidence`: the result is its triangulation table, the verb it allows, and the \
-sources not yet used. Other choices you put to the user (which sources next, \
-whether to look further) go in an `offer` of numbered `options`, and their reply in \
-a `choice`, the same way. Tell the user where the records are when the work is done.";
+The person thinks; you run the tools, show the facts, ask, and check. Never write \
+what a result means, a hypothesis, a verdict, a figure's take-home or a summary for \
+them: ask, and record their words as they said them (`words`). Explain what a \
+number measures and what is typical; what it means here is theirs to say. Ask them \
+to predict before you show a result. When they state a hypothesis, ask what else \
+could explain it and what would nullify it. Tell the person where the records are \
+when the work is done.";
 
-/// The kinds a tool's own notebook takes; the others are the `legume`
-/// server's.
-const TOOL_KINDS: [&str; 3] = ["plan", "observation", "note"];
-
-/// The kinds the `legume` server's notebook takes (and `conclusion`, the
-/// old name of `interpretation`).
+/// The kinds of entry.
 const KINDS: [&str; 8] = [
     "plan",
+    "data",
     "observation",
-    "interpretation",
-    "answer",
+    "hypothesis",
     "evidence",
-    "offer",
-    "choice",
+    "figure",
+    "summary",
     "note",
 ];
 
-/// The `notebook` tool: a tool server's (`full` false), for the plan,
-/// observations and notes; the `legume` server's, for the reasoning too.
-pub(crate) fn notebook_spec(full: bool) -> ToolSpec {
-    if !full {
-        return ToolSpec::new(
-            "notebook",
-            "Add an entry to today's lab notebook (results/<today>/notebook.md, shared by every legume server): your account of the work, kept beside the facts the tools record. Kinds: `plan` (first: the question, the data, how the result will be checked), `observation` (what you did and saw, with numbers), `note` (anything else; `by` user for the user's own words). The entry is `text`. Readings, the user's answers, evidence, offers and choices go to the `legume` server's notebook.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "kind": { "type": "string", "enum": TOOL_KINDS },
-                    "text": { "type": "string", "description": "The entry, in Markdown" },
-                    "by": {
-                        "type": "string",
-                        "enum": ["agent", "user"],
-                        "description": "agent (when left out) for your own; user for the user's own words, as they gave them.",
-                    },
-                },
-                "required": ["kind", "text"],
-            }),
-        );
-    }
+/// The data the person described, under `results/`: each path, their
+/// verdict and why.
+pub(crate) const DATA: (&str, &str) = ("DATA.tsv", "path\tverdict\twhy");
+/// The figures and tables the person kept, under `results/`.
+pub(crate) const FIGURES: (&str, &str) = ("FIGURES.tsv", "number\toutput\thypothesis\ttake_home");
+
+/// A data verdict.
+const DATA_VERDICTS: [&str; 3] = ["good", "caveats", "bad"];
+
+/// The `legume` server's `notebook` tool.
+pub(crate) fn notebook_spec() -> ToolSpec {
     ToolSpec::new(
         "notebook",
-        "Add an entry to today's lab notebook (results/<today>/notebook.md, shared by every legume server): your account of the work, kept beside the facts the tools record. Kinds, in the order of a piece of work: `plan` (first), `observation` (what you did and saw), `interpretation` (two or more `readings` you propose), `answer` (the user's reply to them: `chose` and `words`; the readings chosen become hypotheses H1, H2, ... for the whole project), `evidence` (what one source of evidence says of one hypothesis: `hypothesis`, `source`, `class`, `verdict`, and its numbers in `text`; returns the hypothesis's triangulation table, the verb it allows and the sources not yet used). Other choices you put to the user (which sources next, whether to look further) are an `offer` of numbered `options`, and their reply a `choice` (`chose` and `words`). `note` for anything else. A plan, observation or note is `text`.",
+        "Add an entry to today's lab notebook (results/<today>/notebook.md). You write `observation`s (what you did and saw, with numbers) and `note`s. Every other kind is the person's, in their own words (`words`), never yours: `plan` (their question, and what would change their mind), `data` (where a file came from, and their verdict on it), `hypothesis` (their claim, the rivals they name, what would nullify it; numbered H1, H2, ...; give `hypothesis` to revise one), `evidence` (what one source says of a hypothesis, and why they judge it so), `figure` (an output they keep for the paper, its number and take-home), `summary` (their day: what changed, what argues against it, what is next).",
         json!({
             "type": "object",
             "properties": {
-                "kind": { "type": "string", "enum": ["plan", "observation", "interpretation", "answer", "evidence", "offer", "choice", "note"] },
-                "hypothesis": { "type": "string", "description": "Evidence: the hypothesis it bears on, as H1, H2, ..." },
-                "source": { "type": "string", "description": "Evidence: a name for the data it comes from, the same each time, e.g. \"our cells, donors 1-4\", \"held-out donors 5-6\", a study's accession. Several tools on the same data are one source." },
+                "kind": { "type": "string", "enum": KINDS },
+                "words": { "type": "string", "description": "The person's own words, as they said them: their plan, where data came from, their claim, why they judge evidence so, a figure's take-home, their summary." },
+                "text": { "type": "string", "description": "Yours: an observation or note; for evidence, what the source shows, with numbers and thresholds; for a plan, the data and checks, as facts." },
+                "path": { "type": "string", "description": "Data: the file or folder in the project" },
+                "verdict": { "type": "string", "description": "Data: good, caveats or bad. Evidence: agrees, disagrees or mixed. The person's, never yours." },
+                "hypothesis": { "type": "string", "description": "Evidence, or a figure's claim, or a hypothesis to revise: H1, H2, ..." },
+                "rivals": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Hypothesis: what else could explain it, as the person named it",
+                },
+                "nullify": { "type": "string", "description": "Hypothesis: the result that would make the person drop it, in their words" },
+                "source": { "type": "string", "description": "Evidence: a name for the data it comes from, the same each time, e.g. \"held-out donors 5-6\". Several tools on the same data are one source." },
                 "class": {
                     "type": "string",
                     "enum": evidence::CLASSES.iter().map(|c| c.0).collect::<Vec<_>>(),
-                    "description": "Evidence: the kind of source, from most to least shared with the data the hypothesis came from: our_cells (that data, any tool, a term or gene-set test on it too), same_cells (another measurement of those cells: ATAC, alleles, protein), same_donors (another sample of those donors: a spatial section, another tissue), other_donors (donors held out from the same study), other_study (published or another lab's data), genetics (genotypes, eQTL, GWAS), perturbation (knockouts, screens, drugs), curated (what earlier studies established: known gene sets, the Cell Ontology, papers).",
+                    "description": "Evidence: the kind of source, from most to least shared with the data the hypothesis came from: our_cells, same_cells (another measurement of those cells), same_donors (another sample of those donors), other_donors (held out from the same study), other_study, genetics, perturbation, curated (what earlier studies established). Say it to the person in plain words.",
                 },
-                "verdict": { "type": "string", "enum": evidence::VERDICTS, "description": "Evidence: what the source says of the hypothesis: agrees, disagrees, or mixed (it agrees in part: some donors, some of its analyses)." },
-                "text": { "type": "string", "description": "The entry, in Markdown; for evidence, what the source shows, with numbers and thresholds" },
-                "readings": {
-                    "type": "array",
-                    "minItems": 2,
-                    "description": "An agent's interpretation: the readings it proposes, numbered R1, R2, ... in order.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "claim": { "type": "string" },
-                            "evidence": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": { "kind": { "type": "string" }, "term": { "type": "string" } },
-                                    "required": ["kind", "term"],
-                                },
-                                "description": "Typed items, as {kind: marker|term|figure|statistic|..., term}",
-                            },
-                            "alternatives": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": { "label": { "type": "string" }, "why_not": { "type": "string" } },
-                                    "required": ["label", "why_not"],
-                                },
-                            },
-                            "rationale": { "type": "string" },
-                            "check": { "type": "string", "description": "What would tell this reading from the others" },
-                        },
-                        "required": ["claim", "rationale", "check"],
-                    },
-                },
-                "options": {
-                    "type": "array",
-                    "minItems": 2,
-                    "items": { "type": "string" },
-                    "description": "An offer: the choices put to the user, numbered 1, 2, ... in order; stopping can be one.",
-                },
-                "chose": {
-                    "type": "array",
-                    "items": { "type": "integer", "minimum": 1 },
-                    "description": "An answer or a choice: the numbers the user chose (readings for an answer, options for a choice); leave it out when they chose none.",
-                },
-                "words": {
-                    "type": "string",
-                    "description": "An answer or a choice: the user's reply exactly as they gave it.",
-                },
-                "by": {
-                    "type": "string",
-                    "enum": ["agent", "user"],
-                    "description": "A note or observation: agent (when left out) for your own; user for the user's own words, as they gave them. An answer or a choice needs none.",
-                },
+                "output": { "type": "string", "description": "Figure: the image or table kept, as INDEX.tsv lists it" },
+                "number": { "type": "string", "description": "Figure: its number in the paper, as the person gives it, e.g. 2B or S1" },
+                "by": { "type": "string", "enum": ["agent", "user"], "description": "Note: agent (when left out), or user for the person's own words" },
             },
             "required": ["kind"],
         }),
@@ -158,286 +93,283 @@ pub(crate) fn notebook_spec(full: bool) -> ToolSpec {
     .writes()
 }
 
-/// Who decided a notebook entry: lupin's `decided_by` values, shared by
-/// every legume tool.
-const DECIDED_BY: [&str; 4] = [
-    "agent",
-    "agent_proposed_user_accepted",
-    "user_override",
-    "user",
-];
-
 /// A notebook entry: its heading label, its markdown, and what the call
 /// tells the agent, if anything.
 type Entry = (String, String, Option<String>);
 
-/// A notebook call's entry, with what it adds to the project's ledger
-/// ([`evidence`]); a tool server's notebook (`full` false) takes only its
-/// own kinds. An agent's interpretation is its proposed readings, two or
-/// more; the others say whose they are. `conclusion` is the old name of
-/// `interpretation` and, as before, takes text alone.
-pub(crate) fn notebook_entry(args: &Value, p: &Project, full: bool) -> Result<Entry> {
-    let Some(kind) = args["kind"].as_str() else {
-        anyhow::bail!("`kind` is required");
-    };
-    if !full && !TOOL_KINDS.contains(&kind) && kind != "conclusion" {
-        anyhow::bail!(
-            "kind `{kind}` goes to the `legume` server's notebook, which keeps the readings, \
-             the user's answers and the evidence across tools; this one takes {}. If the \
-             `legume` server is not connected, ask the user to add it (`legume mcp`)",
-            TOOL_KINDS.join(", ")
-        );
-    }
-    // The kind names the entry's heading: only these, so none claims to be
-    // the user's or starts another entry.
-    if full && !KINDS.contains(&kind) && kind != "conclusion" {
-        anyhow::bail!("`kind` is one of {}, not `{kind}`", KINDS.join(", "));
-    }
+/// A notebook call's entry, with what it adds to the project's ledgers.
+pub(crate) fn notebook_entry(args: &Value, p: &Project) -> Result<Entry> {
+    let kind = args["kind"].as_str().unwrap_or_default();
+    anyhow::ensure!(
+        KINDS.contains(&kind),
+        "`kind` is one of {}, not `{kind}`",
+        KINDS.join(", ")
+    );
     match kind {
-        "answer" => return reply_entry(Asked::Readings, args, p),
-        "choice" => return reply_entry(Asked::Options, args, p),
-        "offer" => return offer_entry(args).map(|(l, t)| (l, t, None)),
-        "evidence" => return evidence_entry(args, p),
-        _ => {}
-    }
-    if !args["options"].is_null() {
-        anyhow::bail!("`options` go with kind `offer`");
-    }
-    if !args["hypothesis"].is_null() || !args["verdict"].is_null() {
-        anyhow::bail!("`hypothesis` and `verdict` go with kind `evidence`");
-    }
-    let legacy = kind == "conclusion";
-    let kind = if legacy { "interpretation" } else { kind };
-    let by = args["by"].as_str().unwrap_or("agent");
-    // A tool's notebook takes the agent's own entries and the user's words;
-    // who accepted a reading is the `legume` server's to record.
-    let decided: &[&str] = if full {
-        &DECIDED_BY
-    } else {
-        &["agent", "user"]
-    };
-    if !decided.contains(&by) {
-        anyhow::bail!("`by` is one of {}, not `{by}`", decided.join(", "));
-    }
-    let readings = match &args["readings"] {
-        Value::Null => vec![],
-        Value::Array(r) => r.iter().map(reading).collect::<Result<Vec<_>>>()?,
-        _ => anyhow::bail!("`readings` is a list"),
-    };
-    let proposing = kind == "interpretation" && by == "agent";
-    if proposing && !legacy && readings.len() < 2 {
-        anyhow::bail!(
-            "an agent's interpretation proposes two or more `readings`, each {{claim, evidence?, \
-             alternatives?, rationale, check}}; the user says which hold"
-        );
-    }
-    let mut text = args["text"]
-        .as_str()
-        .unwrap_or_default()
-        .trim_end()
-        .to_string();
-    for (i, r) in readings.iter().enumerate() {
-        if !text.is_empty() {
-            text.push_str("\n\n");
+        "plan" => {
+            let words = words(
+                args,
+                "the person's question as they put it, and what would change their mind",
+            )?;
+            let facts = optional(args, "text");
+            Ok(("plan".into(), joined(&quote(&words), &facts), None))
         }
-        let (claim, lines) = r;
-        text.push_str(&format!("**R{}. {claim}**\n{lines}", i + 1));
+        "observation" => Ok((
+            "observation".into(),
+            required(args, "text", "what you did and saw, with numbers")?,
+            None,
+        )),
+        "note" => {
+            let text = required(args, "text", "the note")?;
+            match args["by"].as_str().unwrap_or("agent") {
+                "agent" => Ok(("note".into(), text, None)),
+                "user" => Ok(("note (user)".into(), quote(&text), None)),
+                by => anyhow::bail!("`by` is agent or user, not `{by}`"),
+            }
+        }
+        "summary" => {
+            let words = words(
+                args,
+                "the person's summary of the day: what changed, what argues against it, what is next",
+            )?;
+            Ok(("summary".into(), quote(&words), None))
+        }
+        "data" => data_entry(args, p),
+        "hypothesis" => hypothesis_entry(args, p),
+        "evidence" => evidence_entry(args, p),
+        _ => figure_entry(args, p),
     }
-    if text.is_empty() {
-        anyhow::bail!("`text` or `readings` is required");
-    }
-    let label = match by {
-        "agent" if proposing => "interpretation (proposed)".to_string(),
-        "agent" => kind.to_string(),
-        "agent_proposed_user_accepted" => format!("{kind} (accepted by the user)"),
-        "user_override" => format!("{kind} (user override)"),
-        _ => format!("{kind} (user)"),
-    };
-    Ok((label, text, None))
 }
 
-/// What one source of evidence says of one hypothesis, added to the
-/// project's ledger; the agent is given the hypothesis's table, the verb it
-/// allows, and the sources it has not used.
+/// Field `name`, required: one or more lines.
+fn required(args: &Value, name: &str, what: &str) -> Result<String> {
+    match args[name].as_str().map(str::trim) {
+        Some(s) if !s.is_empty() => Ok(s.to_string()),
+        _ => anyhow::bail!("`{name}` is required: {what}"),
+    }
+}
+
+/// Field `name`, if given.
+fn optional(args: &Value, name: &str) -> String {
+    args[name]
+        .as_str()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The person's words, required: never the agent's account of them.
+fn words(args: &Value, what: &str) -> Result<String> {
+    required(
+        args,
+        "words",
+        &format!("{what}, in their own words; ask them, and record what they say"),
+    )
+}
+
+/// `text` quoted, as the person's.
+pub(crate) fn quote(text: &str) -> String {
+    text.lines()
+        .map(|l| format!("> {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn joined(a: &str, b: &str) -> String {
+    if b.is_empty() {
+        a.to_string()
+    } else {
+        format!("{a}\n\n{b}")
+    }
+}
+
+/// `path` as the project names it: inside it, and there.
+fn in_project(p: &Project, path: &str) -> Result<String> {
+    let rel = p.rel(path.trim());
+    anyhow::ensure!(
+        !rel.starts_with('/') && !rel.split('/').any(|c| c == ".."),
+        "`{path}` is not inside the project"
+    );
+    anyhow::ensure!(p.root().join(&rel).exists(), "`{rel}` is not there");
+    Ok(rel)
+}
+
+/// Where a file came from, and the person's verdict on it.
+fn data_entry(args: &Value, p: &Project) -> Result<Entry> {
+    let path = in_project(p, &required(args, "path", "the data's file or folder")?)?;
+    let words = words(args, "where the data came from, and what they think of it")?;
+    let verdict = optional(args, "verdict");
+    anyhow::ensure!(
+        verdict.is_empty() || DATA_VERDICTS.contains(&verdict.as_str()),
+        "a data `verdict` is one of {}, not `{verdict}`",
+        DATA_VERDICTS.join(", ")
+    );
+    p.provenance("notebook", &p.root().join(&path), &words);
+    p.ledger(DATA, &[vec![path.clone(), verdict.clone(), words.clone()]]);
+    let head = match verdict.as_str() {
+        "" => format!("`{path}`"),
+        v => format!("`{path}`, verdict: {v}"),
+    };
+    let told = verdict.is_empty().then(|| {
+        format!(
+            "Recorded where {path} came from. Its verdict is not given: show the person \
+             the quality checks, say what argues against the data, and ask whether it is \
+             good, has caveats, or is bad."
+        )
+    });
+    Ok(("data".into(), format!("{head}\n\n{}", quote(&words)), told))
+}
+
+/// The person's hypothesis, new or revised, numbered for the project.
+fn hypothesis_entry(args: &Value, p: &Project) -> Result<Entry> {
+    let hyps = evidence::hypotheses(&p.read_ledger(evidence::HYPOTHESES));
+    let rivals: Vec<String> = match &args["rivals"] {
+        Value::Null => Vec::new(),
+        Value::String(s) => vec![s.trim().to_string()],
+        Value::Array(a) => a
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => anyhow::bail!("`rivals` is a list of what else could explain it"),
+    };
+    let rivals = project::one_line(&rivals.join("; "));
+    let nullify = project::one_line(&optional(args, "nullify"));
+    let claim = args["words"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let (h, label) = if args["hypothesis"].is_null() {
+        let Some(claim) = claim else {
+            anyhow::bail!(
+                "`words` is required: the person's claim, as they put it (this rather than \
+                 that); ask them, and record what they say"
+            );
+        };
+        let id = hyps.iter().map(|h| h.id).max().unwrap_or(0) + 1;
+        let h = evidence::Hypothesis {
+            id,
+            claim: project::one_line(claim),
+            rivals,
+            nullify,
+        };
+        (h, format!("hypothesis H{id}"))
+    } else {
+        let old = evidence::find(args, &hyps)?.clone();
+        let h = evidence::Hypothesis {
+            id: old.id,
+            claim: claim.map_or(old.claim, project::one_line),
+            rivals: if rivals.is_empty() {
+                old.rivals
+            } else {
+                rivals
+            },
+            nullify: if nullify.is_empty() {
+                old.nullify
+            } else {
+                nullify
+            },
+        };
+        let label = format!("hypothesis H{} (revised)", h.id);
+        (h, label)
+    };
+    p.ledger(
+        evidence::HYPOTHESES,
+        &[vec![
+            format!("H{}", h.id),
+            format!("the person, notebook {}", project::now().1),
+            h.claim.clone(),
+            h.rivals.clone(),
+            h.nullify.clone(),
+        ]],
+    );
+    let mut text = quote(&h.claim);
+    if !h.rivals.is_empty() {
+        text.push_str(&format!("\n\nRivals they named: {}", h.rivals));
+    }
+    if !h.nullify.is_empty() {
+        text.push_str(&format!("\n\nWould nullify it: {}", h.nullify));
+    }
+    let mut told = format!("Recorded as H{}.", h.id);
+    if h.rivals.is_empty() {
+        told.push_str(
+            " Ask the person what else could explain it, and record their answer as \
+             `rivals` (revise with `hypothesis`).",
+        );
+    }
+    if h.nullify.is_empty() {
+        told.push_str(
+            " Ask what result would make them drop it, before looking further; record it \
+             as `nullify`.",
+        );
+    }
+    Ok((label, text, Some(told)))
+}
+
+/// What one source says of one hypothesis, and why the person judges it so;
+/// the agent is given the hypothesis's table, the verb it allows, and the
+/// sources not yet used.
 fn evidence_entry(args: &Value, p: &Project) -> Result<Entry> {
     let hyps = evidence::hypotheses(&p.read_ledger(evidence::HYPOTHESES));
     let mut all = evidence::evidence(&p.read_ledger(evidence::EVIDENCE));
     let (h, e) = evidence::check(args, &hyps, &all)?;
     p.ledger(evidence::EVIDENCE, &[e.cells()]);
     let head = format!(
-        "H{} from {} ({}): {}.\n\n{}",
+        "H{} from {} ({}): {}.\n\n{}\n\n{}",
         h.id,
         e.source,
-        e.class.replace('_', " "),
+        evidence::what(&e.class).0,
         e.verdict,
-        e.summary
+        e.summary,
+        quote(&e.why)
     );
+    let label = format!("evidence H{}", h.id);
     all.push(e);
     let table = evidence::table(h, &all);
     let text = format!("{head}\n\n{table}");
     let reply = format!("{table}\n\n{}", evidence::next(h, &all));
-    Ok(("evidence".into(), text, Some(reply)))
+    Ok((label, text, Some(reply)))
 }
 
-/// What the user was last asked today: readings to choose among (an
-/// agent's `interpretation`), or other options (an `offer`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Asked {
-    Readings,
-    Options,
-}
-
-impl Asked {
-    /// The reply kind, what it was asked in, and what its numbers are.
-    fn names(self) -> (&'static str, &'static str, &'static str) {
-        match self {
-            Asked::Readings => ("answer", "proposal", "reading"),
-            Asked::Options => ("choice", "offer", "option"),
+/// An output the person keeps for the paper: its number, its claim and
+/// its take-home.
+fn figure_entry(args: &Value, p: &Project) -> Result<Entry> {
+    let output = in_project(p, &required(args, "output", "the image or table to keep")?)?;
+    let number = project::one_line(&required(
+        args,
+        "number",
+        "its number in the paper, as the person gives it (2B, S1)",
+    )?);
+    let take_home = words(args, "the figure's take-home, what a reader should see")?;
+    let hypothesis = match &args["hypothesis"] {
+        Value::Null => String::new(),
+        _ => {
+            let hyps = evidence::hypotheses(&p.read_ledger(evidence::HYPOTHESES));
+            format!("H{}", evidence::find(args, &hyps)?.id)
         }
-    }
-}
-
-/// The user's reply to the question it answers, today's latest: the
-/// numbers they chose (`chose`) and their reply as they gave it (`words`).
-/// An `answer` replies to a proposal: readings chosen, it was accepted;
-/// none, the user set it aside for their own. A `choice` replies to an
-/// offer.
-fn reply_entry(asked: Asked, args: &Value, p: &Project) -> Result<Entry> {
-    let (reply, question, number) = asked.names();
-    let today = p.notebook_today();
-    let Some((last, time, server, items)) = latest_question(&today) else {
-        anyhow::bail!(
-            "there is no {question} today to {reply}; record the user's own words as a \
-             `note` with `by` `user`"
-        );
     };
-    if waiting(&today).is_none() {
-        let (_, theirs, _) = last.names();
-        anyhow::bail!(
-            "the {theirs} of {time} ({server}) has its reply already, and no question waits \
-             now: record the user's words as a `note` with `by` `user`, or put a new \
-             question to them"
-        );
-    }
-    if last != asked {
-        let (right, theirs, _) = last.names();
-        anyhow::bail!(
-            "the latest question today is the {theirs} of {time} ({server}): record the \
-             reply to it as `{right}` (a reply to an earlier question is a `note` with \
-             `by` `user`)"
-        );
-    }
-    let words = args["words"].as_str().map(str::trim).unwrap_or_default();
-    anyhow::ensure!(
-        !words.is_empty(),
-        "`words` is required: the user's reply exactly as they gave it"
+    p.ledger(
+        FIGURES,
+        &[vec![
+            number.clone(),
+            output.clone(),
+            hypothesis.clone(),
+            project::one_line(&take_home),
+        ]],
     );
-    let count = items.len();
-    let given: &[Value] = match &args["chose"] {
-        Value::Null => &[],
-        Value::Array(a) => a,
-        // One number, as a small model may send it.
-        one @ Value::Number(_) => std::slice::from_ref(one),
-        other => anyhow::bail!(
-            "`chose` is a list of {number} numbers of the {question} of {time} (1 to \
-             {count}), not {other}; leave it out when the user chose none"
-        ),
-    };
-    let mut chose: Vec<usize> = Vec::new();
-    for n in given {
-        match n.as_u64() {
-            Some(n) if (1..=count as u64).contains(&n) => {
-                if !chose.contains(&(n as usize)) {
-                    chose.push(n as usize);
-                }
-            }
-            _ => anyhow::bail!(
-                "`chose` takes {number} numbers of the {question} of {time} (1 to {count}), \
-                 not {n}"
-            ),
-        }
+    let mut text = format!("`{output}`");
+    if !hypothesis.is_empty() {
+        text.push_str(&format!(", for {hypothesis}"));
     }
-    let head = format!("Answers the {question} of {time} ({server})");
-    let mut told = None;
-    let (label, what) = match (asked, chose.is_empty()) {
-        (Asked::Readings, true) => (
-            "interpretation (user override)",
-            format!("{head}: set aside."),
-        ),
-        (Asked::Readings, false) => {
-            let named = hypotheses_from(p, &chose, &items, &time, &server);
-            let names: Vec<String> = chose.iter().map(|n| format!("R{n}")).collect();
-            told = Some(format!(
-                "{}. Record what each source of evidence says of a hypothesis as `evidence`.",
-                named.join(", ")
-            ));
-            (
-                "interpretation (accepted by the user)",
-                format!(
-                    "{head}: chose {}. Hypotheses: {}.",
-                    names.join(", "),
-                    named.join(", ")
-                ),
-            )
-        }
-        (Asked::Options, true) => ("choice (user)", format!("{head}: chose none.")),
-        (Asked::Options, false) => {
-            let names: Vec<String> = chose.iter().map(ToString::to_string).collect();
-            (
-                "choice (user)",
-                format!("{head}: chose {}.", names.join(", ")),
-            )
-        }
-    };
-    let quoted: Vec<String> = words.lines().map(|l| format!("> {l}")).collect();
-    Ok((
-        label.into(),
-        format!("{what}\n\n{}", quoted.join("\n")),
-        told,
-    ))
-}
-
-/// The chosen readings as the project's hypotheses, `R1 = H4`: a claim
-/// already among them keeps its number, a new one is added to the ledger.
-fn hypotheses_from(
-    p: &Project,
-    chose: &[usize],
-    claims: &[String],
-    time: &str,
-    server: &str,
-) -> Vec<String> {
-    // The claims numbered so far, with those this answer adds.
-    let mut known: Vec<(usize, String)> =
-        evidence::hypotheses(&p.read_ledger(evidence::HYPOTHESES))
-            .into_iter()
-            .map(|h| (h.id, h.claim))
-            .collect();
-    let mut next = known.iter().map(|h| h.0).max().unwrap_or(0);
-    let mut rows = Vec::new();
-    let named = chose
-        .iter()
-        .map(|&n| {
-            let claim = &claims[n - 1];
-            let id = match known.iter().find(|h| &h.1 == claim) {
-                Some(h) => h.0,
-                None => {
-                    next += 1;
-                    rows.push(vec![
-                        format!("H{next}"),
-                        format!("R{n} of the proposal of {time} ({server})"),
-                        claim.clone(),
-                    ]);
-                    known.push((next, claim.clone()));
-                    next
-                }
-            };
-            format!("R{n} = H{id}")
-        })
-        .collect();
-    if !rows.is_empty() {
-        p.ledger(evidence::HYPOTHESES, &rows);
-    }
-    named
+    text.push_str(&format!("\n\n{}", quote(&take_home)));
+    let told = hypothesis.is_empty().then(|| {
+        format!(
+            "Kept as {number}. It supports no hypothesis yet: ask the person which claim it \
+             supports, and how strongly."
+        )
+    });
+    Ok((format!("figure {number}"), text, told))
 }
 
 /// The entries of a day's notebook, each from its heading's text
@@ -463,193 +395,9 @@ pub(crate) fn entries(notebook: &str) -> Vec<&str> {
         .collect()
 }
 
-/// The last question in `notebook` a reply can answer: a proposal with
-/// numbered readings (an old `conclusion` has none) or an offer, with its
-/// time, its server, and its readings' claims or its options, in order.
-fn latest_question(notebook: &str) -> Option<(Asked, String, String, Vec<String>)> {
-    entries(notebook).into_iter().rev().find_map(question)
-}
-
-/// The question `entry` asks, if it is one.
-fn question(entry: &str) -> Option<(Asked, String, String, Vec<String>)> {
-    let (head, body) = entry.split_once('\n')?;
-    let mut head = head.splitn(3, " · ");
-    let (time, server, label) = (head.next()?, head.next()?, head.next()?);
-    let (asked, prefix) = match label {
-        "interpretation (proposed)" => (Asked::Readings, "**R"),
-        "offer" => (Asked::Options, "- **"),
-        _ => return None,
-    };
-    let items: Vec<String> = body
-        .lines()
-        .filter_map(|l| {
-            let r = l.strip_prefix(prefix)?;
-            let digits = r.len() - r.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-            let item = r[digits..].strip_prefix('.').filter(|_| digits > 0)?;
-            // `**R1. claim**`, `- **1.** option`
-            let item = item.strip_prefix("**").unwrap_or(item).trim();
-            Some(item.strip_suffix("**").unwrap_or(item).trim().to_string())
-        })
-        .collect();
-    (!items.is_empty()).then(|| (asked, time.to_string(), server.to_string(), items))
-}
-
-/// Today's last question with no reply after it, if any.
-fn waiting(notebook: &str) -> Option<(Asked, String, String, Vec<String>)> {
-    for entry in entries(notebook).into_iter().rev() {
-        let head = entry.lines().next().unwrap_or_default();
-        let label = head.splitn(3, " · ").nth(2).unwrap_or_default();
-        if label.starts_with("interpretation (accepted")
-            || label.starts_with("interpretation (user override")
-            || label == "choice (user)"
-        {
-            return None;
-        }
-        // An old `conclusion` asks nothing: an older question may wait.
-        if let Some(q) = question(entry) {
-            return Some(q);
-        }
-    }
-    None
-}
-
-/// The question in `notebook` still waiting for the user's reply, if any:
-/// today's last proposal or offer with no reply after it.
-pub(crate) fn open_question(notebook: &str) -> Option<String> {
-    let (asked, time, server, items) = waiting(notebook)?;
-    let (reply, question, _) = asked.names();
-    Some(format!(
-        "the {question} of {time} ({server}), to record as `{reply}`: {}",
-        numbered(asked, &items, &[]).join(" / ")
-    ))
-}
-
-/// The waiting question's items, numbered as the user sees them (only
-/// `chose` when it names any).
-fn numbered(asked: Asked, items: &[String], chose: &[usize]) -> Vec<String> {
-    items
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| chose.is_empty() || chose.contains(&(i + 1)))
-        .map(|(i, t)| match asked {
-            Asked::Readings => format!("R{}. {t}", i + 1),
-            Asked::Options => format!("{}. {t}", i + 1),
-        })
-        .collect()
-}
-
-/// A reply choosing `chose` of the question waiting in `notebook`, in
-/// words, for the user to confirm: what they chose, or that they chose
-/// none of it.
-#[cfg_attr(not(feature = "chat"), allow(dead_code))]
-pub(crate) fn reply_in_words(notebook: &str, chose: &[usize]) -> Option<String> {
-    let (asked, time, _, items) = waiting(notebook)?;
-    let (_, question, number) = asked.names();
-    if chose.is_empty() {
-        return Some(format!("none of the {number}s of the {question} of {time}"));
-    }
-    let named = numbered(asked, items.as_slice(), chose);
-    (!named.is_empty()).then(|| named.join(" / "))
-}
-
-/// An agent's offer: choices put to the user that are not readings (which
-/// step next, whether to look further), numbered 1, 2, ... for a `choice`.
-fn offer_entry(args: &Value) -> Result<(String, String)> {
-    let options: Vec<String> = match &args["options"] {
-        Value::Array(o) => o
-            .iter()
-            .map(|o| match o.as_str().map(str::trim) {
-                Some(o) if !o.is_empty() => Ok(project::one_line(o)),
-                _ => anyhow::bail!("each of `options` is a line of text"),
-            })
-            .collect::<Result<_>>()?,
-        _ => vec![],
-    };
-    anyhow::ensure!(
-        options.len() >= 2,
-        "an offer puts two or more `options` to the user (stopping can be one)"
-    );
-    let mut text = args["text"]
-        .as_str()
-        .unwrap_or_default()
-        .trim_end()
-        .to_string();
-    if !text.is_empty() {
-        text.push_str("\n\n");
-    }
-    for (i, o) in options.iter().enumerate() {
-        text.push_str(&format!("- **{}.** {o}\n", i + 1));
-    }
-    Ok(("offer".into(), text))
-}
-
-/// One proposed reading, checked: its claim, and the lines that go
-/// under it.
-fn reading(r: &Value) -> Result<(String, String)> {
-    let field = |name: &str| -> Result<String> {
-        match r[name].as_str().map(str::trim) {
-            Some(s) if !s.is_empty() => Ok(project::one_line(s)),
-            _ => anyhow::bail!(
-                "each reading needs `claim`, `rationale` and `check`; `{name}` is missing"
-            ),
-        }
-    };
-    let claim = field("claim")?;
-    let mut lines = String::new();
-    let evidence: Vec<String> = r["evidence"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(
-            |e| match (e["kind"].as_str(), e["term"].as_str(), e.as_str()) {
-                (Some(k), Some(t), _) => format!("{k} {t}"),
-                (_, _, Some(s)) => s.to_string(),
-                _ => e.to_string(),
-            },
-        )
-        .collect();
-    if !evidence.is_empty() {
-        lines.push_str(&format!(
-            "- Evidence: {}\n",
-            project::one_line(&evidence.join("; "))
-        ));
-    }
-    for a in r["alternatives"].as_array().into_iter().flatten() {
-        let label = a["label"].as_str().unwrap_or_default();
-        let why = a["why_not"].as_str().unwrap_or_default();
-        lines.push_str(&format!(
-            "- Not {}: {}\n",
-            project::one_line(label),
-            project::one_line(why)
-        ));
-    }
-    lines.push_str(&format!("- Rationale: {}\n", field("rationale")?));
-    lines.push_str(&format!("- Check: {}", field("check")?));
-    Ok((claim, lines))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const DAY: &str = "# Notebook, 2026-10-28\n\nThe agents' account.\n\
-\n## 10:00:00 · legume · offer\n\nNext?\n\n- **1.** Held-out donors\n- **2.** Stop\n\
-\n## 10:01:00 · legume · interpretation (proposed)\n\nContext:\n## Background\nmore\n\n\
-**R1. IFN drives topic 7**\n- Rationale: r\n\n**R2. Donor 2 carries it**\n- Rationale: r\n";
-
-    #[test]
-    fn a_heading_in_an_entrys_text_stays_in_the_entry() {
-        let e = entries(DAY);
-        assert_eq!(e.len(), 2, "{e:?}");
-        assert!(
-            e[1].contains("## Background") && e[1].contains("**R2."),
-            "{}",
-            e[1]
-        );
-        let (asked, time, _, items) = latest_question(DAY).unwrap();
-        assert_eq!((asked, time.as_str()), (Asked::Readings, "10:01:00"));
-        assert_eq!(items, ["IFN drives topic 7", "Donor 2 carries it"]);
-    }
 
     fn project() -> (tempfile::TempDir, Project) {
         let dir = tempfile::tempdir().unwrap();
@@ -658,54 +406,143 @@ mod tests {
     }
 
     /// The entry `args` makes, recorded as the server records it.
-    fn record(p: &Project, args: Value, full: bool) -> Result<String> {
-        let (label, text, _) = notebook_entry(&args, p, full)?;
+    fn record(p: &Project, args: Value) -> Result<(String, Option<String>)> {
+        let (label, text, told) = notebook_entry(&args, p)?;
         p.notebook(&label, &text);
-        Ok(label)
+        Ok((label, told))
     }
 
     #[test]
-    fn no_entry_claims_to_be_the_users_by_its_kind_or_a_tools_by() {
+    fn the_persons_kinds_take_only_their_words() {
         let (_dir, p) = project();
-        for kind in [
-            "interpretation (accepted by the user)",
-            "plan\n## 10:00:00 · x · offer",
-        ] {
-            let e = record(&p, json!({ "kind": kind, "text": "t" }), true).unwrap_err();
-            assert!(e.to_string().contains("`kind` is one of"), "{e}");
+        for kind in ["plan", "summary", "hypothesis"] {
+            let e = record(&p, json!({ "kind": kind, "text": "the agent's version" })).unwrap_err();
+            assert!(e.to_string().contains("`words` is required"), "{kind}: {e}");
         }
-        let accepted =
-            json!({ "kind": "conclusion", "by": "agent_proposed_user_accepted", "text": "t" });
-        let e = record(&p, accepted.clone(), false).unwrap_err();
-        assert!(e.to_string().contains("`by` is one of agent, user"), "{e}");
-        // The `legume` server takes lupin's values.
-        assert_eq!(
-            record(&p, accepted, true).unwrap(),
-            "interpretation (accepted by the user)"
-        );
+        for kind in ["interpretation", "answer", "offer", "choice", "conclusion"] {
+            let e = record(&p, json!({ "kind": kind, "text": "t" })).unwrap_err();
+            assert!(e.to_string().contains("`kind` is one of"), "{kind}: {e}");
+        }
+        let e = record(
+            &p,
+            json!({ "kind": "note", "text": "t", "by": "agent_proposed_user_accepted" }),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("`by` is agent or user"), "{e}");
+        record(
+            &p,
+            json!({ "kind": "plan", "words": "Why is cluster 4 apart, rather than with 2?" }),
+        )
+        .unwrap();
+        assert!(p
+            .notebook_today()
+            .contains(" · legume · plan\n\n> Why is cluster 4 apart"));
     }
 
     #[test]
-    fn a_question_is_answered_once() {
+    fn a_hypothesis_asks_for_its_rivals_and_what_would_nullify_it() {
         let (_dir, p) = project();
-        let reading = |c: &str| json!({ "claim": c, "rationale": "r", "check": "c" });
-        let propose = json!({ "kind": "interpretation", "readings": [reading("A"), reading("B")] });
-        record(&p, propose, true).unwrap();
-        assert_eq!(reply_in_words(&p.notebook_today(), &[2]).unwrap(), "R2. B");
-        let answer = json!({ "kind": "answer", "chose": [1], "words": "1" });
-        record(&p, answer.clone(), true).unwrap();
-        assert!(reply_in_words(&p.notebook_today(), &[2]).is_none());
-        let e = record(&p, answer, true).unwrap_err();
-        assert!(e.to_string().contains("has its reply already"), "{e}");
+        let (label, told) = record(
+            &p,
+            json!({ "kind": "hypothesis", "words": "Cluster 4 is stressed monocytes" }),
+        )
+        .unwrap();
+        assert_eq!(label, "hypothesis H1");
+        let told = told.unwrap();
+        assert!(
+            told.contains("what else could explain it") && told.contains("make them drop it"),
+            "{told}"
+        );
+        let (label, told) = record(
+            &p,
+            json!({ "kind": "hypothesis", "hypothesis": "H1", "rivals": ["damaged cells", "a sample artefact"], "nullify": "no heat-shock genes in sample 2" }),
+        )
+        .unwrap();
+        assert_eq!(label, "hypothesis H1 (revised)");
+        assert_eq!(told.unwrap(), "Recorded as H1.");
+        let h = evidence::hypotheses(&p.read_ledger(evidence::HYPOTHESES));
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].claim, "Cluster 4 is stressed monocytes");
+        assert_eq!(h[0].rivals, "damaged cells; a sample artefact");
+        let (label, _) = record(
+            &p,
+            json!({ "kind": "hypothesis", "words": "Donor 2 carries cluster 4" }),
+        )
+        .unwrap();
+        assert_eq!(label, "hypothesis H2");
     }
 
     #[test]
-    fn an_old_conclusion_does_not_hide_an_open_offer() {
-        let day = format!(
-            "{}\n## 10:02:00 · senna · interpretation (proposed)\n\nTopic 7 is IFN.\n",
-            &DAY[..DAY.find("\n## 10:01").unwrap()]
+    fn evidence_is_judged_by_the_person() {
+        let (_dir, p) = project();
+        record(
+            &p,
+            json!({ "kind": "hypothesis", "words": "IFN drives topic 7" }),
+        )
+        .unwrap();
+        let mut ev = json!({ "kind": "evidence", "hypothesis": "H1", "source": "donors 5-6", "class": "other_donors", "verdict": "agrees", "text": "5 of 6 higher" });
+        let e = record(&p, ev.clone()).unwrap_err();
+        assert!(e.to_string().contains("`words` is required"), "{e}");
+        ev["words"] = json!("held-out donors show it too");
+        let (label, told) = record(&p, ev).unwrap();
+        assert_eq!(label, "evidence H1");
+        let told = told.unwrap();
+        assert!(told.contains("| held-out donors show it too |"), "{told}");
+        assert!(
+            told.contains("has not said what would nullify H1"),
+            "{told}"
         );
-        let open = open_question(&day).unwrap();
-        assert!(open.starts_with("the offer of 10:00:00 (legume)"), "{open}");
+    }
+
+    #[test]
+    fn data_and_figures_are_the_persons_and_in_the_project() {
+        let (dir, p) = project();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        std::fs::write(dir.path().join("data/a.h5"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join("results")).unwrap();
+        std::fs::write(dir.path().join("results/umap.png"), "x").unwrap();
+        let e = record(
+            &p,
+            json!({ "kind": "data", "path": "../etc/passwd", "words": "w" }),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("not inside the project"), "{e}");
+        let (_, told) = record(
+            &p,
+            json!({ "kind": "data", "path": "data/a.h5", "words": "10x PBMC from the core" }),
+        )
+        .unwrap();
+        assert!(told.unwrap().contains("ask whether it is good"));
+        record(
+            &p,
+            json!({ "kind": "data", "path": "data/a.h5", "words": "fine, but one donor", "verdict": "caveats" }),
+        )
+        .unwrap();
+        let readme = std::fs::read_to_string(dir.path().join("data/README.md")).unwrap();
+        assert!(
+            readme.contains("`data/a.h5`: 10x PBMC from the core"),
+            "{readme}"
+        );
+        let (label, told) = record(
+            &p,
+            json!({ "kind": "figure", "output": "results/umap.png", "number": "2B", "words": "cluster 4 sits apart" }),
+        )
+        .unwrap();
+        assert_eq!(label, "figure 2B");
+        assert!(told.unwrap().contains("supports no hypothesis yet"));
+        let figures = p.read_ledger(FIGURES);
+        assert!(
+            figures.contains("\t2B\tresults/umap.png\t\tcluster 4 sits apart"),
+            "{figures}"
+        );
+    }
+
+    #[test]
+    fn a_heading_in_an_entrys_text_stays_in_the_entry() {
+        let day = "# Notebook\n\n## 10:00:00 · legume · plan\n\n> Why?\n## Background\nmore\n\n\
+                   ## 10:01:00 · legume · observation\n\nsaw\n";
+        let e = entries(day);
+        assert_eq!(e.len(), 2, "{e:?}");
+        assert!(e[0].contains("## Background"), "{}", e[0]);
     }
 }

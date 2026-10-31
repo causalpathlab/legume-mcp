@@ -15,7 +15,6 @@
 //!   results/<YYYY-MM-DD>/
 //!     runall.sh              the day's steps from every server, in order
 //!     notebook.md            the agents' account: plan, observations, interpretation
-//!     chat.md                `legume chat`'s conversations, with the model each used
 //!     …                      the tools' default outputs
 //! ```
 //!
@@ -57,20 +56,40 @@ pub const OFF_ENV: &str = "LEGUME_MCP_RECORDS";
 pub const INDEX_HEAD: &str = "date\ttime\tserver\ttool\toutput\tsummary\tinputs\tfacts";
 const INDEX_HEAD_BEFORE_0_5: &str = "date\ttime\tserver\ttool\toutput\tsummary";
 
-/// The project's folder: [`ROOT_ENV`], else the working directory, as an
-/// absolute path (records kept or not).
+/// The folder `legume init` makes in a project, which marks it.
+pub const MARK: &str = ".legume";
+
+/// The project's folder: [`ROOT_ENV`]; else the nearest folder, from the
+/// working directory up, that `legume init` marked ([`MARK`]), so an agent
+/// started in a subfolder keeps the same records; else the working
+/// directory. Absolute (records kept or not).
 pub fn root() -> Option<PathBuf> {
     match std::env::var_os(ROOT_ENV) {
         Some(v) if !v.is_empty() => std::path::absolute(v).ok(),
-        _ => std::env::current_dir().ok(),
+        _ => std::env::current_dir().ok().map(|here| marked(&here)),
     }
 }
 
-/// The project whose records a server keeps, as [`ROOT_ENV`] and
-/// [`OFF_ENV`] say: [`root`], or none when records are `off`. Absolute, so
-/// a server that changes into it reads the same folder from inside.
+/// The nearest folder from `here` up that holds [`MARK`], else `here`.
+fn marked(here: &Path) -> PathBuf {
+    here.ancestors()
+        .find(|d| std::fs::symlink_metadata(d.join(MARK)).is_ok_and(|m| m.is_dir()))
+        .unwrap_or(here)
+        .to_path_buf()
+}
+
+/// The project whose records a server that stays where it started keeps,
+/// as [`ROOT_ENV`] and [`OFF_ENV`] say: that folder, or none when records
+/// are `off`. Not a marked folder above it ([`root`]): the server reads
+/// relative paths from where it is, and `runall.sh` replays them from the
+/// project. Absolute, so a server that changes into it reads the same
+/// folder from inside.
 pub fn root_from_env() -> Option<PathBuf> {
-    records_on().then(root).flatten()
+    let here = match std::env::var_os(ROOT_ENV) {
+        Some(v) if !v.is_empty() => std::path::absolute(v).ok(),
+        _ => std::env::current_dir().ok(),
+    };
+    records_on().then_some(here).flatten()
 }
 
 /// Whether records are kept: [`OFF_ENV`] is not `off`.
@@ -102,9 +121,10 @@ pub(crate) struct Project {
     feed: Option<Arc<Feed>>,
 }
 
-/// Local date and time, `YYYY-MM-DD` and `HH:MM:SS`, and the offset from
-/// UTC in seconds (UTC where the local time cannot be had).
-fn local_now() -> (String, String, i64) {
+/// Local date and time, `YYYY-MM-DD` and `HH:MM:SS`, the offset from UTC
+/// in seconds (UTC where the local time cannot be had), and the seconds
+/// since 1970.
+fn local_now() -> (String, String, i64, u64) {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -125,22 +145,32 @@ fn local_now() -> (String, String, i64) {
                 // c_long: i64 on 64-bit targets, i32 on 32-bit ones.
                 #[allow(clippy::useless_conversion)]
                 i64::from(tm.tm_gmtoff),
+                secs,
             );
         }
     }
     let (d, t) = utc(secs);
-    (d, t, 0)
+    (d, t, 0, secs)
 }
 
-/// Local date and time, `YYYY-MM-DD` and `HH:MM:SS`.
+/// When a working day turns over: work until 5 in the morning belongs to
+/// the day before, so a late night stays one day.
+const DAY_TURNS: i64 = 5 * 3_600;
+
+/// The working day and the local time, `YYYY-MM-DD` and `HH:MM:SS`.
 pub(crate) fn now() -> (String, String) {
-    let (d, t, _) = local_now();
-    (d, t)
+    let (_, t, off, secs) = local_now();
+    (working_day(secs, off), t)
+}
+
+/// The working day of `secs` at `off` from UTC.
+fn working_day(secs: u64, off: i64) -> String {
+    utc((secs as i64 + off - DAY_TURNS).max(0) as u64).0
 }
 
 /// Now, local, as RFC 3339 (`2026-10-20T12:03:33-07:00`).
 pub(crate) fn rfc3339() -> String {
-    let (d, t, off) = local_now();
+    let (d, t, off, _) = local_now();
     let sign = if off < 0 { '-' } else { '+' };
     let off = off.abs();
     format!("{d}T{t}{sign}{:02}:{:02}", off / 3600, off % 3600 / 60)
@@ -174,6 +204,7 @@ impl Project {
     }
 
     /// Today's `notebook.md` as written so far; empty when there is none.
+    #[cfg(test)]
     pub(crate) fn notebook_today(&self) -> String {
         read_record(&self.root.join("results").join(now().0).join("notebook.md"))
     }
@@ -497,23 +528,6 @@ impl Project {
         read_record(&self.root.join("results").join(file))
     }
 
-    /// Lines of today's `chat.md`: what the person said to a model in
-    /// `legume chat`, what it called and what it answered.
-    #[cfg_attr(not(feature = "chat"), allow(dead_code))]
-    pub(crate) fn chat(&self, text: &str) {
-        let Ok(dir) = self.day_dir() else { return };
-        let head = || {
-            format!(
-                "# Chat, {}\n\n\
-                 What the person said to a model in `legume chat`, what it called and what it\n\
-                 answered. The steps are in `runall.sh`, which repeats them without the model;\n\
-                 the reasoning is in `notebook.md`.\n",
-                now().0
-            )
-        };
-        self.append(&dir.join("chat.md"), 0o644, head, text);
-    }
-
     /// An entry in today's `notebook.md`.
     pub(crate) fn notebook(&self, kind: &str, text: &str) {
         let Ok(dir) = self.day_dir() else { return };
@@ -521,8 +535,9 @@ impl Project {
         let head = || {
             format!(
                 "# Notebook, {date}\n\n\
-                 The agents' account of the day's work: what was asked, done, seen and\n\
-                 made of it. The facts are in the tools' outputs and `runall.sh`.\n"
+                 The day's work: what was done and seen, and, quoted, everything the\n\
+                 person asked, judged and concluded, in their words. The facts are in\n\
+                 the tools' outputs and `runall.sh`.\n"
             )
         };
         let entry = format!(
@@ -562,6 +577,24 @@ fn own(path: &Path) -> PathBuf {
         .extension()
         .map_or(String::new(), |e| format!(".{}", e.to_string_lossy()));
     path.with_file_name(format!("{stem}-{}{ext}", std::process::id()))
+}
+
+/// `bytes` as the file at `path`, in place of what was there: never
+/// written through a symlink, which is removed as a link.
+pub(crate) fn write_fresh(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use anyhow::Context;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("replacing {}", path.display())),
+    }
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o644);
+    o.open(path)
+        .and_then(|mut f| f.write_all(bytes))
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 /// The bytes of `path` when it is a regular file of this user's that no one
@@ -676,6 +709,12 @@ pub(crate) fn escape(text: &str) -> String {
 }
 
 /// A regular file of this user's that no one else can write.
+/// Whether `path` is a file [`read_trusted`] reads: the user's own, not a
+/// link, and none others can change.
+pub(crate) fn is_trusted(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| trusted(&m))
+}
+
 #[cfg(unix)]
 fn trusted(m: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -890,6 +929,33 @@ mod tests {
         assert_eq!(read_record(&f), "head\nmine\n");
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(read_record(&f), "head\nplanted\nmine\n");
+    }
+
+    #[test]
+    fn a_late_night_is_the_day_before() {
+        // 2026-10-29 01:30 and 05:00 in Vancouver (UTC-7).
+        let off = -7 * 3_600;
+        let at = |h: u64, m: u64| (1_793_232_000 - off) as u64 + h * 3_600 + m * 60;
+        assert_eq!(
+            utc((at(0, 0) as i64 + off) as u64).0,
+            "2026-10-29",
+            "midnight, local"
+        );
+        assert_eq!(working_day(at(1, 30), off), "2026-10-28");
+        assert_eq!(working_day(at(5, 0), off), "2026-10-29");
+        assert_eq!(working_day(at(23, 59), off), "2026-10-29");
+    }
+
+    #[test]
+    fn a_marked_project_is_found_from_a_subfolder() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("analysis/deep");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(dir.path().join(MARK)).unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        assert_eq!(marked(&base.join("analysis/deep")), base);
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert_eq!(marked(elsewhere.path()), elsewhere.path(), "no mark: here");
     }
 
     #[test]

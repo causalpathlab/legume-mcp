@@ -1,21 +1,23 @@
-//! `legume report`: a day's work as slides, built from the records alone,
-//! and `legume graph`: its provenance graph. The slides are Typst source
-//! (`results/<day>/report/report.typ`, beside `graph.svg` and the story),
-//! made into a PDF when `typst` is on the PATH; nothing is installed. The
-//! report's folder is its own: no tool's output is replaced, and a story
-//! replaced is kept (`story.1.md`, ...).
+//! The `legume` server's `report`: a day's work as slides, built from the
+//! records alone, in `results/<day>/report/`: `report.pdf` (typeset by this
+//! program with Typst, nothing installed), `report.md` (the same slides as
+//! text, for any editor), and the trail `graph.svg`: the person's entries,
+//! with what ran under each. The folder is the report's own: no tool's
+//! output is replaced.
 //!
-//! The slides, in order: the title; the story, the one part an agent
-//! writes (labelled as its own); the question (the day's plans); the data
-//! (`data/README.md`); the steps (the graph, then each output with what it
-//! was made from and its numbers, the flagged ones marked); the figures,
-//! each with the line of `runall.sh` that made it; the observations; the
-//! interpretation, the person's (or "not yet interpreted"); each
-//! hypothesis's triangulation table, the verb it allows and the sources not
-//! yet used; and how to replay the work.
+//! The slides, in order: the title; the person's summary of the day, in
+//! their words; their question; the data, with where each file came from
+//! and their verdict; the steps (the graph, then each output with what it
+//! was made from and its numbers, the flagged ones marked); the figures
+//! they kept, then the other images, each with the line of `runall.sh`
+//! that made it; what was seen; each hypothesis, as they put it, with its
+//! rivals, what would nullify it, its sources and the verb they allow; what
+//! is open for the person; and how to replay the work. The agent writes
+//! none of it.
 //!
-//! Every word from the records goes into the source as a Typst string, so
-//! no record, however written, is read as markup or code.
+//! Every word from the records goes into the Typst source as a string and
+//! into the Markdown escaped, so no record, however written, is read as
+//! markup or code.
 
 use crate::evidence;
 use crate::graph::Graph;
@@ -23,45 +25,23 @@ use crate::project::read_record;
 use crate::records::{Entry, Records, Step};
 use anyhow::{Context, Result};
 use std::fmt::Write as _;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// The room for the graph on its slide, in cm: width, height.
-const GRAPH_ROOM: (f64, f64) = (26.5, 10.5);
-
-/// `legume report`'s usage.
-pub const REPORT_USAGE: &str = "\
-legume report [--day YYYY-MM-DD] [--story FILE] [--project DIR] [--no-pdf]
-
-The day's work as slides, from the records, in results/<day>/report/:
-report.typ (Typst) and graph.svg, and report.pdf when typst is on the PATH.
-The story, the one part an agent or a person writes, comes from --story or
-from the folder's story.md (the `legume` server's `report` tool writes it;
-a story replaced is kept as story.1.md, ...); it is labelled as theirs.
-Everything else is read from the records.";
-
-/// `legume graph`'s usage.
-pub const GRAPH_USAGE: &str = "\
-legume graph [--day YYYY-MM-DD | --all] [--format svg|dot|text] [--project DIR]
-
-The provenance graph from results/INDEX.tsv: which files each step read and
-made. The day's steps (today's unless --day; every day's with --all), on
-stdout: SVG (the default), Graphviz DOT, or text.";
+const GRAPH_ROOM: (f64, f64) = (26.0, 10.0);
 
 /// What a report made.
-pub struct Built {
-    pub typ: PathBuf,
-    pub graph: Option<PathBuf>,
+pub(crate) struct Built {
     /// The PDF, or why there is none.
     pub pdf: std::result::Result<PathBuf, String>,
-    /// Whether the slides have a story.
-    pub story: bool,
+    pub md: PathBuf,
+    pub graph: Option<PathBuf>,
+    /// Whether the person summarised the day.
+    pub summary: bool,
 }
 
-/// The report of `day` (today when none) for the project at `root`, with
-/// `story` (else the report's `story.md`, kept from before); `pdf`: make the
-/// PDF when `typst` is on the PATH.
-pub fn build(root: &Path, day: Option<&str>, story: Option<&str>, pdf: bool) -> Result<Built> {
+/// The report of `day` (today when none) for the project at `root`.
+pub(crate) fn build(root: &Path, day: Option<&str>) -> Result<Built> {
     let day = day_of(day)?;
     let dir = root.join("results").join(&day);
     anyhow::ensure!(
@@ -93,124 +73,43 @@ pub fn build(root: &Path, day: Option<&str>, story: Option<&str>, pdf: bool) -> 
     };
     let fresh = |path: &Path, bytes: &[u8]| -> Result<()> {
         unlisted(path)?;
-        write_fresh(path, bytes)
+        crate::project::write_fresh(path, bytes)
     };
-    let story_file = out.join("story.md");
-    if let Some(s) = story {
-        let before = read_record(&story_file);
-        if !before.trim().is_empty() && before.trim_end() != s.trim_end() {
-            keep_aside(&story_file, before.as_bytes())?;
-        }
-        fresh(&story_file, s.trim_end().as_bytes())?;
-    }
-    let story = read_record(&story_file);
     let steps: Vec<&Step> = records.steps.iter().filter(|s| s.date == day).collect();
     // The graph, and how it fits a slide: as wide as the slide when it is
     // wider than the room for it, else as tall.
-    let graph = if steps.is_empty() {
+    let graph = if steps.is_empty() && records.notebook.is_empty() {
         None
     } else {
         let path = out.join("graph.svg");
-        let (svg, w, h) = Graph::of(&steps).drawn();
+        let (svg, w, h) = Graph::of(&steps, &records.notebook).drawn(GRAPH_ROOM.0 / GRAPH_ROOM.1);
         fresh(&path, svg.as_bytes())?;
         Some((path, w / h > GRAPH_ROOM.0 / GRAPH_ROOM.1))
     };
-    let typ = out.join("report.typ");
-    let source = slides(
-        root,
-        &day,
-        &records,
-        &steps,
-        story.trim(),
-        graph.as_ref().map(|g| g.1),
+    let name = root.file_name().map_or_else(
+        || root.display().to_string(),
+        |n| n.to_string_lossy().into(),
     );
-    fresh(&typ, source.as_bytes())?;
-    let pdf = if pdf {
-        unlisted(&typ.with_extension("pdf"))?;
-        compile(root, &typ)
-    } else {
-        Err("not asked for (--no-pdf)".into())
-    };
+    let deck = slides(root, &day, &records, &steps, graph.as_ref().map(|g| g.1));
+    let md = out.join("report.md");
+    fresh(&md, markdown(&deck, &name, &day).as_bytes())?;
+    let pdf_path = out.join("report.pdf");
+    unlisted(&pdf_path)?;
+    let pdf = pdf(root, &typst(&deck, &name, &day)).and_then(|bytes| {
+        crate::project::write_fresh(&pdf_path, &bytes)
+            .map(|()| pdf_path.clone())
+            .map_err(|e| format!("{e:#}"))
+    });
+    if pdf.is_err() {
+        // An earlier build's slides would disagree with report.md.
+        let _ = std::fs::remove_file(&pdf_path);
+    }
     Ok(Built {
-        typ,
-        graph: graph.map(|g| g.0),
         pdf,
-        story: !story.trim().is_empty(),
+        md,
+        graph: graph.map(|g| g.0),
+        summary: records.notebook.iter().any(|e| e.kind == "summary"),
     })
-}
-
-/// The provenance graph of `day` (today when none; every day with `all`)
-/// as `format`: `svg`, `dot` or `text`.
-pub fn graph(root: &Path, day: Option<&str>, all: bool, format: &str) -> Result<String> {
-    let day = day_of(day)?;
-    let records = Records::read(root, &day);
-    let steps: Vec<&Step> = records
-        .steps
-        .iter()
-        .filter(|s| all || s.date == day)
-        .collect();
-    let g = Graph::of(&steps);
-    Ok(match format {
-        "svg" => g.svg(),
-        "dot" => g.dot(),
-        "text" if steps.is_empty() => format!("No steps recorded for {day}.\n"),
-        "text" => g.text(),
-        other => anyhow::bail!("--format is svg, dot or text, not {other}"),
-    })
-}
-
-/// `legume report ...` and `legume graph ...` on the command line.
-pub fn main(command: &str, args: &[String], out: &mut dyn std::io::Write) -> Result<()> {
-    let mut day = None;
-    let mut story = None;
-    let mut project = None;
-    let mut format = "svg".to_string();
-    let mut all = false;
-    let mut pdf = true;
-    let usage = if command == "graph" {
-        GRAPH_USAGE
-    } else {
-        REPORT_USAGE
-    };
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        let mut value = |what: &str| {
-            it.next()
-                .cloned()
-                .with_context(|| format!("{a} needs {what}"))
-        };
-        match (command, a.as_str()) {
-            (_, "--day") => day = Some(value("a day, YYYY-MM-DD")?),
-            (_, "--project") => project = Some(PathBuf::from(value("a folder")?)),
-            ("report", "--story") => {
-                let path = value("a file")?;
-                story = Some(
-                    std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?,
-                )
-            }
-            ("report", "--no-pdf") => pdf = false,
-            ("graph", "--format") => format = value("svg, dot or text")?,
-            ("graph", "--all") => all = true,
-            (_, "-h" | "--help") => {
-                writeln!(out, "{usage}")?;
-                return Ok(());
-            }
-            _ => anyhow::bail!("unknown argument {a}\n\n{usage}"),
-        }
-    }
-    let root = match project {
-        Some(p) => crate::absolute(&p),
-        None => crate::project::root_from_env()
-            .map_or_else(std::env::current_dir, Ok)
-            .context("the project folder")?,
-    };
-    if command == "graph" {
-        write!(out, "{}", graph(&root, day.as_deref(), all, &format)?)?;
-        return Ok(());
-    }
-    let built = build(&root, day.as_deref(), story.as_deref(), pdf)?;
-    writeln!(out, "{}", said(&root, &built))?;
-    Ok(())
 }
 
 /// What was made, in words, paths from the project.
@@ -221,23 +120,18 @@ pub(crate) fn said(root: &Path, b: &Built) -> String {
             .to_string_lossy()
             .into_owned()
     };
-    let mut out = format!("Slides: {}", rel(&b.typ));
+    let mut out = match &b.pdf {
+        Ok(p) => format!("Slides: {}", rel(p)),
+        Err(why) => format!("No PDF ({why})."),
+    };
+    out += &format!("\nThe same, as text: {}", rel(&b.md));
     if let Some(g) = &b.graph {
-        out += &format!("\nProvenance graph: {}", rel(g));
+        out += &format!("\nThe trail of the day's steps: {}", rel(g));
     }
-    match &b.pdf {
-        Ok(p) => out += &format!("\nPDF: {}", rel(p)),
-        Err(why) => {
-            out += &format!(
-                "\nNo PDF ({why}). With Typst installed: typst compile --root . {}",
-                rel(&b.typ)
-            )
-        }
-    }
-    if !b.story {
-        out += "\nNo story yet: the slides open with the question. A story (a few \
-                paragraphs on what was asked, done and found, as hypotheses) goes in \
-                with `report`'s `story`, or `legume report --story FILE`.";
+    if !b.summary {
+        out += "\nThe person has not summarised the day: the slides open with their \
+                question. Ask them for the day's summary (kind `summary`, their words) and \
+                build the report again.";
     }
     out
 }
@@ -256,104 +150,461 @@ fn day_of(day: Option<&str>) -> Result<String> {
     Ok(d.to_string())
 }
 
-/// `bytes` as the file at `path`, in place of what was there: never
-/// written through a symlink, which is removed as a link.
-fn write_fresh(path: &Path, bytes: &[u8]) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("replacing {}", path.display())),
-    }
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o644);
-    o.open(path)
-        .and_then(|mut f| f.write_all(bytes))
-        .with_context(|| format!("writing {}", path.display()))
+/// A slide: its title and what it shows, in the order shown.
+struct Slide {
+    title: String,
+    blocks: Vec<Block>,
 }
 
-/// An earlier story, kept beside the new one as `story.1.md`, `story.2.md`,
-/// ...: a story replaced is never lost.
-fn keep_aside(story: &Path, bytes: &[u8]) -> Result<()> {
-    for n in 1..=999 {
-        let kept = story.with_file_name(format!("story.{n}.md"));
-        let mut o = std::fs::OpenOptions::new();
-        o.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o644);
-        match o.open(&kept) {
-            Ok(mut f) => {
-                return f
-                    .write_all(bytes)
-                    .with_context(|| format!("writing {}", kept.display()))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e).with_context(|| format!("writing {}", kept.display())),
+/// A table's cell: its text, a dimmer second line, and whether it is
+/// flagged.
+#[derive(Default)]
+struct Cell {
+    text: String,
+    sub: String,
+    warn: bool,
+}
+
+impl Cell {
+    fn of(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            ..Default::default()
         }
     }
-    anyhow::bail!("{} has 999 earlier stories: none kept", story.display())
 }
 
-/// The PDF of `typ`, by `typst` on the PATH, its files read from `root`
-/// alone; or why there is none.
-fn compile(root: &Path, typ: &Path) -> std::result::Result<PathBuf, String> {
-    let Some(typst) = crate::on_path("typst") else {
-        return Err("typst is not on the PATH".into());
+/// What a slide shows. Every string is read from the records, and is shown
+/// as written.
+enum Block {
+    Text(String),
+    Dim(String),
+    Warn(String),
+    /// A notebook entry: where it is from, and its words.
+    Quote(String, String),
+    List(Vec<String>),
+    /// A labelled line: `Verb: ...`.
+    Field(String, String),
+    Table(Vec<String>, Vec<Vec<Cell>>),
+    /// An image under the project, its caption and a note on how it was
+    /// made; `wide`: as wide as the slide, else as tall as its room.
+    Image {
+        path: String,
+        caption: String,
+        note: String,
+        wide: bool,
+    },
+    Code(String),
+}
+
+/// The slides of the day, from the records.
+fn slides(
+    root: &Path,
+    day: &str,
+    records: &Records,
+    steps: &[&Step],
+    graph: Option<bool>,
+) -> Vec<Slide> {
+    let dir = root.join("results").join(day);
+    let notebook = format!("results/{day}/notebook.md");
+    let entries = |keep: &dyn Fn(&str) -> bool| -> Vec<&Entry> {
+        records.notebook.iter().filter(|e| keep(&e.kind)).collect()
     };
-    let pdf = typ.with_extension("pdf");
-    let out = std::process::Command::new(typst)
-        .arg("compile")
-        .arg("--root")
-        .arg(root)
-        .arg(typ)
-        .arg(&pdf)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("typst did not run: {e}"))?;
-    if out.status.success() {
-        Ok(pdf)
-    } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        Err(format!(
-            "typst failed: {}",
-            crate::project::one_line(err.trim())
-        ))
-    }
-}
+    // An entry: the person's words (its `> ` lines) quoted, what the
+    // agent recorded with them plain.
+    let quote = |e: &Entry, n: usize| -> Vec<Block> {
+        let head = format!("{} · {} · {}", e.time, e.server, e.kind);
+        let (theirs, rest) = split_words(&e.text);
+        let mut blocks = Vec::new();
+        if !theirs.is_empty() {
+            blocks.push(Block::Quote(head.clone(), cut(&theirs, n, &notebook)));
+        }
+        if !rest.is_empty() {
+            if theirs.is_empty() {
+                blocks.push(Block::Dim(head));
+            }
+            blocks.push(Block::Text(cut(&rest, n, &notebook)));
+        }
+        blocks
+    };
+    let mut deck = Vec::new();
 
-/// `text` as a Typst string literal: shown as written, never read as
-/// markup or code.
-fn lit(text: &str) -> String {
-    let mut s = String::from("\"");
-    for c in text.chars() {
-        match c {
-            '\\' => s.push_str("\\\\"),
-            '"' => s.push_str("\\\""),
-            '\t' => s.push_str("    "),
-            c if c.is_control() => {}
-            c => s.push(c),
+    // The person's summary of the day.
+    let summaries = entries(&|k| k == "summary");
+    if !summaries.is_empty() {
+        let mut blocks = vec![Block::Dim(
+            "In the person's words; every slide after this one is read from the records.".into(),
+        )];
+        blocks.extend(summaries.into_iter().flat_map(|e| quote(e, 2500)));
+        deck.push(Slide {
+            title: "The day, in the person's words".into(),
+            blocks,
+        });
+    }
+
+    // The question.
+    let plans = entries(&|k| k == "plan");
+    let mut blocks: Vec<Block> = plans.into_iter().flat_map(|e| quote(e, 1200)).collect();
+    if blocks.is_empty() {
+        blocks.push(Block::Warn("No question was recorded this day.".into()));
+        blocks.push(Block::Dim(
+            "A plan is the person's question, as a contrast, and what would change their mind."
+                .into(),
+        ));
+    }
+    deck.push(Slide {
+        title: "The question".into(),
+        blocks,
+    });
+
+    // The data.
+    let mut blocks = Vec::new();
+    if records.data.is_empty() {
+        blocks.push(Block::Dim("No files under data/.".into()));
+    } else {
+        // As many as a slide holds; the rest counted.
+        const ROWS: usize = 12;
+        let rows = records
+            .data
+            .iter()
+            .take(ROWS)
+            .map(|d| {
+                let from = match d.from.as_str() {
+                    "" => Cell {
+                        text: "not recorded".into(),
+                        warn: true,
+                        ..Default::default()
+                    },
+                    f => Cell::of(f),
+                };
+                let verdict = match d.verdict.as_str() {
+                    "" => Cell {
+                        text: "not given".into(),
+                        warn: true,
+                        ..Default::default()
+                    },
+                    v @ ("caveats" | "bad") => Cell {
+                        text: v.into(),
+                        warn: true,
+                        ..Default::default()
+                    },
+                    v => Cell::of(v),
+                };
+                vec![Cell::of(&d.path), from, verdict]
+            })
+            .collect();
+        blocks.push(Block::Table(
+            vec![
+                "File".into(),
+                "Where it came from".into(),
+                "The person's verdict".into(),
+            ],
+            rows,
+        ));
+        let rest = &records.data[records.data.len().min(ROWS)..];
+        if !rest.is_empty() {
+            let count =
+                |f: &dyn Fn(&crate::records::Data) -> bool| rest.iter().filter(|d| f(d)).count();
+            blocks.push(Block::Dim(format!(
+                "{} more files under data/: {} with where they came from not recorded, {} \
+                 without a verdict.",
+                rest.len(),
+                count(&|d| d.from.is_empty()),
+                count(&|d| d.verdict.is_empty())
+            )));
         }
     }
-    s.push('"');
-    s
-}
+    deck.push(Slide {
+        title: "The data".into(),
+        blocks,
+    });
 
-/// `text` as markup: each line a string of its own, a blank line between
-/// paragraphs, Markdown's bold marks dropped.
-fn para(text: &str) -> String {
-    let mut out = String::new();
-    let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
-    for (i, l) in lines.iter().enumerate() {
-        if l.trim().is_empty() {
-            out.push('\n');
+    // The steps.
+    if let Some(wide) = graph {
+        deck.push(Slide {
+            title: "The trail".into(),
+            blocks: vec![Block::Image {
+                path: format!("results/{day}/report/graph.svg"),
+                caption: "The person's entries in order (blue); under each, what ran (rounded; \
+                          red flagged a number) and was seen (dashed) after it. A faint line: \
+                          a step read a file another made."
+                    .into(),
+                note: String::new(),
+                wide,
+            }],
+        });
+    }
+    let mut blocks = Vec::new();
+    if steps.is_empty() {
+        blocks.push(Block::Dim(
+            "No step recorded an output this day (results/INDEX.tsv).".into(),
+        ));
+    } else {
+        let rows = steps
+            .iter()
+            .map(|st| {
+                let numbers: Vec<String> = st.facts.iter().map(ToString::to_string).collect();
+                vec![
+                    Cell::of(clock(&st.time)),
+                    Cell::of(format!("{} {}", st.server, st.tool)),
+                    Cell {
+                        text: st.output.clone(),
+                        sub: if st.inputs.is_empty() {
+                            String::new()
+                        } else {
+                            format!("from {}", st.inputs.join(", "))
+                        },
+                        warn: false,
+                    },
+                    Cell {
+                        text: numbers.join("; "),
+                        warn: st.facts.iter().any(|f| f.flagged().is_some()),
+                        ..Default::default()
+                    },
+                ]
+            })
+            .collect();
+        blocks.push(Block::Table(
+            vec![
+                "Time".into(),
+                "Step".into(),
+                "Output, from".into(),
+                "Key numbers".into(),
+            ],
+            rows,
+        ));
+        let flagged: Vec<String> = steps
+            .iter()
+            .flat_map(|st| {
+                st.facts
+                    .iter()
+                    .filter(|f| f.flagged().is_some())
+                    .map(move |f| format!("{} ({} {}): {f}", st.output, st.server, st.tool))
+            })
+            .collect();
+        if !flagged.is_empty() {
+            blocks.push(Block::Warn(
+                "Flagged by the tools: look at these before building on them.".into(),
+            ));
+            blocks.push(Block::List(flagged));
+        }
+    }
+    deck.push(Slide {
+        title: "The steps, with their key numbers".into(),
+        blocks,
+    });
+
+    // The figures the person kept, then the day's other images.
+    let runall = read_record(&dir.join("runall.sh"));
+    let made = |output: &str| -> String {
+        match steps.iter().find(|st| st.output == output) {
+            Some(st) => made_by(&runall, st, day),
+            None => String::new(),
+        }
+    };
+    // Each file shown once: a PNG and the PDF or SVG beside it are one.
+    let mut shown: Vec<String> = Vec::new();
+    for f in &records.figures {
+        let mut blocks = Vec::new();
+        if is_figure(root, &f.output) {
+            let path = sharpest(root, &f.output);
+            shown.push(path.clone());
+            blocks.push(Block::Image {
+                path,
+                caption: f.take_home.clone(),
+                note: made(&f.output),
+                wide: true,
+            });
+        } else {
+            blocks.push(Block::Text(f.take_home.clone()));
+            blocks.push(Block::Warn(if root.join(&f.output).exists() {
+                format!(
+                    "{} is not shown: the slides show only the person's own image files, \
+                     not links or files others can change.",
+                    f.output
+                )
+            } else {
+                format!("{} is not there.", f.output)
+            }));
+        }
+        if !f.hypothesis.is_empty() {
+            blocks.push(Block::Field("For".into(), f.hypothesis.clone()));
+        }
+        deck.push(Slide {
+            title: format!("Figure {}", f.number),
+            blocks,
+        });
+    }
+    for st in steps.iter().filter(|st| is_figure(root, &st.output)) {
+        let path = sharpest(root, &st.output);
+        if shown.contains(&path) {
             continue;
         }
-        let next_blank = lines.get(i + 1).is_none_or(|n| n.trim().is_empty());
-        out.push_str(&format!("#{}", lit(&l.replace("**", ""))));
-        out.push_str(if next_blank { "\n" } else { " \\\n" });
+        shown.push(path.clone());
+        deck.push(Slide {
+            title: format!("Image: {}", file_name(&st.output)),
+            blocks: vec![Block::Image {
+                path,
+                caption: st.summary.clone(),
+                note: made_by(&runall, st, day),
+                wide: true,
+            }],
+        });
     }
-    out
+
+    // What was seen.
+    let seen = entries(&|k| k.starts_with("observation") || k.starts_with("note") || k == "user");
+    if !seen.is_empty() {
+        deck.push(Slide {
+            title: "What was seen".into(),
+            blocks: seen.into_iter().flat_map(|e| quote(e, 900)).collect(),
+        });
+    }
+
+    // The hypotheses.
+    for h in &records.hypotheses {
+        let l = &h.ledger;
+        let mut blocks = vec![Block::Quote(
+            "the person's hypothesis".into(),
+            h.claim.clone(),
+        )];
+        let said = |label: &str, text: &str, missing: &str| -> Block {
+            if text.is_empty() {
+                Block::Field(label.into(), format!("not said yet: {missing}"))
+            } else {
+                Block::Field(label.into(), text.into())
+            }
+        };
+        blocks.push(said("Rivals", &h.rivals, "what else could explain it?"));
+        blocks.push(said(
+            "Would nullify it",
+            &h.nullify,
+            "what result would make them drop it?",
+        ));
+        if l.sources.is_empty() {
+            blocks.push(Block::Dim("No source has been weighed for it yet.".into()));
+        } else {
+            let rows = l
+                .sources
+                .iter()
+                .map(|e| {
+                    let (kind, shares) = evidence::what(&e.class);
+                    vec![
+                        Cell::of(&e.source),
+                        Cell {
+                            text: kind.into(),
+                            sub: format!("shares {shares}"),
+                            warn: false,
+                        },
+                        Cell {
+                            text: e.verdict.clone(),
+                            warn: e.verdict != "agrees",
+                            ..Default::default()
+                        },
+                        Cell {
+                            text: e.why.clone(),
+                            sub: e.summary.clone(),
+                            warn: false,
+                        },
+                    ]
+                })
+                .collect();
+            blocks.push(Block::Table(
+                vec![
+                    "Source".into(),
+                    "Kind".into(),
+                    "Says".into(),
+                    "Why, and the numbers".into(),
+                ],
+                rows,
+            ));
+        }
+        blocks.push(Block::Field("Verb".into(), l.verb.clone()));
+        blocks.push(Block::Field(
+            "Standing".into(),
+            format!("{} (level {} of 3)", l.standing, l.level),
+        ));
+        if !l.unused.is_empty() {
+            let names: Vec<String> = l
+                .unused
+                .iter()
+                .map(|c| evidence::what(c).0.to_string())
+                .collect();
+            blocks.push(Block::Field(
+                "Sources not yet used".into(),
+                names.join("; "),
+            ));
+        }
+        deck.push(Slide {
+            title: format!("Hypothesis H{}", h.id),
+            blocks,
+        });
+    }
+
+    // What is open for the person.
+    let open = records.open();
+    if !open.is_empty() {
+        deck.push(Slide {
+            title: "Open for the person".into(),
+            blocks: vec![Block::List(open)],
+        });
+    }
+
+    // Replay.
+    let mut blocks = vec![
+        Block::Text("Every step of the day, in order, without the agent:".into()),
+        Block::Code(format!("bash results/{day}/runall.sh")),
+    ];
+    let mut tools: Vec<String> = Vec::new();
+    for l in runall.lines().filter_map(|l| l.strip_prefix("# ")) {
+        let w: Vec<&str> = l.split_whitespace().collect();
+        // `# 10:02:03 server version tool {args}`
+        // The notebook's own lines are not a tool's.
+        if w.len() >= 4
+            && w[0].len() == 8
+            && w[0].as_bytes()[2] == b':'
+            && w[1] != crate::brain::NAME
+        {
+            let t = format!("{} {}", w[1], w[2]);
+            if !tools.contains(&t) {
+                tools.push(t);
+            }
+        }
+    }
+    if !tools.is_empty() {
+        blocks.push(Block::Field("Tools".into(), tools.join(", ")));
+    }
+    blocks.push(Block::Dim(format!(
+        "The records: results/{day}/notebook.md (the day's account), results/{day}/runall.sh \
+         (the steps), results/INDEX.tsv (each output, its inputs and numbers), \
+         results/HYPOTHESES.tsv and EVIDENCE.tsv (the triangulation), results/DATA.tsv and \
+         FIGURES.tsv (the person's verdicts and kept figures)."
+    )));
+    deck.push(Slide {
+        title: "Replay".into(),
+        blocks,
+    });
+    deck
+}
+
+/// A notebook entry's text in two: the person's words (its `> ` lines,
+/// without the marks; the slides set them apart themselves), and what the
+/// agent recorded with them.
+fn split_words(text: &str) -> (String, String) {
+    let (mut theirs, mut rest) = (Vec::new(), Vec::new());
+    for l in text.lines() {
+        match l.strip_prefix("> ").or(l.strip_prefix('>')) {
+            Some(w) => theirs.push(w),
+            None => rest.push(l),
+        }
+    }
+    let joined = |v: Vec<&str>| v.join("\n").trim().to_string();
+    (joined(theirs), joined(rest))
+}
+
+/// `10:02:03` as `10:02`.
+fn clock(time: &str) -> String {
+    time.chars().take(5).collect()
 }
 
 /// `text` cut to `n` characters, saying where the rest is.
@@ -365,336 +616,29 @@ fn cut(text: &str, n: usize, rest: &str) -> String {
     format!("{kept}… (the rest in {rest})")
 }
 
-/// The page set up, and the helpers the slides use.
-const PREAMBLE: &str = r##"#set page(paper: "presentation-16-9", margin: (x: 1.6cm, top: 1.2cm, bottom: 1.5cm), footer: context {
-  set text(size: 9pt, fill: luma(120))
-  [#footer-text #h(1fr) #counter(page).display()]
-})
-#set text(size: 14pt)
-#set par(justify: false)
-#show heading.where(level: 1): it => {
-  pagebreak(weak: true)
-  set text(size: 22pt)
-  block(below: 0.9em, it.body)
-}
-#let dim(body) = text(fill: luma(105), body)
-#let warn(body) = text(fill: rgb("#b03a2e"), weight: "bold", body)
-#let quoted(body) = block(inset: (left: 0.9em, y: 0.3em), stroke: (left: 2pt + luma(190)), body)
-#let small(body) = { set text(size: 11pt); body }
-"##;
-
-/// The Typst source of the slides.
-fn slides(
-    root: &Path,
-    day: &str,
-    records: &Records,
-    steps: &[&Step],
-    story: &str,
-    graph: Option<bool>,
-) -> String {
-    let name = root.file_name().map_or_else(
-        || root.display().to_string(),
-        |n| n.to_string_lossy().into(),
-    );
-    let dir = root.join("results").join(day);
-    let notebook = format!("results/{day}/notebook.md");
-    let entries = |keep: &dyn Fn(&str) -> bool| -> Vec<&Entry> {
-        records.notebook.iter().filter(|e| keep(&e.kind)).collect()
+/// The sharpest version of image `output` there is: the SVG, else the PDF,
+/// beside a PNG or JPEG of the same name, which a slide scales without
+/// blurring.
+fn sharpest(root: &Path, output: &str) -> String {
+    let Some((stem, ext)) = output.rsplit_once('.') else {
+        return output.into();
     };
-    let mut s = String::new();
-    let _ = writeln!(
-        s,
-        "// legume report {}, built from the records of {name} for {day}.\n\
-         // The story is the agent's (or the person's); every other word is read from the records.\n\
-         // Rebuild: legume report --day {day}. Compile from the project folder:\n\
-         //   typst compile --root . results/{day}/report/report.typ",
-        env!("CARGO_PKG_VERSION")
-    );
-    let _ = writeln!(s, "#let footer-text = {}", lit(&format!("{name} · {day}")));
-    let _ = writeln!(
-        s,
-        "#set document(title: {})",
-        lit(&format!("{name}, {day}"))
-    );
-    s.push_str(PREAMBLE);
-
-    // Title.
-    let _ = writeln!(
-        s,
-        "\n#align(horizon)[\n  #text(size: 32pt, weight: \"bold\")[#{}]\n\n  #text(size: 18pt)[#{}]\n\n  \
-         #dim[Built by legume report {} from the project's records.] \\\n  \
-         #dim[Exploratory work: what it found are hypotheses, not findings.]\n]",
-        lit(&name),
-        lit(day),
-        env!("CARGO_PKG_VERSION")
-    );
-
-    // The story.
-    if !story.is_empty() {
-        let _ = writeln!(
-            s,
-            "\n= Story\n#dim[Written by the agent (or the person), from the records; every slide after this one is read from the records themselves.]\n\n{}",
-            para(&cut(story, 2500, &format!("results/{day}/report/story.md")))
-        );
-    }
-
-    // The question.
-    s.push_str("\n= The question\n");
-    let plans = entries(&|k| k.starts_with("plan"));
-    if plans.is_empty() {
-        s.push_str("#warn[No plan was recorded this day.] #dim[A plan says the question, the data, the sources of evidence and how the result will be checked.]\n");
-    }
-    for e in plans {
-        let _ = writeln!(
-            s,
-            "#dim[#{}]\n#quoted[\n{}]\n",
-            lit(&format!("{} · {} · {}", e.time, e.server, e.kind)),
-            para(&cut(&e.text, 1200, &notebook))
-        );
-    }
-
-    // The data.
-    s.push_str("\n= The data\n");
-    let data = read_record(&root.join("data/README.md"));
-    let data: Vec<&str> = data.lines().filter(|l| l.starts_with("- ")).collect();
-    if data.is_empty() {
-        s.push_str("#dim[No data recorded in data/README.md.]\n");
-    }
-    for l in data.iter().rev().take(14).rev() {
-        let _ = writeln!(s, "- #{}", lit(&l[2..]));
-    }
-
-    // The steps.
-    s.push_str("\n= The steps\n");
-    if steps.is_empty() {
-        s.push_str("#dim[No step recorded an output this day (results/INDEX.tsv).]\n");
-    }
-    if let Some(wide) = graph {
-        let size = if wide {
-            "width: 100%".to_string()
-        } else {
-            format!("height: {}cm", GRAPH_ROOM.1)
-        };
-        let _ = writeln!(
-            s,
-            "#v(1fr)\n#align(center, image({}, {size}))\n#v(1fr)\n\
-             #dim[Each step (rounded) between the files it read and made; grey files are data no step here made; a red step flagged a number.]",
-            lit(&format!("/results/{day}/report/graph.svg"))
-        );
-        s.push_str("\n= The steps, with their numbers\n");
-    }
-    if !steps.is_empty() {
-        s.push_str(
-            "#small[#table(columns: (auto, auto, 1.4fr, 1fr), stroke: 0.5pt + luma(200), inset: 5pt,\n  \
-             table.header([*Time*], [*Step*], [*Output, from*], [*Numbers*]),\n",
-        );
-        for st in steps {
-            let mut out = format!("#{}", lit(&st.output));
-            if !st.inputs.is_empty() {
-                out += &format!(
-                    " \\ #dim[#{}]",
-                    lit(&format!("from {}", st.inputs.join(", ")))
-                );
-            }
-            let numbers: Vec<String> = st
-                .facts
-                .iter()
-                .map(|f| match f.flagged() {
-                    Some(_) => format!("#warn[#{}]", lit(&format!("flagged: {f}"))),
-                    None => format!("#{}", lit(&f.to_string())),
-                })
-                .collect();
-            let _ = writeln!(
-                s,
-                "  [#{}], [#{}], [{out}], [{}],",
-                lit(&st.time.chars().take(5).collect::<String>()),
-                lit(&format!("{} {}", st.server, st.tool)),
-                numbers.join(" \\ ")
-            );
-        }
-        s.push_str(")]\n");
-        let flagged: Vec<String> = steps
-            .iter()
-            .flat_map(|st| {
-                st.facts
-                    .iter()
-                    .filter(|f| f.flagged().is_some())
-                    .map(move |f| format!("{} ({} {}): {f}", st.output, st.server, st.tool))
-            })
-            .collect();
-        if !flagged.is_empty() {
-            s.push_str("\n#warn[Flagged by the tools: look at these before building on them.]\n");
-            for f in flagged {
-                let _ = writeln!(s, "- #{}", lit(&f));
+    if matches!(ext.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg") {
+        for vector in ["svg", "pdf"] {
+            let path = format!("{stem}.{vector}");
+            if is_figure(root, &path) {
+                return path;
             }
         }
     }
-
-    // The figures.
-    let runall = read_record(&dir.join("runall.sh"));
-    for st in steps.iter().filter(|st| is_figure(root, &st.output)) {
-        let _ = writeln!(
-            s,
-            "\n= {}\n#align(center, image({}, width: 100%, height: 10cm, fit: \"contain\"))\n#dim[#{}] \\\n#small[#dim[#{}]]",
-            format_args!("#{}", lit(&format!("Figure: {}", file_name(&st.output)))),
-            lit(&format!("/{}", st.output)),
-            lit(&st.summary),
-            lit(&made_by(&runall, st, day))
-        );
-    }
-
-    // The observations.
-    let seen = entries(&|k| k.starts_with("observation") || k.starts_with("note"));
-    if !seen.is_empty() {
-        s.push_str("\n= What was seen\n");
-        for e in seen {
-            let _ = writeln!(
-                s,
-                "#dim[#{}]\n#quoted[\n{}]\n",
-                lit(&format!("{} · {} · {}", e.time, e.server, e.kind)),
-                para(&cut(&e.text, 900, &notebook))
-            );
-        }
-    }
-
-    // The interpretation.
-    s.push_str("\n= The interpretation\n");
-    let decided = entries(&|k| {
-        k.starts_with("interpretation (accepted") || k.starts_with("interpretation (user")
-    });
-    if decided.is_empty() {
-        s.push_str("#warn[Not yet interpreted.] #dim[No reading has been accepted or set aside by the person; the readings proposed are below.]\n\n");
-        for e in entries(&|k| k.starts_with("interpretation")) {
-            let _ = writeln!(
-                s,
-                "#dim[#{}]\n#quoted[\n{}]\n",
-                lit(&format!("{} · {} · {}", e.time, e.server, e.kind)),
-                para(&cut(&e.text, 900, &notebook))
-            );
-        }
-    }
-    for e in &decided {
-        let _ = writeln!(
-            s,
-            "#dim[#{}]\n#quoted[\n{}]\n",
-            lit(&format!("{} · {} · {}", e.time, e.server, e.kind)),
-            para(&cut(&e.text, 1200, &notebook))
-        );
-    }
-    if let Some(q) = &records.waiting {
-        let _ = writeln!(s, "#warn[Waiting for the person:] #{}", lit(q));
-    }
-    let chosen = entries(&|k| k.starts_with("choice"));
-    if !chosen.is_empty() {
-        s.push_str("\n*Next steps the person chose*\n\n");
-        for e in chosen {
-            let _ = writeln!(s, "- #{}", lit(&cut(&e.first, 300, &notebook)));
-        }
-    }
-
-    // The hypotheses.
-    for h in &records.hypotheses {
-        let l = &h.ledger;
-        let _ = writeln!(s, "\n= #{}", lit(&format!("H{}. {}", h.id, h.claim)));
-        if l.sources.is_empty() {
-            s.push_str("#dim[No source has been weighed for it yet.]\n");
-        } else {
-            s.push_str(
-                "#small[#table(columns: (auto, auto, auto, auto, 1fr), stroke: 0.5pt + luma(200), inset: 5pt,\n  \
-                 table.header([*Source*], [*Kind*], [*Shares with our cells*], [*Says*], [*Evidence*]),\n",
-            );
-            for e in &l.sources {
-                let (kind, shares) = evidence::what(&e.class);
-                let says = match e.verdict.as_str() {
-                    "agrees" => format!("#{}", lit("agrees")),
-                    v => format!("#warn[#{}]", lit(v)),
-                };
-                let _ = writeln!(
-                    s,
-                    "  [#{}], [#{}], [#{}], [{says}], [#{}],",
-                    lit(&e.source),
-                    lit(kind),
-                    lit(shares),
-                    lit(&e.summary)
-                );
-            }
-            s.push_str(")]\n");
-        }
-        let _ = writeln!(
-            s,
-            "\n*Verb:* #{} \\\n*Standing:* #{} #dim[#{}]",
-            lit(&l.verb),
-            lit(l.standing),
-            lit(&format!("(level {} of 3)", l.level))
-        );
-        if !l.unused.is_empty() {
-            let names: Vec<String> = l
-                .unused
-                .iter()
-                .map(|c| format!("{} ({c})", evidence::what(c).0))
-                .collect();
-            let _ = writeln!(
-                s,
-                "\n#dim[Sources not yet used, those that would raise the verb first:] #{}",
-                lit(&names.join("; "))
-            );
-        }
-    }
-
-    // Replay.
-    s.push_str("\n= Replay\nEvery step of the day, in order, without the agent or the model:\n");
-    let _ = writeln!(
-        s,
-        "#raw({}, block: true, lang: \"bash\")",
-        lit(&format!("bash results/{day}/runall.sh"))
-    );
-    let mut tools: Vec<String> = Vec::new();
-    for l in runall.lines().filter_map(|l| l.strip_prefix("# ")) {
-        let w: Vec<&str> = l.split_whitespace().collect();
-        // `# 10:02:03 server version tool {args}`
-        if w.len() >= 4 && w[0].len() == 8 && w[0].as_bytes()[2] == b':' {
-            let t = format!("{} {}", w[1], w[2]);
-            if !tools.contains(&t) {
-                tools.push(t);
-            }
-        }
-    }
-    if !tools.is_empty() {
-        let _ = writeln!(s, "\n*Tools:* #{}", lit(&tools.join(", ")));
-    }
-    let chat = read_record(&dir.join("chat.md"));
-    let mut models: Vec<&str> = chat
-        .lines()
-        .filter(|l| l.starts_with("- Model:") || l.starts_with("- Model file:"))
-        .collect();
-    models.dedup();
-    if !models.is_empty() {
-        s.push_str("\n*The model in `legume chat`* #dim[(not needed to replay)]\n");
-        for m in models {
-            let _ = writeln!(s, "- #{}", lit(&m[2..]));
-        }
-    }
-    let _ = writeln!(
-        s,
-        "\n#dim[The records: #{}]",
-        lit(&format!(
-            "results/{day}/notebook.md (the reasoning), results/{day}/runall.sh (the steps), \
-             results/INDEX.tsv (each output, its inputs and numbers), results/HYPOTHESES.tsv \
-             and EVIDENCE.tsv (the triangulation){}",
-            if chat.is_empty() {
-                String::new()
-            } else {
-                format!(", results/{day}/chat.md (the chat)")
-            }
-        ))
-    );
-    s
+    output.into()
 }
 
-/// Whether `output` is a figure the slides can show: an image inside the
-/// project that is there.
+/// Whether `output` is a figure the slides can show: an image (or a PDF
+/// figure) inside the project that is there, and that Typst may read (the
+/// person's own file: no link, none others can change).
 fn is_figure(root: &Path, output: &str) -> bool {
-    let image = ["png", "jpg", "jpeg", "gif", "svg"].iter().any(|e| {
+    let image = ["png", "jpg", "jpeg", "gif", "svg", "pdf"].iter().any(|e| {
         output
             .rsplit_once('.')
             .is_some_and(|(_, x)| x.eq_ignore_ascii_case(e))
@@ -702,7 +646,7 @@ fn is_figure(root: &Path, output: &str) -> bool {
     image
         && !output.starts_with('/')
         && !output.split('/').any(|p| p == "..")
-        && root.join(output).is_file()
+        && crate::project::is_trusted(&root.join(output))
 }
 
 fn file_name(path: &str) -> &str {
@@ -736,10 +680,395 @@ fn made_by(runall: &str, st: &Step, day: &str) -> String {
     )
 }
 
+/// `text` as a Typst string literal: shown as written, never read as
+/// markup or code.
+fn lit(text: &str) -> String {
+    let mut s = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '\\' => s.push_str("\\\\"),
+            '"' => s.push_str("\\\""),
+            '\t' => s.push_str("    "),
+            c if c.is_control() => {}
+            c => s.push(c),
+        }
+    }
+    s.push('"');
+    s
+}
+
+/// `text` as Typst markup: each line a string of its own, a blank line
+/// between paragraphs, Markdown's bold marks dropped.
+fn para(text: &str) -> String {
+    let mut out = String::new();
+    let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+    for (i, l) in lines.iter().enumerate() {
+        if l.trim().is_empty() {
+            out.push('\n');
+            continue;
+        }
+        let next_blank = lines.get(i + 1).is_none_or(|n| n.trim().is_empty());
+        out.push_str(&format!("#{}", lit(&l.replace("**", ""))));
+        out.push_str(if next_blank { "\n" } else { " \\\n" });
+    }
+    out
+}
+
+/// The page set up, in the manner of a Beamer deck: a title bar on each
+/// slide, a footline, Computer Modern.
+const PREAMBLE: &str = r##"#let ink = rgb("#1d3557")
+#set page(paper: "presentation-16-9", margin: (x: 1.4cm, top: 2.3cm, bottom: 1.3cm),
+  footer: context {
+    set text(size: 9pt, fill: white)
+    move(dx: -1.4cm, block(width: 100% + 2.8cm, inset: (x: 1.4cm, y: 0.25cm), fill: ink, outset: (bottom: 1cm))[
+      #footer-text #h(1fr) #counter(page).display() / #counter(page).final().first()
+    ])
+  }, footer-descent: 0.6cm)
+#set text(font: "New Computer Modern", size: 15pt)
+#show raw: set text(font: "DejaVu Sans Mono", size: 12pt)
+#set par(justify: false, leading: 0.6em)
+#let slide(title, body) = {
+  pagebreak(weak: true)
+  // A long title is set smaller, so it stays on the bar.
+  let size = if title.len() > 52 { 16pt } else { 21pt }
+  place(top + left, dx: -1.4cm, dy: -2.3cm, block(width: 100% + 2.8cm, height: 1.6cm,
+    inset: (x: 1.4cm), fill: ink, align(horizon, text(size: size, fill: white, weight: "bold", title))))
+  body
+}
+#let dim(body) = text(fill: luma(100), body)
+#let warn(body) = text(fill: rgb("#b03a2e"), weight: "bold", body)
+#let quoted(body) = block(inset: (left: 0.9em, y: 0.3em), stroke: (left: 2pt + ink.lighten(50%)), body)
+#let small(body) = { set text(size: 11pt); body }
+"##;
+
+/// The slides as Typst source.
+fn typst(deck: &[Slide], name: &str, day: &str) -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "#let footer-text = {}", lit(&format!("{name} · {day}")));
+    let _ = writeln!(
+        s,
+        "#set document(title: {})",
+        lit(&format!("{name}, {day}"))
+    );
+    s.push_str(PREAMBLE);
+    let _ = writeln!(
+        s,
+        "\n#align(horizon)[\n  #text(size: 34pt, weight: \"bold\", fill: ink)[#{}]\n\n  \
+         #text(size: 20pt)[#{}]\n\n  #dim[Built by legume {} from the project's records.] \\\n  \
+         #dim[Exploratory work: what it found are hypotheses, not findings.]\n]",
+        lit(name),
+        lit(day),
+        env!("CARGO_PKG_VERSION")
+    );
+    for slide in deck {
+        let _ = writeln!(s, "\n#slide({})[", lit(&slide.title));
+        for b in &slide.blocks {
+            s.push_str(&typst_block(b));
+        }
+        s.push_str("]\n");
+    }
+    s
+}
+
+fn typst_block(b: &Block) -> String {
+    match b {
+        Block::Text(t) => format!("{}\n", para(t)),
+        Block::Dim(t) => format!("#dim[#{}]\n\n", lit(t)),
+        Block::Warn(t) => format!("#warn[#{}]\n\n", lit(t)),
+        Block::Quote(from, t) => format!("#small[#dim[#{}]]\n#quoted[\n{}]\n", lit(from), para(t)),
+        Block::List(items) => {
+            let mut s: String = items.iter().map(|i| format!("- #{}\n", lit(i))).collect();
+            s.push('\n');
+            s
+        }
+        Block::Field(label, value) => format!("*#{}:* #{}\n\n", lit(label), lit(value)),
+        Block::Table(head, rows) => {
+            let mut s = format!(
+                "#small[#table(columns: {}, stroke: 0.5pt + luma(200), inset: 5pt,\n  table.header({}),\n",
+                head.len(),
+                head.iter()
+                    .map(|h| format!("[*#{}*]", lit(h)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            for row in rows {
+                let cells: Vec<String> = row
+                    .iter()
+                    .map(|c| {
+                        let text = if c.warn {
+                            format!("#warn[#{}]", lit(&c.text))
+                        } else {
+                            format!("#{}", lit(&c.text))
+                        };
+                        if c.sub.is_empty() {
+                            format!("[{text}]")
+                        } else {
+                            format!("[{text} \\ #dim[#{}]]", lit(&c.sub))
+                        }
+                    })
+                    .collect();
+                let _ = writeln!(s, "  {},", cells.join(", "));
+            }
+            s.push_str(")]\n\n");
+            s
+        }
+        Block::Image {
+            path,
+            caption,
+            note,
+            wide,
+        } => {
+            let size = if *wide {
+                "width: 100%, height: 9cm, fit: \"contain\"".to_string()
+            } else {
+                format!("height: {}cm", GRAPH_ROOM.1)
+            };
+            let mut s = format!(
+                "#align(center, image({}, {size}))\n#dim[#{}]",
+                lit(&format!("/{path}")),
+                lit(caption)
+            );
+            if !note.is_empty() {
+                let _ = write!(s, " \\\n#small[#dim[#{}]]", lit(note));
+            }
+            s.push_str("\n\n");
+            s
+        }
+        Block::Code(c) => format!("#raw({}, block: true, lang: \"bash\")\n\n", lit(c)),
+    }
+}
+
+/// `text` safe in Markdown: shown as written, never as a heading, a link,
+/// HTML or a table's border.
+fn md(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        match c {
+            '\\' | '`' | '*' | '_' | '[' | ']' | '#' | '|' | '!' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '\t' => out.push_str("    "),
+            c if c.is_control() && c != '\n' => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The slides as Markdown, for any editor; images linked from the report's
+/// folder.
+fn markdown(deck: &[Slide], name: &str, day: &str) -> String {
+    let mut s = format!(
+        "# {}, {}\n\nBuilt by legume {} from the project's records. Exploratory work: what it \
+         found are hypotheses, not findings.\n",
+        md(name),
+        md(day),
+        env!("CARGO_PKG_VERSION")
+    );
+    for slide in deck {
+        let _ = writeln!(s, "\n## {}\n", md(&slide.title));
+        for b in &slide.blocks {
+            s.push_str(&md_block(b, day));
+        }
+    }
+    s
+}
+
+fn md_block(b: &Block, day: &str) -> String {
+    let one = |t: &str| md(&t.replace('\n', " "));
+    match b {
+        Block::Text(t) => format!("{}\n\n", md(t)),
+        Block::Dim(t) => format!("_{}_\n\n", one(t)),
+        Block::Warn(t) => format!("**{}**\n\n", one(t)),
+        Block::Quote(from, t) => {
+            let lines: Vec<String> = t.lines().map(|l| format!("> {}", md(l))).collect();
+            format!("_{}_\n\n{}\n\n", one(from), lines.join("\n"))
+        }
+        Block::List(items) => {
+            let mut s: String = items.iter().map(|i| format!("- {}\n", one(i))).collect();
+            s.push('\n');
+            s
+        }
+        Block::Field(label, value) => format!("**{}:** {}\n\n", one(label), one(value)),
+        Block::Table(head, rows) => {
+            let mut s = format!(
+                "| {} |\n|{}\n",
+                head.iter().map(|h| one(h)).collect::<Vec<_>>().join(" | "),
+                "---|".repeat(head.len())
+            );
+            for row in rows {
+                let cells: Vec<String> = row
+                    .iter()
+                    .map(|c| {
+                        let text = if c.warn {
+                            format!("**{}**", one(&c.text))
+                        } else {
+                            one(&c.text)
+                        };
+                        if c.sub.is_empty() {
+                            text
+                        } else {
+                            format!("{text}<br>_{}_", one(&c.sub))
+                        }
+                    })
+                    .collect();
+                let _ = writeln!(s, "| {} |", cells.join(" | "));
+            }
+            s.push('\n');
+            s
+        }
+        Block::Image {
+            path,
+            caption,
+            note,
+            ..
+        } => {
+            // The report is in results/<day>/report/: three folders down.
+            let own = format!("results/{day}/report/");
+            let link = match path.strip_prefix(&own) {
+                Some(name) => name.to_string(),
+                None => format!("../../../{path}"),
+            };
+            // Any character a link could end at, or be read as, escaped.
+            let link: String = link
+                .chars()
+                .map(|c| match c {
+                    'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '.' | '_' | '~' | '/' => {
+                        c.to_string()
+                    }
+                    c => c.to_string().bytes().map(|b| format!("%{b:02X}")).collect(),
+                })
+                .collect();
+            // Markdown viewers show images, not PDFs: a PDF is a link.
+            let bang = if link.to_ascii_lowercase().ends_with(".pdf") {
+                ""
+            } else {
+                "!"
+            };
+            let mut s = format!(
+                "{bang}[{}]({})\n\n_{}_\n\n",
+                one(caption),
+                link,
+                one(caption)
+            );
+            if !note.is_empty() {
+                let _ = write!(s, "_{}_\n\n", one(note));
+            }
+            s
+        }
+        Block::Code(c) => format!("```bash\n{}\n```\n\n", c.replace("```", "")),
+    }
+}
+
+/// The PDF of Typst `source`, its images read from the project at `root`
+/// alone; or why there is none.
+#[cfg(feature = "pdf")]
+fn pdf(root: &Path, source: &str) -> std::result::Result<Vec<u8>, String> {
+    typeset::pdf(root, source)
+}
+
+#[cfg(not(feature = "pdf"))]
+fn pdf(_: &Path, _: &str) -> std::result::Result<Vec<u8>, String> {
+    Err("this legume was built without PDFs (feature `pdf`); report.md has the slides".into())
+}
+
+/// Typst, in this program: the slides' source, the fonts Typst ships, and
+/// the project's files as the only files it can read.
+#[cfg(feature = "pdf")]
+mod typeset {
+    use std::path::{Path, PathBuf};
+    use std::sync::LazyLock;
+    use typst::diag::{FileError, FileResult};
+    use typst::foundations::{Bytes, Datetime, Duration};
+    use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
+    use typst::text::{Font, FontBook};
+    use typst::utils::LazyHash;
+    use typst::{Library, LibraryExt, World};
+    use typst_layout::PagedDocument;
+
+    static LIBRARY: LazyLock<LazyHash<Library>> =
+        LazyLock::new(|| LazyHash::new(Library::default()));
+    static FONTS: LazyLock<(LazyHash<FontBook>, Vec<Font>)> = LazyLock::new(|| {
+        let fonts: Vec<Font> = typst_assets::fonts()
+            .flat_map(|d| Font::iter(Bytes::new(d)))
+            .collect();
+        (LazyHash::new(FontBook::from_fonts(&fonts)), fonts)
+    });
+
+    struct Slides {
+        root: PathBuf,
+        main: Source,
+    }
+
+    impl World for Slides {
+        fn library(&self) -> &LazyHash<Library> {
+            &LIBRARY
+        }
+        fn book(&self) -> &LazyHash<FontBook> {
+            &FONTS.0
+        }
+        fn main(&self) -> FileId {
+            self.main.id()
+        }
+        fn source(&self, id: FileId) -> FileResult<Source> {
+            if id == self.main.id() {
+                Ok(self.main.clone())
+            } else {
+                Err(FileError::NotSource)
+            }
+        }
+        /// A file of the project: the path Typst gives is rooted in it.
+        fn file(&self, id: FileId) -> FileResult<Bytes> {
+            let rel = id
+                .vpath()
+                .get_with_slash()
+                .trim_start_matches('/')
+                .to_string();
+            let path = self.root.join(&rel);
+            match crate::project::read_trusted(&path) {
+                Ok(b) => Ok(Bytes::new(b)),
+                Err(e) => Err(FileError::from_io(e, &path)),
+            }
+        }
+        fn font(&self, index: usize) -> Option<Font> {
+            FONTS.1.get(index).cloned()
+        }
+        fn today(&self, _: Option<Duration>) -> Option<Datetime> {
+            None
+        }
+    }
+
+    pub(super) fn pdf(root: &Path, source: &str) -> Result<Vec<u8>, String> {
+        let id = VirtualPath::new("/report.typ")
+            .map(|v| RootedPath::new(VirtualRoot::Project, v).intern())
+            .map_err(|e| format!("{e:?}"))?;
+        let world = Slides {
+            root: root.to_path_buf(),
+            main: Source::new(id, source.to_string()),
+        };
+        let doc = typst::compile::<PagedDocument>(&world)
+            .output
+            .map_err(|errs| {
+                let msgs: Vec<String> = errs.iter().map(|e| e.message.to_string()).collect();
+                format!("the slides did not typeset: {}", msgs.join("; "))
+            })?;
+        typst_pdf::pdf(&doc, &typst_pdf::PdfOptions::default()).map_err(|errs| {
+            let msgs: Vec<String> = errs.iter().map(|e| e.message.to_string()).collect();
+            format!("the PDF was not written: {}", msgs.join("; "))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::Project;
     use crate::Fact;
+    use serde_json::json;
 
     #[test]
     fn record_text_is_a_string_never_markup_or_code() {
@@ -749,24 +1078,127 @@ mod tests {
             para("#read(\"/etc/passwd\")\n**R1. claim**\n\nnext"),
             "#\"#read(\\\"/etc/passwd\\\")\" \\\n#\"R1. claim\"\n\n#\"next\"\n"
         );
+        assert_eq!(
+            md("# H1 <script>![x](y)</script> | *b*"),
+            "\\# H1 &lt;script&gt;\\!\\[x\\](y)&lt;/script&gt; \\| \\*b\\*"
+        );
         assert!(day_of(Some("../../x")).is_err());
         assert!(day_of(Some("2026-10-28")).is_ok());
     }
 
     #[test]
-    fn the_slides_come_from_the_records() {
+    fn a_slide_shows_the_vector_figure_beside_a_png() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("pbmc");
-        let day = "2026-10-28";
-        let d = root.join("results").join(day);
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::create_dir_all(root.join("data")).unwrap();
+        let root = dir.path();
+        let touch = |f: &str| std::fs::write(root.join(f), "").unwrap();
+        touch("qc.png");
+        assert_eq!(sharpest(root, "qc.png"), "qc.png");
+        touch("qc.pdf");
+        assert_eq!(sharpest(root, "qc.png"), "qc.pdf");
+        touch("qc.svg");
+        assert_eq!(sharpest(root, "qc.png"), "qc.svg");
+        let image = |path: &str| {
+            md_block(
+                &Block::Image {
+                    path: path.into(),
+                    caption: "qc".into(),
+                    note: String::new(),
+                    wide: false,
+                },
+                "2026-10-28",
+            )
+        };
+        assert!(image("results/2026-10-28/qc.pdf")
+            .starts_with("[qc](../../../results/2026-10-28/qc.pdf)"));
+        // The report's own folder, and no other day's, is here.
+        assert!(image("results/2026-10-28/report/graph.svg").starts_with("![qc](graph.svg)"));
+        assert!(image("results/2026-10-27/report/graph.svg")
+            .starts_with("![qc](../../../results/2026-10-27/report/graph.svg)"));
+        assert!(image("results/a (1).png").starts_with("![qc](../../../results/a%20%281%29.png)"));
+    }
+
+    #[test]
+    fn the_persons_words_are_quoted_and_the_agents_are_not() {
+        let (theirs, rest) = split_words("> Why 4,\n> not 2?\n\nData: data/a.h5, 6 donors.");
+        assert_eq!(theirs, "Why 4,\nnot 2?");
+        assert_eq!(rest, "Data: data/a.h5, 6 donors.");
+    }
+
+    #[test]
+    fn each_picture_is_shown_once_and_only_the_persons_own_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let day = crate::project::now().0;
+        let d = root.join("results").join(&day);
+        std::fs::create_dir_all(d.join("report")).unwrap();
+        for f in ["umap.png", "umap.svg", "shared.png"] {
+            std::fs::write(d.join(f), "x").unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o664);
+            std::fs::set_permissions(d.join("shared.png"), perms).unwrap();
+        }
+        let line = |tool: &str, out: &str| {
+            format!("{day}\t10:00:00\tsenna\t{tool}\tresults/{day}/{out}\tthe map\t\t[]\n")
+        };
         std::fs::write(
-            root.join("data/README.md"),
-            "# Data\n\n- data/pbmc.h5: 10x PBMC, from 10x Genomics\n",
+            root.join("results/INDEX.tsv"),
+            format!(
+                "{}\n{}{}{}",
+                crate::project::INDEX_HEAD,
+                line("view_export", "umap.png"),
+                line("view_export", "umap.svg"),
+                line("plot", "shared.png")
+            ),
         )
         .unwrap();
-        std::fs::write(d.join("umap.png"), b"\x89PNG").unwrap();
+        let p = Project::new(root.to_path_buf(), "legume", "0");
+        p.ledger(
+            crate::notebook::FIGURES,
+            &[vec![
+                "3".into(),
+                format!("results/{day}/gone.png"),
+                String::new(),
+                "x".into(),
+            ]],
+        );
+        // An earlier build's slides, which must not outlive a failed one.
+        std::fs::write(d.join("report/report.pdf"), "old").unwrap();
+        let built = build(root, Some(&day)).unwrap();
+        let md = std::fs::read_to_string(&built.md).unwrap();
+        assert_eq!(md.matches("umap.svg)").count(), 1, "{md}");
+        #[cfg(unix)]
+        assert!(
+            !md.contains("## Image: shared.png"),
+            "others can change it: {md}"
+        );
+        assert!(md.contains("gone.png is not there"), "{md}");
+        if built.pdf.is_err() {
+            assert!(!d.join("report/report.pdf").exists());
+        }
+    }
+
+    #[test]
+    fn the_slides_come_from_the_records_and_the_persons_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pbmc");
+        let day = crate::project::now().0;
+        let d = root.join("results").join(&day);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::write(root.join("data/pbmc.h5"), "x").unwrap();
+        // A real PNG, 1x1, for the PDF to embed.
+        std::fs::write(
+            d.join("umap.png"),
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+            )
+            .unwrap(),
+        )
+        .unwrap();
         std::fs::write(
             root.join("results/INDEX.tsv"),
             format!(
@@ -790,93 +1222,71 @@ mod tests {
             ),
         )
         .unwrap();
-        std::fs::write(
-            d.join("notebook.md"),
-            "# Notebook\n\n## 10:01:00 · legume · plan\n\nWhy is cluster 4 apart, rather than with 2?\n\n\
-             ## 10:06:00 · legume · interpretation (proposed)\n\n**R1. stress** #emph[x]\n\n**R2. a donor**\n",
-        )
-        .unwrap();
-        let b = build(
-            &root,
-            Some(day),
-            Some("We asked why *cluster 4* stands apart."),
-            false,
-        )
-        .unwrap();
-        let typ = std::fs::read_to_string(&b.typ).unwrap();
-        assert!(typ.contains("= Story\n"), "{typ}");
-        assert!(
-            typ.contains("#\"We asked why *cluster 4* stands apart.\""),
-            "{typ}"
+        let p = Project::new(root.clone(), "legume", "0");
+        let note = |args: serde_json::Value| {
+            let (label, text, _) = crate::notebook::notebook_entry(&args, &p).unwrap();
+            p.notebook(&label, &text);
+        };
+        note(
+            json!({ "kind": "plan", "words": "Why is cluster 4 apart, rather than with 2? #set page(width: 1cm)" }),
         );
-        assert!(
-            typ.contains("#\"Why is cluster 4 apart, rather than with 2?\""),
-            "{typ}"
+        note(
+            json!({ "kind": "data", "path": "data/pbmc.h5", "words": "10x PBMC, from 10x Genomics", "verdict": "caveats" }),
         );
-        assert!(
-            typ.contains("#\"data/pbmc.h5: 10x PBMC, from 10x Genomics\""),
-            "{typ}"
+        note(
+            json!({ "kind": "hypothesis", "words": "Cluster 4 is stressed *monocytes*", "rivals": ["damaged cells"] }),
         );
-        assert!(
-            typ.contains("image(\"/results/2026-10-28/report/graph.svg\""),
-            "{typ}"
+        note(
+            json!({ "kind": "figure", "output": format!("results/{day}/umap.png"), "number": "2B", "hypothesis": "H1", "words": "cluster 4 sits apart" }),
         );
+        note(json!({ "kind": "summary", "words": "We asked why cluster 4 stands apart." }));
+
+        let b = build(&root, Some(&day)).unwrap();
+        assert!(b.summary && b.graph.is_some());
+        let text = std::fs::read_to_string(&b.md).unwrap();
+        for want in [
+            "## The day, in the person's words",
+            "> We asked why cluster 4 stands apart.",
+            "> Why is cluster 4 apart, rather than with 2? \\#set page(width: 1cm)",
+            "| data/pbmc.h5 | 10x PBMC, from 10x Genomics | **caveats** |",
+            "(flagged: above 0.2)**",
+            "## Figure 2B",
+            "](../../../results/",
+            "## Hypothesis H1",
+            "> Cluster 4 is stressed \\*monocytes\\*",
+            "**Rivals:** damaged cells",
+            "**Would nullify it:** not said yet",
+            "runall.sh, line 4: senna view export",
+            "H1: what result would make you drop it?",
+        ] {
+            assert!(text.contains(want), "{want} in {text}");
+        }
+        assert!(!text.contains("old.json"), "another day's steps stay out");
         assert!(
-            typ.contains("#warn[#\"flagged: mito 0.31 (flagged: above 0.2)\"]"),
-            "{typ}"
+            !text.contains("## Image: umap.png"),
+            "a kept figure shows once"
         );
-        assert!(
-            !typ.contains("old.json"),
-            "another day's steps stay out: {typ}"
+        let source = typst(
+            &slides(&root, &day, &Records::read(&root, &day), &[], None),
+            "pbmc",
+            &day,
         );
-        // The figure, with the line that made it.
-        assert!(
-            typ.contains("image(\"/results/2026-10-28/umap.png\""),
-            "{typ}"
-        );
-        assert!(
-            typ.contains("results/2026-10-28/runall.sh, line 4: senna view export --out results/2026-10-28/umap.png"),
-            "{typ}"
-        );
-        // No reading accepted: said, and the proposal shown as text.
-        assert!(typ.contains("#warn[Not yet interpreted.]"), "{typ}");
-        assert!(typ.contains("#\"R1. stress #emph[x]\""), "{typ}");
-        assert!(typ.contains("*Tools:* #\"senna 0.9.0\""), "{typ}");
-        assert!(b.graph.is_some() && b.story);
-        assert!(std::fs::read_to_string(d.join("report/story.md"))
-            .unwrap()
-            .starts_with("We asked"));
-        // Built again without a story, the day's is kept.
-        let again = build(&root, Some(day), None, false).unwrap();
-        assert!(again.story);
-        let words = said(&root, &again);
-        assert!(
-            words.contains("Slides: results/2026-10-28/report/report.typ"),
-            "{words}"
-        );
-        assert!(words.contains("No PDF (not asked for"), "{words}");
-        // The graph on its own.
-        let text = graph(&root, Some(day), false, "text").unwrap();
-        assert!(
-            text.contains("view_export (senna · 2026-10-28 10:05)"),
-            "{text}"
-        );
-        assert!(graph(&root, Some(day), true, "text")
-            .unwrap()
-            .contains("old.json"));
-        assert!(build(&root, Some("2026-01-01"), None, false).is_err());
-        // A new story keeps the one before.
-        build(&root, Some(day), Some("Another story."), false).unwrap();
-        assert!(std::fs::read_to_string(d.join("report/story.1.md"))
-            .unwrap()
-            .starts_with("We asked"));
+        assert!(source
+            .contains("#\"Why is cluster 4 apart, rather than with 2? #set page(width: 1cm)\""));
+        #[cfg(feature = "pdf")]
+        {
+            let pdf = std::fs::read(b.pdf.as_ref().unwrap()).unwrap();
+            assert!(pdf.starts_with(b"%PDF"), "a PDF");
+            assert!(said(&root, &b).starts_with("Slides: results/"));
+        }
+        assert!(build(&root, Some("2026-01-01")).is_err());
         // A tool's output there is not replaced.
         let mut index = std::fs::read_to_string(root.join("results/INDEX.tsv")).unwrap();
         index.push_str(&format!(
             "{day}\t11:00:00\tsenna\tview_export\tresults/{day}/report/graph.svg\ta map\t\t[]\n"
         ));
         std::fs::write(root.join("results/INDEX.tsv"), index).unwrap();
-        let Err(e) = build(&root, Some(day), None, false) else {
+        let Err(e) = build(&root, Some(&day)) else {
             panic!("a tool's output replaced");
         };
         assert!(

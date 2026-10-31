@@ -43,19 +43,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub mod brain;
-#[cfg(feature = "chat")]
-pub mod chat;
 #[cfg(feature = "clap")]
 pub mod cli;
 mod evidence;
 mod hints;
+pub mod init;
 pub use hints::{Annotations, Next, Prompt, PromptArg};
 mod graph;
 pub mod job;
 mod jobs;
 mod notebook;
 mod records;
-pub mod report;
+mod report;
 #[cfg(all(feature = "sessions", unix))]
 mod session;
 #[cfg(not(all(feature = "sessions", unix)))]
@@ -829,12 +828,12 @@ fn job_next(status: &Value) -> Vec<Next> {
             "it is still running; its outputs do not exist yet",
         )],
         Some("done") => vec![Next::new(
-            "notebook",
+            "legume notebook",
             json!({ "kind": "observation" }),
             "say what it made and what you see in it, with the numbers",
         )],
         Some("failed") => vec![Next::new(
-            "notebook",
+            "legume notebook",
             json!({ "kind": "observation" }),
             "say why it failed (its last lines), and change the call before running it again",
         )],
@@ -847,7 +846,8 @@ const JOBS_NOTE: &str = "\
 A tool may run a long step as a background job and return its id (job-N) at \
 once: follow it with job_status or job_wait (wait again while it runs), and \
 stop it with job_cancel. Its outputs exist once it is done; do not use them \
-before.";
+before. Tell the person in plain words what is running and about how long it \
+takes, not the job's id.";
 /// How jobs end, after [`JOBS_NOTE`].
 #[cfg(all(feature = "sessions", unix))]
 const JOBS_END: &str = " A job whose status names a session runs in that \
@@ -940,7 +940,7 @@ where
         let records = records.clone();
         let listening = f.listen(steer.clone(), move |text| {
             if let Some(p) = &records {
-                p.notebook("user", text);
+                p.notebook("note (user)", &notebook::quote(text));
             }
         });
         if let Err(e) = listening {
@@ -1007,9 +1007,10 @@ where
     };
     let mut specs = handler.tools();
     let prompts = handler.prompts();
-    let builtin_notebook = records.is_some() && !specs.iter().any(|t| t.name == "notebook");
+    // The one notebook is the `legume` server's.
+    let builtin_notebook = full && records.is_some() && !specs.iter().any(|t| t.name == "notebook");
     if builtin_notebook {
-        specs.push(notebook::notebook_spec(full));
+        specs.push(notebook::notebook_spec());
     }
     let jobs: Arc<Jobs> = Arc::default();
     let builtin_jobs = !full && !specs.iter().any(|t| JOB_TOOLS.contains(&t.name.as_str()));
@@ -1130,11 +1131,10 @@ where
                 }
                 if builtin_notebook && name == "notebook" {
                     let p = records.as_ref().expect("a built-in notebook has records");
-                    let result =
-                        notebook::notebook_entry(&args, p, full).map(|(label, text, told)| {
-                            p.notebook(&label, &text);
-                            told.map(Content::Text).into_iter().collect()
-                        });
+                    let result = notebook::notebook_entry(&args, p).map(|(label, text, told)| {
+                        p.notebook(&label, &text);
+                        told.map(Content::Text).into_iter().collect()
+                    });
                     done.respond(call_result(result));
                     continue;
                 }

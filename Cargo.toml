@@ -29,25 +29,28 @@ serde_json = "1.0"
 
 # The terminal session the view runs in (`<tool> mcp watch`).
 legume-tui = { version = "0.3.15", default-features = false, optional = true }
-ratatui = { version = "0.30", default-features = false, features = ["crossterm", "unstable-rendered-line-info"], optional = true }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"], optional = true }
 
 # A tool's command line as an agent sets it (`legume_mcp::cli`).
 clap = { version = "4.6", optional = true }
 
+# The report's PDF, typeset in this program: Typst and the fonts it ships
+# (`pdf`, on by default; a tool that uses only the library takes
+# `default-features = false`).
+typst = { version = "0.15.1", optional = true }
+typst-assets = { version = "0.15.1", features = ["fonts"], optional = true }
+typst-layout = { version = "0.15.1", optional = true }
+typst-pdf = { version = "0.15.1", optional = true }
+
 [features]
+default = ["pdf"]
+pdf = ["dep:typst", "dep:typst-assets", "dep:typst-layout", "dep:typst-pdf"]
 tui = ["dep:legume-tui", "dep:ratatui"]
 clap = ["dep:clap"]
 # Background steps that run in a detachable session of the tool's own TUI
 # (`Call::start_session_job`): a person attaches to watch them, and they
 # outlive the server.
 sessions = ["dep:legume-tui"]
-# `legume chat`: the tools with a model on this machine, through an
-# OpenAI-compatible server (no new dependency).
-chat = []
-# `legume chat` on a screen of its own, the conversation beside the
-# project's records, in a session the person can leave and come back to
-# (`legume attach`).
-screen = ["chat", "tui", "legume-tui/clap"]
 
 [target.'cfg(unix)'.dependencies]
 # geteuid and O_NOFOLLOW, to leave alone record files this user does not own.
@@ -74,15 +77,3 @@ required-features = ["tui"]
 [[test]]
 name = "cli"
 required-features = ["clap"]
-
-[[test]]
-name = "chat"
-required-features = ["chat"]
-
-[[test]]
-name = "chat_consent"
-required-features = ["chat"]
-
-[[test]]
-name = "chat_screen"
-required-features = ["screen"]

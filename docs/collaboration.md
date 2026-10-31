@@ -2,70 +2,80 @@
 
 A white paper on how a person and an AI agent analyse data together with the
 legume tools (faba, data-beans, senna, pinto, lupin, chickpea, cocoa), and how
-the work is kept so anyone can check it and run it again. The tools run the
-steps; the `legume` server (`legume mcp`, from legume-mcp) keeps the reasoning
-they share, and serves this paper a section at a time (its `guide` tool, or
-`legume guide` on the command line).
+the work is kept so anyone can check it, run it again and write it up. The
+tools run the steps; the `legume` server (`legume mcp`, from legume-mcp)
+keeps the project's notebook, and serves this paper a section at a time (its
+`guide` tool).
 
 It is written for two readers:
 
 - **People** who run analyses with an agent and want to know what to expect.
-- **Agents**, including small models. The quick card below and sections 4 to
-  11 are the rules an agent follows. They are plain steps on purpose. If you
-  are an agent, read them fully before you call a tool.
+- **Agents**. The quick card below and sections 4 to 11 are the rules an
+  agent follows. They are plain steps on purpose. If you are an agent, read
+  them fully before you call a tool.
 
-Some features are new in legume-mcp 0.5.0 or still planned. Section 14 lists
+Some features are new in legume-mcp 0.5.0 or still planned; section 14 lists
 what is available now. For how to call a tool's own functions (its
 arguments, what `out` does), follow that tool's instructions. For the
-notebook, follow this paper: some tools' instructions still say to close with
-kind `conclusion`, which is the old name (section 14).
+notebook, follow this paper.
 
-**Two notebooks, one record.** Every tool's server has a `notebook` for the
-`plan`, `observation` and `note`. The `legume` server's `notebook` takes
-those too, and the reasoning: `interpretation`, `answer`, `evidence`,
-`offer` and `choice`. All write the same `results/<day>/notebook.md`.
+**One notebook.** The `legume` server's `notebook` is the project's only
+one: the tools' servers have none. It writes `results/<day>/notebook.md`.
+
+**The rule.** The person thinks; the agent runs the tools, shows the facts,
+asks and checks. The agent never writes what a result means, a hypothesis, a
+verdict, a figure's message or a summary: it asks, and records the person's
+words. Science is also how the person learns, so the agent explains what
+each number measures and asks the person to predict before it shows a result.
 
 ---
 
 ## Quick card for agents
 
 ```text
- 1. Find the project folder in the tools' instructions ("under the project ...").
-    If it looks wrong (a folder of source code, e.g. with Cargo.toml and src/;
-    your home folder), tell the person. Read data/README.md if it is there.
- 2. First call: notebook kind "plan": the question as a contrast (fact rather
-    than foil), the data, and two or more sources of evidence that share as
-    little as possible (section 8.3). Several tools on the same data are
-    one source.
- 3. Look before you change: read-only tools first.
- 4. Never overwrite. If a tool refuses, read its message and change the call.
- 5. A job id ("job-3") means: call job_wait {"id": "job-3"} until it is done.
-    Use its outputs only after that.
- 6. After a step: notebook kind "observation", with numbers and thresholds.
- 7. To say what something means: on the legume server, notebook kind
-    "interpretation" with 2+ readings (it also takes answer, evidence, offer
-    and choice; a tool's own notebook refuses them),
-    each claim as "<fact> rather than <foil>, because <difference>".
-    Then ask the person which hold.
- 8. Their reply: notebook kind "answer" with "chose" (numbers) and "words" (exact).
-    "ok" or "continue" is not an answer: ask again. The readings chosen
-    become hypotheses H1, H2, ... (the result says which).
- 9. For each source of evidence on a hypothesis: notebook kind "evidence"
-    with "hypothesis", "source", "class", "verdict" and the numbers in "text"
-    (section 8.5). The result is its table, the verb it allows and the
-    sources not yet used. Offer the next sources, ones that share little
-    with the sources that agree (section 8.6): notebook kind "offer" with
-    numbered "options", then ask. Their reply: kind "choice" with
-    "chose" and "words", never "answer". Published data sets are one such
-    source: search only after they choose it, and never invent an accession.
-10. Use the verb the agreeing sources allow. "Drives" only with genetic,
+ 1. First, call `status` on the legume server and tell the person where the
+    project stands, in plain words: the data and what is not recorded about
+    it, what was done, the hypotheses, and what is open for them. If the
+    project folder looks wrong (source code, your home folder), say so.
+ 2. Ask the person's question, as a contrast (this rather than that), and
+    what result would change their mind. Record their words: notebook kind
+    "plan" with "words".
+ 3. Data whose origin or quality they have not given: run the read-only
+    checks, explain each number (what it measures, what is typical), say
+    what argues against the data, and ask. Record their words: kind "data"
+    with "path", "words" and their "verdict" (good, caveats, bad).
+ 4. Read-only tools before steps. Never overwrite; if a tool refuses, read
+    why and change the call. Before a step, ask what they expect to see.
+    A cutoff is the person's to choose: show what each choice removes (a
+    dry run with its figure, or the tool's own view, section 7), then run
+    the step with their settings, so it is recorded.
+ 5. A long step runs as a job: follow it with job_wait until it is done, and
+    tell the person plainly what is running and about how long it takes.
+ 6. After a step: kind "observation", with numbers and thresholds. This is
+    yours: what was done and seen, not what it means.
+ 7. Never say what a result means, even if asked to. Ask. When the person
+    states a hypothesis, ask what else could explain it and what would
+    nullify it. Record their words: kind "hypothesis" with "words",
+    "rivals" and "nullify"; it is numbered H1, H2, ... (section 5).
+ 8. To test a hypothesis, tell the person which kinds of source could
+    corroborate or nullify it and what each shares with our cells
+    (section 8); they choose. Show the numbers, ask whether it agrees,
+    disagrees or is mixed, and why. Record kind "evidence" with
+    "hypothesis", "source", "class", "verdict", the numbers in "text" and
+    their reason in "words". The result is its table, the verb it allows
+    and the sources not yet used.
+ 9. Use only the verb the table allows. "Drives" only with genetic,
     perturbation or applied-treatment evidence.
-11. Never decide alone what a result means, even if asked to. A result that
-    ends "Next, if the person agrees" lists calls to propose, not to run.
-12. At the end: the `legume` server's `report`, with your story of the day
-    (the rest of the slides is the records); then where the records and the
-    slides are, and for each hypothesis its table and the source still
-    missing.
+10. When the person wants a figure or table for the paper: have the tool
+    write it as SVG or PDF (data-beans `plot` with `out` ending .svg;
+    senna or pinto `view_export` with `pdf`), so it stays sharp on slides
+    and in print. Then kind "figure" with "output", their "number" (2B) and
+    their take-home in "words"; ask which hypothesis it supports.
+11. At the end of the day: ask for their summary (what changed, what argues
+    against it, what is next) and record their words, kind "summary". Then
+    build the slides with `report` and tell them where the records and
+    the slides are. A result that ends "Next, if the person agrees" lists
+    calls to propose, not to run.
 ```
 
 ---
@@ -79,24 +89,25 @@ of study, each with its own bias. One data set carries its own bias however
 many tools read it, so several tools on the same data are one source. When
 sources with different biases agree, the claim is stronger; when they
 disagree, the disagreement shows which bias to look at. The tools compute
-facts from a source. The agent plans, runs the tools, proposes what the
-results might mean and, after each answer, proposes the next source that
-could confirm or break the claim. The person decides what the
-results mean and how far to go. Everything is written down in the project
-folder, so the work can be checked and run again without the agent. The
-records follow two guides by W. S. Noble: how to organise a computational
-biology project (2009) and how to define one (2023).
+facts from a source. The agent runs the tools, shows the facts, asks the
+questions that make the person think, and checks what they write against the
+records. The person decides what the results mean, which sources to pursue,
+and how far to go, and writes it in their own words. Everything is written
+down in the project folder, so the work can be checked, run again and
+written up as a paper. The records follow two guides by W. S. Noble: how to
+organise a computational biology project (2009) and how to define one
+(2023).
 
 ## 2. Who does what
 
 | | Does | Never does |
 |---|---|---|
-| **Tool** | Computes and states facts: counts, fits, scores, tables, figures. Records every step it runs. Refuses bad input with a message that says what to fix. | Decides what a result means. Overwrites an earlier result. |
-| **Agent** | Plans, runs tools, reads results, writes the notebook, proposes several possible readings, asks the person, records the reply, proposes the next source of evidence. | Decides alone what a result means. Rewrites the person's words. Hides a failed or doubtful step. |
-| **Person** | Sets the question. Answers the agent's proposals. Decides what the results mean. Stops or redirects the work. | Has to remember what was done: the records do that. |
+| **Tool** | Computes and states facts: counts, fits, scores, tables, figures. Records every step it runs, with its inputs and key numbers, and flags a number that looks wrong. Refuses bad input with a message that says what to fix. | Decides what a result means. Overwrites an earlier result. |
+| **Agent** | Runs the tools, reads results, explains what each number measures, asks what the person expects and what they think, records what was done and seen, records the person's words, checks them against the records, and names what argues against. | Says what a result means. Writes the person's hypothesis, verdict, take-home or summary. Rewrites their words. Hides a failed or doubtful step. |
+| **Person** | Sets the question. Judges the data. States hypotheses and their rivals. Judges each source of evidence. Keeps the figures for the paper. Summarises the day. | Has to remember what was done: the records do that. |
 
-The short version: **tools state facts, the agent proposes, the person
-decides.**
+The short version: **tools state facts, the agent asks and checks, the
+person thinks and writes.**
 
 ## 3. The project folder
 
@@ -104,17 +115,23 @@ All work happens in one project folder. Every tool writes its records there.
 
 ```text
 <project>/
+  .legume/                marks the project (legume init)
   data/                   inputs
-  data/README.md          where each input came from, and when
+  data/README.md          where each input came from, in the person's words or a tool's
   results/
     INDEX.tsv             one row per output: date, time, server, tool, file, summary,
                           the files it was made from, its key numbers
-    HYPOTHESES.tsv        the readings the person chose, numbered H1, H2, ...
-    EVIDENCE.tsv          what each source of evidence says of a hypothesis
-    <YYYY-MM-DD>/         one folder per day
+    DATA.tsv              the person's verdict on each data file, and why
+    HYPOTHESES.tsv        the person's hypotheses, H1, H2, ..., with their rivals and
+                          what would nullify each
+    EVIDENCE.tsv          what each source of evidence says of a hypothesis, and why
+                          the person judged it so
+    FIGURES.tsv           the figures and tables the person kept for the paper
+    <YYYY-MM-DD>/         one folder per working day (it turns over at 5 a.m.)
       runall.sh           every step of the day, in order; running it repeats the work
-      notebook.md         the day's account: plan, observations, readings, answers
-      chat.md             the day's chats with a local model (legume chat), and the model
+      notebook.md         the day's account: plan, data, observations, hypotheses,
+                          evidence, figures, summary
+      report/             the day's slides: report.pdf, report.md, graph.svg
       ...                 outputs the agent did not name
 ```
 
@@ -122,190 +139,148 @@ What each record is for:
 
 - **`runall.sh`** repeats the work without the agent:
   `bash results/<day>/runall.sh`. Steps that failed stay in it as comments.
-- **`notebook.md`** is the story of the day: what was asked, done and seen,
-  and what it means. The tools' outputs hold the facts; the notebook holds
-  the reasoning.
+- **`notebook.md`** is the story of the day. The agent's entries say what was
+  done and seen; everything else is the person's words, quoted.
 - **`INDEX.tsv`** says which file came from which tool, with a one-line
   summary, the files it was made from (`inputs`) and its key numbers
   (`facts`: cells kept of how many, hits at which threshold). A tool flags a
-  number that looks wrong; `legume` `status` lists the flagged ones. Raise
-  them with the person before building on that output. Following `inputs`
-  back tells whether two results come from the same data, and so are one
-  source (section 8.3).
-- **`data/README.md`** says where each input came from.
+  number that looks wrong; `status` lists the flagged ones. Raise them with
+  the person before building on that output. Following `inputs` back tells
+  whether two results come from the same data, and so are one source
+  (section 8.3).
+- **`data/README.md`** and **`DATA.tsv`** say where each input came from and
+  whether the person judged it good.
 - **`HYPOTHESES.tsv`** and **`EVIDENCE.tsv`** are the project's
   triangulation ledger: they outlive the day, so a hypothesis keeps its
   number and its table across days.
+- **`FIGURES.tsv`** lists what the person kept for the paper, by number,
+  with the claim each supports and its take-home.
 
 Two practical rules:
 
-- The project folder is the server's working folder, or the folder named by
-  the environment variable `LEGUME_MCP_PROJECT`. Each tool's instructions
-  say which, in a sentence like "Records ... under the project
-  /path/to/project". Set `LEGUME_MCP_PROJECT` when you register the tools,
-  or the records land wherever the client was started.
-- Records are only ever added to. Nothing in them is rewritten.
+- The project folder is the one `legume init` marked, found from any
+  subfolder the agent starts in; else the server's working folder, or the
+  folder named by the environment variable `LEGUME_MCP_PROJECT`.
+- Records are only ever added to. Nothing in them is rewritten; a hypothesis
+  revised is a new row, the latest one counts.
 
-## 4. The working loop
+## 4. The working day
 
-Every piece of work follows the same loop, in this order.
+**Start.**
 
-1. **Check the folder.** Read the project folder from the tools'
-   instructions (no call needed). If it looks wrong (a folder of source code,
-   with files such as `Cargo.toml` and `src/`; your home folder), tell the
-   person before anything else. Read `data/README.md` if it is there: the
-   plan names the data.
-2. **Plan.** Notebook kind `plan`: the question as a contrast (fact and
-   foil, section 8.1), the data, the sources of evidence you expect to use
-   (two or more that share as little as possible, section 8.3), and how the
-   result will be checked.
-3. **Look before you change.** Inspect the data with read-only tools (for
-   example data-beans `info`, `names`, `statistics`).
-4. **Run a step.** Call the tool. A long step runs in the background: see
-   section 10, rule 5.
-5. **Observe.** Notebook kind `observation`: what you did and what you saw,
-   with numbers.
-6. **Propose.** When a result needs interpreting: notebook kind
-   `interpretation` with two or more readings (section 5). Then ask the
-   person.
-7. **Record the reply.** Notebook kind `answer` (section 6).
-8. **Triangulate.** When the person has chosen a reading worth more work (a
-   working hypothesis): record what each source says of it as kind
-   `evidence` (section 8.5), which returns its table and the verb it allows
-   now, and offer the next source of evidence, one that
-   shares little with the sources that already agree (section 8.6).
-   Published data sets are one such source (section 9). The person chooses.
-9. **Next step.** Agree the next step with the person, and go back to 3.
-10. **Close.** Tell the person where the records are and, for each working
-    hypothesis, its table, the verb it allows, and the source that would
-    strengthen it most.
+1. **Where we are.** Call `status` and tell the person, in plain words, what
+   the project holds and what is open for them. If the project folder looks
+   wrong (a folder of source code, with files such as `Cargo.toml` and
+   `src/`; a home folder), say so first.
+2. **The question.** Ask it as a contrast (fact and foil, section 8.1), and
+   what result would change their mind. Record their words as the `plan`;
+   you may add the data and the checks, as facts, in `text`.
+3. **The data.** For each file whose origin or quality is not recorded: run
+   the read-only checks (data-beans `info`, `qc` without `out`,
+   `statistics`), explain what each number measures and what is typical,
+   name what argues against the data (one sample, already filtered, an
+   unknown source), and ask. Record their words as `data`.
 
-Examples (a plan and an observation go to any server's notebook):
+**During.**
+
+4. **Before a step, ask what they expect.** The gap between the expectation
+   and the result is where they learn.
+5. **Run the step.** A long step runs as a job (section 10, rule 5): tell the
+   person plainly what is running and about how long.
+6. **Observe.** Record kind `observation`: what you did and saw, with
+   numbers. Show it to the person; ask what they see.
+7. **Their hypotheses.** When the person says what they think a result
+   means, record it as a `hypothesis` in their words, with the rivals they
+   name and what would nullify it (section 5).
+8. **Triangulate.** For a hypothesis worth more work, follow section 8: they
+   choose the sources, judge each, and the table sets the verb.
+9. **Figures.** When a figure or table is worth publishing, the person keeps
+   it as a `figure` (section 6).
+
+**End.**
+
+10. **Their summary.** Ask what changed today, what argues against it, and
+    what is next; record their words as the `summary`. Build the slides
+    with `report`, and tell them where the records and the slides are.
+
+Examples:
 
 ```json
-{"tool": "notebook", "args": {"kind": "plan", "text": "Question: why do the cells of IFN-treated donors differ from those of control donors, cell type by cell type? (fact: treated; foil: control, same cell type)\nData: data/pbmc.zarr.zip, 6 donors (3 control, 3 IFN).\nSources: our cells, donors 1-4 (senna, lupin, cocoa); held-out donors 5 and 6; a published IFN data set if the person chooses it.\nCheck: a finding must hold in donors 5 and 6."}}
+{"tool": "notebook", "args": {"kind": "plan", "words": "Why do the treated donors' monocytes differ from the controls'? I'd drop it if donors 5 and 6 don't show it.", "text": "Data: data/pbmc.zarr.zip, 6 donors (3 control, 3 IFN). Check: held-out donors 5 and 6."}}
 
 {"tool": "notebook", "args": {"kind": "observation", "text": "QC kept 9,812 of 11,204 cells (12% dropped). Donor 4 lost 30%, the others 8-11%."}}
 ```
 
-## 5. Proposing readings
+## 5. Hypotheses, in the person's words
 
-An agent never decides alone what a result means. It proposes **readings**:
-possible explanations, each one testable.
+A hypothesis is the person's: a claim about why something differs, put as a
+contrast. The agent never proposes one; it asks, and records what the person
+says.
 
-Rules:
+When they state one:
 
-1. Give **two or more** readings. The tool refuses fewer.
-2. Each reading has:
-   - `claim` (required): one sentence, the possible explanation.
-   - `rationale` (required): why it is plausible.
-   - `check` (required): what would tell this reading apart from the others.
-   - `evidence` (optional): the facts it rests on, as a list of
-     `{"kind": ..., "term": ...}`. Use one of these kinds:
-     `marker` (a gene), `term` (a GO or pathway term), `statistic` (a
-     number, e.g. "median mito 22%"), `figure` (a file), `step` (an output
-     of an earlier step), `note`.
-   - `alternatives` (optional): what else it could be, and why not, as a list
-     of `{"label": ..., "why_not": ...}`.
-3. When a boring explanation is possible (batch, quality, one donor, chance),
-   make it one of the readings.
-4. The notebook numbers the readings R1, R2, ... in the order you give them.
+1. Record it: `{"kind": "hypothesis", "words": "<their claim, as they said it>"}`.
+   It is numbered H1, H2, ... for the whole project.
+2. Ask **what else could explain it**: batch, quality, one donor, chance, a
+   cell state rather than a type. Record their answer as `rivals`.
+3. Ask **what result would make them drop it**, before looking further.
+   Record it as `nullify`.
+4. Revise a hypothesis by its number: `{"kind": "hypothesis", "hypothesis":
+   "H1", "rivals": [...], "nullify": "..."}`. The latest version counts; the
+   earlier ones stay in the records.
+
+Missing rivals or a missing "would nullify it" are not refused: the result
+tells you the question to ask, and `status` lists it as open until it is
+answered.
 
 Example:
 
 ```json
 {"tool": "notebook", "args": {
-  "kind": "interpretation",
-  "readings": [
-    {"claim": "Topic 7 is higher in treated than in control monocytes because of the interferon response",
-     "evidence": [{"kind": "marker", "term": "ISG15"}, {"kind": "marker", "term": "MX1"}],
-     "alternatives": [{"label": "batch effect", "why_not": "topic 7 is present in both sequencing runs"}],
-     "rationale": "3x higher in treated donors, led by interferon-stimulated genes. Explains: the ISG markers and the monocyte bias. Leaves open: why donor 2 is highest",
-     "check": "pseudobulk per donor: all 3 treated donors higher than all 3 controls"},
-    {"claim": "Topic 7 is higher in treated than in control monocytes because two treated donors carry most of it",
-     "evidence": [{"kind": "statistic", "term": "donors 2 and 3 hold 70% of topic 7 cells"}],
-     "rationale": "most of its cells come from two donors. Explains: the uneven donor counts. Leaves open: why those two",
-     "check": "leave-one-donor-out: the effect stays without donor 2 or 3"}
-  ]}}
+  "kind": "hypothesis",
+  "words": "Topic 7 is higher in treated monocytes because of the interferon response",
+  "rivals": ["two treated donors carry most of it", "a batch effect"],
+  "nullify": "donors 5 and 6 show no rise in ISG15 or MX1"}}
 ```
 
-A call the tool refuses:
+A call the tool refuses: `{"kind": "hypothesis", "text": "Topic 7 is clearly
+interferon."}` (no `words`: the agent's own version is not the person's).
 
-```json
-{"tool": "notebook", "args": {"kind": "interpretation", "text": "Topic 7 is clearly interferon."}}
-```
+## 6. Data, figures and the day's summary
 
-It is one claim, with no evidence, no alternative and no check.
+The other kinds the person writes:
 
-After the readings, **ask the person** which hold. Make answering easy:
-
-> Which of these hold? Reply with numbers (for example "1" or "1 and 3"),
-> or a short line of your own.
-
-Use a multiple-choice question if your client can show one.
-
-## 6. Recording the person's reply
-
-Record the reply with notebook kind `answer`. It has two fields:
-
-- `chose`: the numbers of the readings the person chose. Leave it out when
-  they chose none.
-- `words`: the person's reply, **copied exactly**. Do not shorten, fix or
-  summarise it.
-
-The notebook does the rest: it links the answer to today's latest proposal,
-checks the numbers, and writes who decided.
-
-| The person replies | Call |
+| What | Call |
 |---|---|
-| "2" | `{"kind": "answer", "chose": [2], "words": "2"}` |
-| "1 and 3, but check donor 4" | `{"kind": "answer", "chose": [1, 3], "words": "1 and 3, but check donor 4"}` |
-| "1 I think, not sure" (numbers with a hedge) | `{"kind": "answer", "chose": [1], "words": "1 I think, not sure"}`. The numbers count; the hedge stays in `words`. |
-| "None of these. Cluster 4 is doublets." | `{"kind": "answer", "words": "None of these. Cluster 4 is doublets."}` |
-| "ok" / "continue" / "sounds good" / "whatever you think" / "yes" | **No call.** This does not say which readings hold. Ask again: "Which of R1 to R3 hold? A number is enough." |
-| A reply to a list that is **not** readings: next sources (section 8.6), outside data (section 9) | Kind `choice`, never `answer`: `{"kind": "choice", "chose": [2], "words": "2"}`. The list itself was recorded as kind `offer` when you asked (section 8.6). `answer` takes only reading numbers, so "2" there would mean R2; the notebook refuses an `answer` when the latest question was an offer, and a `choice` when it was a proposal. A bare "yes" to a numbered list is not a choice either: ask which number. |
-| A reply to an **earlier** question, e.g. "Actually R2 holds too" after you made an offer | `{"kind": "note", "by": "user", "text": "Actually R2 holds too"}`, then answer the open question first. If it changes which readings hold, propose them again (a new `interpretation`) so the person can answer it. |
-| "Note: donor 4 was sequenced late." (not about a proposal) | `{"kind": "note", "by": "user", "text": "Note: donor 4 was sequenced late."}` |
+| Where a file came from, and their verdict | `{"kind": "data", "path": "data/pbmc.h5", "words": "the core's 10x run of donors 1-6", "verdict": "caveats"}` |
+| A figure kept for the paper (first have the tool write it as SVG or PDF: a PNG blurs on a slide) | `{"kind": "figure", "output": "results/2026-10-28/umap.svg", "number": "2B", "hypothesis": "H1", "words": "cluster 4 sits apart from the other monocytes"}` |
+| The day's summary | `{"kind": "summary", "words": "<what changed, what argues against it, what is next, as they said it>"}` |
+| Anything else they said | `{"kind": "note", "by": "user", "text": "<their words>"}` |
 
-The notebook then shows:
-
-```text
-## 14:32:10 · senna · interpretation (proposed)
-**R1. Topic 7 is higher in treated than in control monocytes because of the interferon response**
-...
-## 14:35:02 · senna · interpretation (accepted by the user)
-Answers the proposal of 14:32:10 (senna): chose R1. Hypotheses: R1 = H1.
-
-> 1, but check donor 4
-```
-
-Anyone reading it later sees what was proposed, what the person decided, and
-whose words are whose. Each reading chosen becomes a **hypothesis** of the
-project, H1, H2, ..., in `results/HYPOTHESES.tsv`; the same claim chosen
-again keeps its number. Refer to it by that number from then on, on any
-day. An answer that chose readings is recorded as
-"accepted by the user"; one that chose none, as "user override". lupin
-records its labelling decisions the same way, under the names
-`agent_proposed_user_accepted` and `user_override` (field `decided_by`).
-
-If the tool refuses an answer because "there is no proposal today", record
-the person's words as a `note` with `by` `user` instead.
-
-The person is responsible for the interpretation. The tools make that easy
-and visible; they cannot force it. A report built from a notebook with only
-proposed readings shows "not yet interpreted".
+Always the person's own words: do not shorten, fix or summarise them. When
+they reply only "ok" or "continue", nothing is recorded: ask again.
 
 ## 7. When someone asks the agent to decide
 
 Sometimes the person says "just tell me what it means" or "you decide".
-The agent still does not decide alone. It answers like this:
+The agent still does not decide. It answers like this:
 
-> Here are the readings I think are most likely, with what would tell them
-> apart: R1 ..., R2 ... I lean towards R1 because ... Which do you want to go
-> with? Reply with a number.
+> What do you see in it? Here are the facts: ... Things that often explain a
+> pattern like this are ...; what would tell them apart is ... Which do you
+> think holds, and why?
 
-Giving a preference is fine. Recording it as the person's decision is not.
-Only the person's reply, recorded as an `answer`, decides.
+Naming the usual explanations and what would tell them apart is fine; it
+helps the person think. Choosing one for them is not, and nothing is
+recorded as theirs that they did not say.
+
+Cutoffs and thresholds are the person's choice as well. Show them what
+each choice would do: a dry run, with its figure. Where the tool has a
+view of its own for the choice, offer it. In data-beans `qc` on a
+terminal, the person moves each rule's edge, sees how many cells only it
+removes, and presses `p` for the flags that pick the same cells. Then
+run the step through the tool's server with those settings, so
+`runall.sh` repeats it: a choice made in a view and never run here is
+not in the records.
 
 ## 8. Explaining by contrast, checking by triangulation
 
@@ -320,34 +295,35 @@ here *rather than* there: the **fact** and the **foil**.
 - Fact: monocytes of IFN-treated donors express topic 7.
 - Foil: monocytes of control donors do not.
 
-A reading names a **difference** between the two sides that could cause the
-contrast (Lipton's difference condition).
+A hypothesis names a **difference** between the two sides that could cause
+the contrast (Lipton's difference condition).
 
-**Rule.** Write each claim as "<fact> rather than <foil>, because
-<difference>". For example: "Topic 7 is higher in treated than in control
-monocytes because of the interferon response."
+**Rule.** Help the person put each claim as "<fact> rather than <foil>,
+because <difference>". For example: "Topic 7 is higher in treated than in
+control monocytes because of the interferon response." Ask; do not rephrase
+their claim for them.
 
 **Rule.** Choose the foil as close to the fact as you can: the same cell
 type, the same batch, ideally one difference. A foil that differs in many
 ways (another tissue, another lab) explains little.
 
-A reading's "because" is a proposal to test, not a finding. The verb rule
-(8.3) is for what you write as found: observations, the triangulation table
-and the close.
+A hypothesis's "because" is a claim to test, not a finding. The verb rule
+(8.3) is for what is written as found: observations, the triangulation table
+and the summary.
 
-### 8.2 Ranking readings: likelier and lovelier
+### 8.2 Ranking hypotheses: likelier and lovelier
 
-**Rule.** In each reading's `rationale`, add two lines:
+**Rule.** When the person weighs their hypothesis against its rivals, ask
+them two things:
 
-- **Explains:** which observations it accounts for.
-- **Leaves open:** what it does not explain.
+- **What does it explain?** Which observations it accounts for.
+- **What does it leave open?** What it does not explain.
 
-A reading backed by more evidence is *likelier*. A reading that explains more
+A hypothesis backed by more evidence is *likelier*. One that explains more
 and leaves less open is *lovelier*. They are not the same. Loveliness decides
-which reading to test first; only the check decides which holds. Language
-models are good at lovely stories, and in single-cell data the dull reading
-(batch, one donor, quality) is often the likeliest. When you say which you
-lean towards (section 7), say whether it is likelier or lovelier.
+which to test first; only the test decides which holds. Lovely stories are
+easy to believe, and in single-cell data the dull rival (batch, one donor,
+quality) is often the likeliest: make sure the person has weighed it.
 
 ### 8.3 Sources of evidence
 
@@ -396,8 +372,8 @@ same cells are one. The same cells' other measurements (chromatin, alleles)
 count as a source of their own, but name what they share: the cells and the
 donors. They do not replicate a claim; only a source with other cells does.
 
-**Rule.** A disagreement is information. Ask which source's bias could
-explain it, and make that one of the readings. Two sources can also disagree
+**Rule.** A disagreement is information. Ask the person which source's bias
+could explain it, and name that bias as a rival for them to weigh. Two sources can also disagree
 because they see different things: allele balance sees a copy-neutral loss
 of heterozygosity that expression cannot.
 
@@ -503,25 +479,24 @@ the claim got (one group of cells; replicated; replicated with genetics or a
 perturbation). The "shares" column comes from the kind you gave. Anything that does not
 agree is named after it, to be named with the verb. The result also lists
 the kinds of source not yet used, those that would raise the verb first:
-offer from them (8.6). A source given a second time with another class is
-refused: one source keeps one class.
+name them to the person (8.6). A source given a second time with another
+class is refused: one source keeps one class.
 
-Then, if a source disagrees or something is unexplained, propose readings on
-it and ask, as usual. If the agreeing sources keep the hypothesis, offer the
-next sources (8.6). Write anything no reading explains as an observation
-starting "Unexplained:". Over a project these add up. Several pointing the
-same way are worth a reading of their own, including "something not yet
-named".
+Then, if a source disagrees or something is unexplained, show the person and
+ask what they make of it. Write anything no hypothesis explains as an
+observation starting "Unexplained:". Over a project these add up; point them
+out, since several pointing the same way may be worth a hypothesis of the
+person's own, including "something not yet named".
 
 ### 8.6 Choosing the next source
 
-After each answer that keeps a working hypothesis, offer what to use next.
-This is the step that turns a description into a causal claim.
+After each piece of evidence, name what could come next. This is the step
+that turns a description into a causal claim, and the person chooses it.
 
-**Rule.** Offer sources that share little with the sources that already
-agree. Another analysis of the same data adds nothing. The order of the
-list is not a ranking: say which one you lean towards and why (what it
-shares with the agreeing sources, what it costs).
+**Rule.** Name sources that share little with the sources that already
+agree. Another analysis of the same data adds nothing. For each, say what it
+shares with the agreeing sources, what it costs, and whether it could
+nullify the hypothesis, not only corroborate it.
 
 **Rule.** Aim for the next verb up:
 
@@ -531,34 +506,25 @@ shares with the agreeing sources, what it costs).
 | "is associated with, in these donors" | held-out donors (section 12); another study (section 9) | "is associated with", replicated |
 | "is associated with", replicated | genetics (faba `snp`; copy number backed by allele balance, mung `donors --baf`; fine-mapping is planned); a perturbation (published data, or its genes as a gene set for lupin, 8.4) | "affects", "drives" |
 
-**Rule.** Offer the sources as numbered choices, with what each would add,
-what it shares with the agreeing sources and what it costs, and always
+**Rule.** Put the sources as numbered choices, in plain words, and always
 include stopping:
 
-> R1 now allows "is associated with, in these donors": in our cells (donors
-> 1-4), cell state and cocoa agree. That is one source. Next sources, pick
-> any:
+> H1 now allows "is associated with, in these donors": in our cells (donors
+> 1-4), cell state and cocoa agree. That is one source. What could
+> corroborate it, or nullify it:
 >
 > 1. Held-out donors 5 and 6: other donors, same lab (minutes; the split is
->    done).
+>    done). You said no rise in ISG15 or MX1 there would make you drop it.
 > 2. The same cells' ATAC: chickpea peak-to-gene links for the ISG genes
 >    (shares the cells; about an hour).
 > 3. Another study: a published IFN data set (section 9).
 > 4. Perturbation: a published IFN-receptor knockout's genes, as a gene set
 >    for lupin (8.4).
-> 5. Stop here for R1: it stays "associated, one source".
+> 5. Stop here for H1: it stays "associated, one source".
 
-Record the list as kind `offer` before you ask, and the reply as kind
-`choice` (section 6), never as an `answer`:
-
-```json
-{"tool": "notebook", "args": {"kind": "offer", "text": "Next sources for R1 (now: is associated with, in these donors; one source: our cells, donors 1-4).", "options": ["Held-out donors 5 and 6", "The same cells' ATAC: chickpea links for the ISG genes", "Another study: a published IFN data set", "Perturbation: a published IFN-receptor knockout's genes as a gene set", "Stop here for R1"]}}
-
-{"tool": "notebook", "args": {"kind": "choice", "chose": [1, 3], "words": "1, then 3"}}
-```
-
-Stopping is a legitimate choice. "Stop here" ends work on this hypothesis;
-if it is unclear whether the person means the whole day, ask. The person
+The person chooses; what they choose shows in the next step and its
+evidence, so the list itself is not recorded. Stopping is a legitimate
+choice: if it is unclear whether they mean the whole day, ask. The person
 decides how far to go; the table records how far the claim got.
 
 **Rule.** A source that disagrees is as valuable as one that agrees. Add it
@@ -568,10 +534,10 @@ to the table. Never leave it out to keep the claim tidy.
 
 | Step | From | In this paper |
 |---|---|---|
-| Generate readings | Peirce: abduction | readings R1, R2, ... (section 5) |
+| Generate hypotheses and their rivals | Peirce: abduction | the person's hypotheses H1, H2, ..., with rivals (section 5) |
 | Rank them by contrast | Lipton: inference to the best explanation | fact and foil; likelier and lovelier (8.1, 8.2) |
 | Choose the next source by what it shares | triangulation | the next source (8.6) |
-| Test with predictions fixed first | Popper: falsification | `check`; the `plan` before outside data (section 9) |
+| Test with predictions fixed first | Popper: falsification | "would nullify it" (`nullify`); the `plan` before outside data (section 9) |
 | Combine sources with different biases | Lawlor, Tilling and Davey Smith; Munafò and Davey Smith: triangulation | sources, common terms and the table (8.3 to 8.5) |
 | Refine without merely fitting | Lakatos: progressive and degenerating programmes | a refined hypothesis needs a new test (section 9) |
 | Keep what does not fit | Kuhn: anomalies | the "Unexplained" observations (8.5) |
@@ -583,16 +549,16 @@ that others have published can confirm it, sharpen it, or show that it is
 wrong. Using them costs time, and some need permission to access, so it is
 the person's choice. The agent asks.
 
-**When to ask.** As one of the next sources (section 8.6), once a reading has
-become a **working hypothesis**: the person chose it in an `answer`, and it
-is worth more work. When exploring (section 13), this is after stage 4, the
-shortlist. If the person passes it over or says "not now", leave outside
-data out of later lists for that hypothesis unless they bring it up.
+**When to ask.** As one of the next sources (section 8.6), for a hypothesis
+the person wants to take further. When exploring (section 13), this is after
+stage 4, the shortlist. If the person passes it over or says "not now", leave
+outside data out of later lists for that hypothesis unless they bring it up.
 
-**How to ask.** Offer the choices as numbers (or a multiple-choice question):
+**How to ask.** Put the purposes as numbers (or a multiple-choice question):
 
-> R1 is now our working hypothesis: "Topic 7 is higher in treated than in
-> control monocytes because of the interferon response". Shall I look for published data sets to test it? Pick any:
+> Shall I look for published data sets to test H1, "Topic 7 is higher in
+> treated than in control monocytes because of the interferon response"?
+> Pick any:
 >
 > 1. To confirm it: a similar data set where it should hold.
 > 2. To refine it: data that can show where it holds (which cell type,
@@ -600,19 +566,10 @@ data out of later lists for that hypothesis unless they bring it up.
 > 3. To try to disprove it: a setting where it should fail if it is wrong.
 > 4. Not now.
 
-Record the question as an `offer` and the reply as a `choice`, exactly as in
-section 8.6 ("ok" is not a choice: ask again):
+"ok" is not a choice: ask which number.
 
-```json
-{"tool": "notebook", "args": {"kind": "offer", "text": "Outside data for R1.", "options": ["To confirm it", "To refine it", "To try to disprove it", "Not now"]}}
-
-{"tool": "notebook", "args": {"kind": "choice", "chose": [1, 3], "words": "1 and 3"}}
-```
-
-**Finding candidates.** Only after the person chose outside data, as a
-`choice` (a bare "yes" to a numbered list is not one: ask which number). If
-they chose it from the next-sources offer (8.6), ask only the purpose
-(confirm, refine, disprove) before searching.
+**Finding candidates.** Only after the person chose outside data and its
+purpose (confirm, refine, disprove).
 
 - Search with the literature or data tools you have (PubMed, bioRxiv, GEO,
   CELLxGENE and the like; load them first if your client lists them as not
@@ -628,18 +585,18 @@ Propose two to four candidates, numbered D1, D2, ..., each with:
 |---|---|
 | Accession and link | As the search result gave it, e.g. a GEO series. |
 | What it holds | Species, tissue, assay, number of donors or samples, conditions. |
-| Purpose | Confirm, refine or disprove, and which reading. |
-| Prediction | What result would support the reading, and what would refute it. |
-| Differences | Platform, protocol, processing: reasons a mismatch might not mean the reading is wrong. |
+| Purpose | Confirm, refine or disprove, and which hypothesis. |
+| Prediction | What result would support the hypothesis, and what would refute it. Ask the person; use their words. |
+| Differences | Platform, protocol, processing: reasons a mismatch might not mean the hypothesis is wrong. |
 | Access | Open or controlled; size. |
 
-Write the candidates in the notebook as kind `plan` **before anything is
-downloaded**. This fixes the predictions before the data are seen. Then ask
-which to use: an `offer` with one option per candidate ("D1 ...", "D2 ...",
-and "None of these"), and the reply as a `choice`, as above.
+Write the person's predictions in the notebook as kind `plan` (their words),
+with the candidates as facts in `text`, **before anything is downloaded**.
+This fixes the predictions before the data are seen. Then ask which to use
+("D1", "D2", or "None of these").
 
 ```json
-{"tool": "notebook", "args": {"kind": "plan", "text": "Outside data for R1 (topic 7 = interferon response in monocytes).\nD1 <accession, as found>: PBMCs, IFN-beta vs control, 8 donors, 10x 3'. Purpose: confirm. Prediction: topic 7 genes higher in treated monocytes in at least 6 of 8 donors; refuted if no higher than in controls. Differences: other chemistry, IFN-beta not IFN-alpha. Access: open, 4 GB.\nD2 <accession, as found>: same cells, untreated, stimulated with LPS. Purpose: disprove. Prediction: topic 7 stays low; refuted (topic 7 is a general activation program, not interferon) if LPS raises it as much. Access: open, 3 GB."}}
+{"tool": "notebook", "args": {"kind": "plan", "words": "D1 should show topic 7 higher in treated monocytes in most donors; if not, H1 is in trouble. D2 (LPS) should stay low; if LPS raises it as much, it's general activation, not interferon.", "text": "Outside data for H1.\nD1 <accession, as found>: PBMCs, IFN-beta vs control, 8 donors, 10x 3'. Purpose: confirm. Differences: other chemistry, IFN-beta not IFN-alpha. Access: open, 4 GB.\nD2 <accession, as found>: same cells, untreated, stimulated with LPS. Purpose: disprove. Access: open, 3 GB."}}
 ```
 
 **Bringing it in.**
@@ -658,9 +615,9 @@ and "None of these"), and the reply as a `choice`, as above.
    until the outside data agree: that is fooling yourself (section 12).
 4. Write an observation: held, held in part, or did not hold, with numbers,
    against the prediction in the plan.
-5. Propose readings on what it means, as usual. When a difference between
-   the data sets could explain a mismatch, make that one of the readings.
-   The person answers.
+5. Show the person, and ask what it means and why. When a difference between
+   the data sets could explain a mismatch, name it as a rival for them to
+   weigh. Record their judgement as `evidence`.
 
 A hypothesis that does not hold is a result. Record it as plainly as one that
 does. If refining changes the hypothesis, the changed version is a new
@@ -670,8 +627,8 @@ hypothesis: it needs its own test, on data it was not shaped on.
 
 **Before working**
 
-1. Check the project folder (section 4, step 1).
-2. Write a `plan` first.
+1. Call `status` and tell the person where the project stands (section 4).
+2. Ask the person's question and record their words as the `plan`.
 
 **Running tools**
 
@@ -685,8 +642,9 @@ hypothesis: it needs its own test, on data it was not shaped on.
    `{"tool": "job_wait", "args": {"id": "job-3", "seconds": 120}}`.
    If it is still running, call `job_wait` again. Use its outputs only after
    its state is `done`.
-6. When a job's status has an `attach` command, tell the person that
-   command: they can watch the step on screen.
+6. Tell the person plainly what is running and about how long, not the
+   job's id. When a job's status has an `attach` command, tell them they
+   can watch the step on screen with it.
 7. If the person stopped a call ("stopped by the user"), do not run it again
    unless they ask.
 8. A "Note from the user" in a tool result is the person speaking to you.
@@ -702,30 +660,30 @@ hypothesis: it needs its own test, on data it was not shaped on.
     "87 genes".
 12. Report what was dropped or failed, not only what worked.
 
-**Interpreting**
+**Interpreting: the person's**
 
-13. Never decide alone what a result means (sections 5 to 7).
+13. Never say what a result means, and never write a hypothesis, a verdict,
+    a take-home or a summary for the person (sections 5 to 7). Explain what
+    numbers measure; ask what they mean; record the person's words.
 14. A result found on the same cells that were used to choose it is not
     confirmed (section 12). Say so in the observation.
-15. Write each claim as fact rather than foil, because a difference; use the
-    verb the agreeing sources allow (section 8). Several tools on the same
-    data are one source.
-16. Record what each source says of a hypothesis as kind `evidence`, and
-    use the verb its result allows. Then offer the next sources, ones that share little
-    with those that agree, with stopping as a choice: an `offer`, and the
-    reply as a `choice` (section 8.6).
-17. Offer published data sets as one of the next sources (section 9).
-    Write the predictions in a `plan` before any data is downloaded. Never
-    invent an accession.
+15. Help the person put each claim as fact rather than foil, because a
+    difference, and ask for its rivals and what would nullify it. Use only
+    the verb the agreeing sources allow (section 8). Several tools on the
+    same data are one source.
+16. For a hypothesis, name the sources that could corroborate or nullify it
+    (section 8.6); the person chooses and judges each; record it as
+    `evidence` with their reason.
+17. Name published data sets as one of the next sources (section 9). Record
+    the person's predictions in a `plan` before any data is downloaded.
+    Never invent an accession.
 
 **Closing**
 
-18. Tell the person: today's folder (`results/<day>/`), `notebook.md`,
-    `runall.sh`, what failed or was dropped, which readings are still
-    waiting for their answer, `HYPOTHESES.tsv` and `EVIDENCE.tsv`, and for
-    each hypothesis worked on its table, the verb it allows and the source
-    still missing, as the last `evidence` result gave them. Do not close
-    with kind `conclusion` (section 14).
+18. Ask for the person's summary of the day and record it (`summary`).
+    Build the slides with `report`. Tell the person: today's folder
+    (`results/<day>/`), the slides, what failed or was dropped, and what
+    `status` lists as open for them.
 
 ## 11. The tools and how they connect
 
@@ -740,14 +698,14 @@ map.
 | **pinto** | Fits spatial models and shows them on the tissue. | `run_fit`, `view_open`, `view_map`, `view_markers`, `view_export` |
 | **lupin** | Labels clusters with cell types (decisions with a rationale), places them in the Cell Ontology, tests GO or pathway terms (also gene sets from other sources, as `gmt`), and orders types into trajectories. | `annotate_run`, `annotate_review`, `annotate_genes`, `annotate_preview`, `annotate_relabel`, `trajectory_run`, `trajectory_read` |
 | **chickpea** | Links ATAC peaks to genes in paired RNA + ATAC data. | `p2g_run`, `p2g_links` |
-| **legume** | Keeps the reasoning the tools share: readings, the person's answers, hypotheses and their evidence, offers and choices. Serves this paper and the project's standing. Runs no steps. | `guide`, `status`, `hypotheses`, `notebook` (every kind) |
+| **legume** | Keeps the project's notebook: the person's plan, data verdicts, hypotheses with their rivals, evidence and its table, kept figures, summaries. Serves this paper, the project's standing and the day's slides. Runs no steps. | `guide`, `status`, `report`, `notebook` |
 | **cocoa** | Estimates the effect of an exposure (e.g. treatment) on gene expression across individuals, adjusted for confounders. | `cocoa_commands`, `cocoa_run`, `cocoa_read`, `docs` |
 | **mung** | Infers copy number per cell and per donor, and finds donor-private clones. | none yet: command line (`infercnv`, `clones`, `donors`), section 14 |
 
-Every tool's server also has `notebook` (plan, observation, note),
-`job_status`, `job_wait` and `job_cancel`. Start a session with the `legume`
-server's `status`: where the data, the outputs, today's notebook and the
-hypotheses stand, and any question still waiting for the person's reply.
+Every tool's server also has `job_status`, `job_wait` and `job_cancel`; the
+notebook is the `legume` server's alone. Start a session with its `status`:
+where the data, the outputs, today's notebook, the hypotheses and the kept
+figures stand, and what is open for the person.
 
 The usual path:
 
@@ -767,12 +725,11 @@ BAM files ── faba ──▶ matrices ── data-beans (import, qc) ──�
 ```
 
 lupin's labelling is its own decision loop: `annotate_review` shows the
-evidence, the agent proposes labels with a rationale, `annotate_preview`
-shows what would change, and `annotate_relabel` applies the decisions. Each
-decision has `decided_by`: `agent` for the agent's own,
-`agent_proposed_user_accepted` only when the person accepted it,
-`user_override` when the person chose differently, `user` for the person's
-own.
+evidence, `annotate_preview` shows what would change, and `annotate_relabel`
+applies the decisions. Show the person the evidence and ask which label they
+give; each decision has `decided_by`, and here it is `user` (or
+`user_override` when they chose against lupin's top call), with their
+rationale in their words.
 
 ## 12. Not fooling ourselves
 
@@ -812,11 +769,11 @@ let them steer.
 | Stage | Goal | Typical tools | Ends with |
 |---|---|---|---|
 | 1. Survey | What is in the data: cells, genes, samples, conditions, quality, and how much variance lies between donors' genomes. | data-beans `info`, `statistics`, `qc`, `plot`; mung `donors` | An observation with the key numbers. |
-| 2. Structure | Main axes of variation, clusters, cell types. | senna `run_fit`, `view_map`; lupin `annotate_*` | Readings on what the clusters are, and an answer. |
-| 3. Contrast | Where conditions differ: composition, programs, effects. | cocoa; lupin; chickpea | Readings on the differences, and an answer. |
-| 4. Shortlist | Three to five candidate hypotheses, each as a contrast, with evidence, a check and the sources that could test it. | notebook | Readings the person answers. |
+| 2. Structure | Main axes of variation, clusters, cell types. | senna `run_fit`, `view_map`; lupin `annotate_*` | The person's labels and what they make of the clusters, in their words. |
+| 3. Contrast | Where conditions differ: composition, programs, effects. | cocoa; lupin; chickpea | What the person makes of the differences, in their words. |
+| 4. Shortlist | Three to five of the person's hypotheses, each as a contrast, with rivals and what would nullify it. | notebook `hypothesis` | Hypotheses H1, H2, ... in the person's words. |
 | 5. Triangulate | Add sources that share little with those that agree, one at a time, as the person chooses (section 8.6): held-out donors (section 12), the same cells' other measurements, published data sets (section 9), genetic and perturbation data. | data-beans `split`, `import`; chickpea; lupin (`gmt`, frozen panels) | A triangulation table per hypothesis. |
-| 6. Report | Each hypothesis with its table, the verb it allows, and the source still missing. | `legume` `report` (the story is yours; the rest is the records) | The day's slides, ready to share. |
+| 6. Figures and report | The figures and tables the person keeps for the paper; each hypothesis with its table and the verb it allows. | notebook `figure`, `summary`; `legume` `report` | The day's slides (PDF and Markdown), ready to share. |
 
 The result of exploring is **hypotheses**, not findings. Say so.
 
@@ -826,133 +783,117 @@ The result of exploring is **hypotheses**, not findings. Say so.
 |---|---|
 | Records: `runall.sh`, `notebook.md`, `INDEX.tsv`, `data/README.md` | Available |
 | Background jobs (`job_status`, `job_wait`, `job_cancel`), sessions with `attach` | Available |
-| Notebook kinds `plan`, `observation`, `note` | Available |
-| The `legume` server (`legume mcp`): `guide`, `status`, `hypotheses`, and the notebook's reasoning kinds | New in legume-mcp 0.5.0 |
-| Notebook kinds `interpretation` (with `readings`) and `answer` | New in legume-mcp 0.5.0, on the `legume` server |
-| lupin `decided_by` on labelling decisions | Available |
-| Key numbers (`facts`, flagged ones in `legume` `status`) and `inputs` for every step, in `INDEX.tsv` | New in legume-mcp 0.5.0; each tool adds its own numbers |
+| `legume init`: a project connected to Claude Code and Cursor (`.mcp.json`, `.cursor/mcp.json`) and marked (`.legume/`) | New in legume-mcp 0.5.0 |
+| The `legume` server (`legume mcp`): `guide`, `status` (with a hypothesis's table, the data on disk and what is open), `report`, `notebook` | New in legume-mcp 0.5.0 |
+| One notebook, the `legume` server's: `plan`, `data`, `observation`, `hypothesis`, `evidence`, `figure`, `summary`, `note`; the person's kinds take their words only | New in legume-mcp 0.5.0 |
+| Hypotheses H1, H2, ... with rivals and what would nullify each (`HYPOTHESES.tsv`); evidence with the person's reason (`EVIDENCE.tsv`); the table, its verb and the sources not yet used (section 8.5) | New in legume-mcp 0.5.0 |
+| Data verdicts (`DATA.tsv`) and figures kept for the paper (`FIGURES.tsv`) | New in legume-mcp 0.5.0 |
+| Key numbers (`facts`, flagged ones in `status`) and `inputs` for every step, in `INDEX.tsv` | New in legume-mcp 0.5.0; each tool adds its own numbers |
+| The day's slides: `report.pdf` (typeset by legume, nothing to install) and `report.md`, with the trail graph | New in legume-mcp 0.5.0 |
 | Recipes as MCP prompts on the `legume` server: `explore`, `triangulate` | New in legume-mcp 0.5.0 |
 | `next` hints in results ("Next, if the person agrees"); tool annotations (read-only, writes, destructive) | New in legume-mcp 0.5.0; the job tools give them, each tool adds its own |
-| Notebook kinds `offer` and `choice` (section 8.6) | New in legume-mcp 0.5.0 |
-| Testing on outside data (section 9): `plan`, `offer`, `choice` and data-beans `import` | Available with 0.5.0 |
-| Contrast and triangulation (section 8), written in `claim`, `rationale` and observations | Available |
+| Testing on outside data (section 9): `plan` and data-beans `import` | Available with 0.5.0 |
+| lupin `decided_by` on labelling decisions | Available |
 | lupin: Cell Ontology placement, `suggest-cl` (command line), term tests on GO, GAF or GMT gene sets (section 8.4) | Available |
-| Notebook kind `evidence`; hypotheses H1, H2, ... (`HYPOTHESES.tsv`, `EVIDENCE.tsv`); the table, its verb and the sources not yet used, built by the notebook (section 8.5) | New in legume-mcp 0.5.0 |
-| `contrast` (fact and foil) as a notebook field | Planned |
+| `legume paper`: a manuscript draft from the kept figures and the person's text | Planned |
 | Fine-mapping (SuSiE-like) in chickpea, for genetics as a source | Planned |
 | mung `infercnv` and `clones` (command line), read by senna and pinto `--cnv-clones` | Available |
 | mung `donors`: per-donor CNV calls, the share of variance between donors, allele support from faba `snp` | In development (not released) |
 | mung per-cell allele evidence; MCP server | Planned |
 | `genome_share` against a null with donor labels shuffled, and against the same share for cluster labels (donor vs type) | Planned |
-| The triangulation table, its verb and the sources not yet used, in the chat's screen and in `legume report` | New in legume-mcp 0.5.0 |
-| `legume chat` (the tools with a local model: llama-server, LM Studio, Ollama, MLX, vLLM), with a small chat for small models | New in legume-mcp 0.5.0 (feature `chat`) |
-| The chat's screen: the conversation beside the steps and their numbers, the notebook and the hypotheses with their sources, in a session to leave and come back to (`legume attach`) | New in legume-mcp 0.5.0 (feature `screen`) |
-| `legume init` (a project's chat settings, `.legume/chat.json`) and the chat's record (`chat.md`, with the model file's SHA-256) | New in legume-mcp 0.5.0 (feature `chat`) |
-| `legume report` (a day's slides built from the records, Typst; the story the agent's only) and `legume graph` (the provenance graph from `INDEX.tsv`) | New in legume-mcp 0.5.0; the `legume` server's `report` tool |
 
-**Without the `legume` server.** If a tool's notebook says a kind "goes to
-the `legume` server's notebook" and no `legume` server is connected, ask the
-person to add it (`legume mcp`, registered like any tool). Until then, or if
-the notebook refuses `readings` or the kinds `answer`, `evidence`, `offer`
-or `choice` because the tool is older than 0.5.0:
-
-- write the readings as a numbered list in the text of kind `conclusion`
-  (the old name), marked "proposed, not decided";
-- write the person's reply as
-  `{"kind": "note", "by": "user", "text": "Answer to the proposal of <time>: chose R1. The user said: \"<exact words>\""}`;
-- write an offer as a numbered list in a `note` (yours: no `by`), and the reply to it as
-  `{"kind": "note", "by": "user", "text": "Choice on the offer of <time>: chose 2. The user said: \"<exact words>\""}`.
-- number the chosen readings H1, H2, ... yourself, and write each table as an
-  `observation`: the hypothesis, then one row per source (source, kind,
-  what it says, the numbers), and the verb section 8.3 allows.
-
-On a 0.5.0 server, kind `conclusion` still works, but it is recorded as a
-proposal with no numbered readings, and an `answer` cannot refer to it. Use
-`interpretation` with `readings` instead, even if a tool's instructions say
-`conclusion`.
+**Tools older than 0.5.0** still have a notebook of their own, which takes
+`plan`, `observation`, `note` and the old `conclusion`. Use the `legume`
+server's notebook instead whenever it is connected (`legume init` connects
+it); if it is not, ask the person to run `legume init`.
 
 ## 15. A short worked example
 
 ```text
 Person:  Explore the IFN-treated PBMCs. I have no specific hypothesis.
 
-Agent:   (project folder from the instructions: /data/pbmc-ifn, looks right)
-         [notebook plan]  Question: what differs between IFN and control?
-           Data: data/pbmc.zarr.zip, 6 donors. Check: donors 5 and 6 held out.
-         [data-beans split by donor: explore set (1-4), held-out set (5-6)]
-         [data-beans qc, no out: a preview]  Median 1,904 genes per cell.
-           A 15% mito cutoff would drop 12% of cells; donor 4 would lose 30%.
-         [notebook observation]  (the numbers above)
-         [notebook interpretation, 3 readings]
-           R1 donor 4 is low quality          check: rerun without donor 4
-           R2 stress in treated cells         check: heat-shock genes by condition
-           R3 the mito cutoff is too strict   check: compare 15% and 20%
-         Which of these hold? Reply with numbers, or a short line.
+Agent:   [status]  The project holds data/pbmc.zarr.zip (6 donors); nobody
+         has recorded where it came from or whether it is good.
+         Where did it come from?
 
-Person:  ok
+Person:  The core's 10x run, donors 1-6, three treated with IFN.
 
-Agent:   That doesn't tell me which hold. Which of R1 to R3? A number is enough.
+Agent:   [notebook data, words "The core's 10x run, ..."]
+         [data-beans qc, no out: a preview]  Median 1,904 genes per cell. A
+         15% mitochondrial cutoff would drop 12% of cells; donor 4 would lose
+         30%. High mitochondrial reads often mean damaged cells. What do you
+         make of donor 4?
 
-Person:  3, try 20%
+Person:  Donor 4 was a bad prep. Keep it but use 20%.
 
-Agent:   [notebook answer, chose [3], words "3, try 20%"]
-         [data-beans qc with a 20% cutoff, out results/.../qc20.zarr.zip]  ...
+Agent:   [notebook data, verdict "caveats", words "Donor 4 was a bad prep ..."]
+         [data-beans qc, 20% cutoff, out results/.../qc20.zarr.zip]
+         [notebook observation]  Kept 10,412 of 11,204 cells; donor 4 lost 14%.
+         Before I cluster: what do you expect to separate the treated cells?
 
-         (later: the person chose R1, "Topic 7 is higher in treated than in
-          control monocytes because of the interferon response")
-         [notebook evidence, H1, our cells, donors 1-4, our_cells, agrees]
-           Verb: "marks" or "is associated with, in these donors".
-           Not yet used: other donors, another study, ...
-         [notebook offer, 5 options]
-         R1 now allows "is associated with, in these donors". Next
-         sources, pick any:
-           1 held-out donors 5-6         2 the same cells' ATAC (chickpea)
-           3 a published IFN data set    4 a knockout's genes as a gene set
-           5 stop here
+Person:  Monocytes, an interferon program.
 
-Person:  1, then 3
+Agent:   [senna fit; view_map]  Topic 7 is high in treated monocytes:
+         ISG15 and MX1 lead it. What do you think it is?
 
-Agent:   [notebook choice, chose [1, 3], words "1, then 3"]
-         [the same steps on donors 5 and 6, every setting frozen]  ...
-         [notebook evidence, H1, held-out donors 5-6, other_donors, agrees]
-           Verb: "is associated with". Standing: replicated: sources that share no cells agree.
+Person:  The interferon response, I'm fairly sure.
+
+Agent:   [notebook hypothesis, words "Topic 7 is the interferon response in
+          treated monocytes"]  Recorded as H1. What else could explain it?
+         And what result would make you drop it?
+
+Person:  Could be two donors carrying it. I'd drop it if donors 5 and 6
+         don't show it.
+
+Agent:   [notebook hypothesis H1, rivals ["two donors carry it"],
+          nullify "donors 5 and 6 don't show it"]
+         What could corroborate or nullify it:
+           1 held-out donors 5-6 (other donors, same lab; you named this)
+           2 the same cells' ATAC (shares the cells)
+           3 a published IFN data set      4 stop here
+
+Person:  1
+
+Agent:   [the same steps on donors 5 and 6, every setting frozen]
+         Topic 7 is higher in both treated donors, about 3x. Does that agree
+         with H1, and why?
+
+Person:  Agrees: both held-out treated donors show it.
+
+Agent:   [notebook evidence, H1, held-out donors 5-6, other_donors, agrees,
+          words "both held-out treated donors show it"]
+           Verb: "is associated with". Standing: replicated.
 ```
 
-Every bracketed action is a tool call. Every decision is in the notebook,
-with who made it.
+Every bracketed action is a tool call. Every interpreting word in the
+notebook is the person's.
 
 ## 16. Glossary
 
 - **Agent**: the AI model that calls the tools.
-- **Answer**: the person's reply to a proposal, recorded exactly, with the
-  readings they chose.
-- **Choice**: the person's reply to an offer, recorded exactly, with the
-  options they chose.
 - **Contrast**: a fact and its foil: why this rather than that (section 8).
-- **Evidence** (notebook kind): what one source says of one hypothesis;
-  the notebook builds the table from it (section 8.5).
+- **Evidence** (notebook kind): what one source says of one hypothesis, and
+  why the person judged it so; the notebook builds the table from it
+  (section 8.5).
 - **Fact / foil**: the case to explain, and the closest case where it does
   not happen.
-- **Hypothesis**: a reading the person chose, numbered H1, H2, ... for the
-  whole project.
-- **Interpretation**: what the results mean. Proposed by the agent as
-  readings; decided by the person's answer.
+- **Figure** (notebook kind): an output the person keeps for the paper, with
+  its number and their take-home.
+- **Hypothesis**: the person's claim, as a contrast, with its rivals and what
+  would nullify it; numbered H1, H2, ... for the whole project.
 - **Job**: a long step running in the background, with an id like `job-3`.
 - **Notebook**: `results/<day>/notebook.md`, the day's account.
 - **Observation**: what was done and seen, with numbers. Facts only.
-- **Offer**: numbered options put to the person that are not readings,
-  such as which source of evidence to use next.
 - **Outside data set**: data published by others, used to confirm, refine or
   try to disprove a working hypothesis (section 9).
 - **Post-selection**: a result computed on the same cells used to choose the
   labels or settings. Not a confirmation.
-- **Prediction**: what result would support a reading and what would refute
-  it, written in a `plan` before the data are seen.
+- **Prediction**: what result would support a hypothesis and what would
+  refute it, in the person's words, before the data are seen.
 - **Project folder**: where all records are written.
 - **Pseudobulk**: summing cells per donor or sample, so that donors, not
   cells, are compared.
-- **Reading**: one possible interpretation, with a claim, a rationale, a
-  check, and optionally evidence and alternatives.
+- **Rivals**: what else could explain a hypothesis, as the person named it.
 - **Session**: a tool's own screen running in the background; the person
   opens it with the `attach` command a job's status gives.
 - **Source** (of evidence): data that differ in where they came from (other
@@ -961,7 +902,8 @@ with who made it.
 - **Triangulation** (causal): combining independent sources of evidence
   whose biases differ; agreement between them is stronger than any one
   alone. The aim of the work (section 1).
-- **Working hypothesis**: a reading the person chose that is worth more work.
+- **Summary** (notebook kind): the person's account of the day: what changed,
+  what argues against it, what is next.
 
 ## References
 

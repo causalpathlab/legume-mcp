@@ -1,6 +1,7 @@
-//! The project's triangulation ledger. The readings the user accepts become
-//! hypotheses, H1, H2, ... for the whole project (`results/HYPOTHESES.tsv`);
-//! what each source of evidence says of one is a row of
+//! The project's triangulation ledger. The person's hypotheses are numbered
+//! H1, H2, ... for the whole project (`results/HYPOTHESES.tsv`), each with
+//! the rivals they named and what would nullify it; what each source of
+//! evidence says of one, and why the person judged it so, is a row of
 //! `results/EVIDENCE.tsv`. From them the notebook builds a hypothesis's
 //! table, the verb its agreeing sources allow, and the kinds of source not
 //! yet used, so neither has to be worked out by the agent.
@@ -12,10 +13,10 @@ use crate::project::one_line;
 
 /// The ledger's files under `results/`, and their columns after the date,
 /// time and server.
-pub(crate) const HYPOTHESES: (&str, &str) = ("HYPOTHESES.tsv", "id\tfrom\tclaim");
+pub(crate) const HYPOTHESES: (&str, &str) = ("HYPOTHESES.tsv", "id\tfrom\tclaim\trivals\tnullify");
 pub(crate) const EVIDENCE: (&str, &str) = (
     "EVIDENCE.tsv",
-    "hypothesis\tsource\tclass\tverdict\tsummary",
+    "hypothesis\tsource\tclass\tverdict\tsummary\twhy",
 );
 
 /// The kinds of source, from most to least shared with the data a
@@ -37,12 +38,6 @@ pub(crate) const CLASSES: [(&str, &str, &str); 8] = [
 
 pub(crate) const VERDICTS: [&str; 3] = ["agrees", "disagrees", "mixed"];
 
-/// The classes' names, as a schema's `enum` lists them.
-#[cfg_attr(not(feature = "chat"), allow(dead_code))]
-pub(crate) fn class_names() -> Vec<&'static str> {
-    CLASSES.iter().map(|c| c.0).collect()
-}
-
 /// What `class` is, and what it shares with our cells, in words.
 pub(crate) fn what(class: &str) -> (&'static str, &'static str) {
     CLASSES
@@ -57,10 +52,14 @@ fn ours(class: &str) -> bool {
     matches!(class, "our_cells" | "same_cells" | "same_donors")
 }
 
-/// A hypothesis: its number and claim.
+/// A hypothesis, as the person put it: its number, claim, the rivals they
+/// named and what would nullify it (empty when not said yet).
+#[derive(Clone)]
 pub(crate) struct Hypothesis {
     pub(crate) id: usize,
     pub(crate) claim: String,
+    pub(crate) rivals: String,
+    pub(crate) nullify: String,
 }
 
 /// One row of evidence.
@@ -71,6 +70,8 @@ pub(crate) struct Evidence {
     pub(crate) class: String,
     pub(crate) verdict: String,
     pub(crate) summary: String,
+    /// Why the person judged it so, in their words.
+    pub(crate) why: String,
 }
 
 impl Evidence {
@@ -82,6 +83,7 @@ impl Evidence {
             self.class.clone(),
             self.verdict.clone(),
             self.summary.clone(),
+            self.why.clone(),
         ]
     }
 }
@@ -103,16 +105,27 @@ fn number(v: &Value) -> Option<usize> {
     }
 }
 
-/// The hypotheses in `HYPOTHESES.tsv`.
+/// The hypotheses in `HYPOTHESES.tsv`, in order of their numbers; a
+/// hypothesis revised is its latest row.
 pub(crate) fn hypotheses(tsv: &str) -> Vec<Hypothesis> {
-    rows(tsv)
-        .filter_map(|r| {
-            Some(Hypothesis {
-                id: number(&Value::String((*r.first()?).into()))?,
-                claim: (*r.get(2)?).into(),
-            })
-        })
-        .collect()
+    let mut out: Vec<Hypothesis> = Vec::new();
+    for r in rows(tsv) {
+        let Some(id) = r.first().and_then(|c| number(&Value::String((*c).into()))) else {
+            continue;
+        };
+        let cell = |i: usize| r.get(i).copied().unwrap_or_default().to_string();
+        let h = Hypothesis {
+            id,
+            claim: cell(2),
+            rivals: cell(3),
+            nullify: cell(4),
+        };
+        match out.iter_mut().find(|o| o.id == id) {
+            Some(o) => *o = h,
+            None => out.push(h),
+        }
+    }
+    out
 }
 
 /// The evidence in `EVIDENCE.tsv`.
@@ -125,6 +138,7 @@ pub(crate) fn evidence(tsv: &str) -> Vec<Evidence> {
                 class: (*r.get(2)?).into(),
                 verdict: (*r.get(3)?).into(),
                 summary: r.get(4).copied().unwrap_or_default().into(),
+                why: r.get(5).copied().unwrap_or_default().into(),
             })
         })
         .collect()
@@ -140,8 +154,8 @@ pub(crate) fn find<'h>(args: &Value, hyps: &'h [Hypothesis]) -> Result<&'h Hypot
         Some(n) => hyps.iter().find(|h| h.id == n).ok_or_else(|| {
             anyhow::anyhow!(
                 "there is no hypothesis H{n} (the hypotheses are {}, in \
-                 results/HYPOTHESES.tsv); a reading becomes one when the user chooses it \
-                 in an `answer`",
+                 results/HYPOTHESES.tsv); the person's hypothesis is recorded as kind \
+                 `hypothesis`",
                 listed()
             )
         }),
@@ -196,12 +210,18 @@ pub(crate) fn check<'h>(
         "text",
         "what this source shows, with its numbers and thresholds",
     )?;
+    let why = text(
+        "words",
+        "why the person judges that it agrees, disagrees or is mixed, in their words; \
+         show them the numbers and ask",
+    )?;
     let e = Evidence {
         hypothesis: h.id,
         source,
         class,
         verdict,
         summary,
+        why,
     };
     Ok((h, e))
 }
@@ -338,16 +358,17 @@ fn verb(sources: &[Evidence]) -> (String, &'static str) {
 pub(crate) fn table(h: &Hypothesis, all: &[Evidence]) -> String {
     let sources = by_source(h.id, all);
     let mut out = format!(
-        "**H{}. {}**\n\n| Source | Kind | Shares with our cells (by kind) | Says | Evidence |\n|---|---|---|---|---|\n",
+        "**H{}. {}**\n\n| Source | Kind | Shares with our cells (by kind) | Says | Evidence | Why, in the person's words |\n|---|---|---|---|---|---|\n",
         h.id, h.claim
     );
     for e in &sources {
         let (kind, shares) = what(&e.class);
         out.push_str(&format!(
-            "| {} | {kind} | {shares} | {} | {} |\n",
+            "| {} | {kind} | {shares} | {} | {} | {} |\n",
             cell(&e.source),
             e.verdict,
-            cell(&e.summary)
+            cell(&e.summary),
+            cell(&e.why)
         ));
     }
     let (verb, standing) = verb(&sources);
@@ -410,9 +431,15 @@ pub(crate) fn next(h: &Hypothesis, all: &[Evidence]) -> String {
              kind counts too, when it shares no cells. ",
         );
     }
+    if h.nullify.is_empty() {
+        out.push_str(&format!(
+            "The person has not said what would nullify H{}: ask before the next source. ",
+            h.id
+        ));
+    }
     out.push_str(
-        "Offer the next sources to the user as an `offer` (stopping can be one) and record \
-         their reply as a `choice`.",
+        "Tell the person, in plain words, which sources could corroborate or nullify it and \
+         what each shares with our cells; they choose which to pursue, or to stop.",
     );
     out
 }
@@ -433,6 +460,7 @@ mod tests {
             class: class.into(),
             verdict: verdict.into(),
             summary: String::new(),
+            why: String::new(),
         }
     }
 
@@ -470,6 +498,22 @@ mod tests {
             ("donors 5-6", "disagrees")
         );
         assert_eq!(level(&s), 1);
+    }
+
+    #[test]
+    fn a_revised_hypothesis_is_its_latest_row() {
+        let tsv = format!(
+            "date\ttime\tserver\t{}\n\
+             d\tt\tlegume\tH1\tyou\tstress\t\t\n\
+             d\tt\tlegume\tH2\tyou\ta donor\t\t\n\
+             d\tt\tlegume\tH1\tyou\tstress\tdamaged cells\tno heat shock in sample 2\n",
+            HYPOTHESES.1
+        );
+        let h = hypotheses(&tsv);
+        assert_eq!(h.len(), 2);
+        assert_eq!((h[0].id, h[0].rivals.as_str()), (1, "damaged cells"));
+        assert_eq!(h[0].nullify, "no heat shock in sample 2");
+        assert_eq!(h[1].claim, "a donor");
     }
 
     #[test]
