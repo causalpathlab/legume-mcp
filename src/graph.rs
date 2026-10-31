@@ -1,279 +1,282 @@
-//! The provenance graph: which files each step was made from and made, as
-//! `results/INDEX.tsv` records them (its `inputs` and `output` columns). A
-//! step is the rows one tool wrote at one time. Drawn as SVG with no
-//! program but this one (columns from the data on the left to the last
-//! outputs on the right), or given as Graphviz DOT or text.
+//! The trail of a day, drawn like a hidden Markov model: along the top, the
+//! person's own entries in the notebook (their question, data verdicts,
+//! hypotheses, evidence, figures, summary), one leading to the next; under
+//! each, what ran and was seen after it, until their next entry. A faint
+//! line joins a step to one that read a file it made (`INDEX.tsv`'s
+//! `inputs` and `output` columns). Drawn as SVG with no program but this
+//! one, for the report.
 
-use crate::records::Step;
+use crate::records::{in_day, Entry, Step};
 use std::collections::HashMap;
 use std::fmt::Write;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Kind {
-    /// A file; `made` when a step in the graph made it, else data (or the
-    /// output of a step outside it).
-    File { made: bool },
-    /// A step: its tool, and whether a number it made was flagged.
+    /// One of the person's entries; `said` false for the stand-in over the
+    /// steps that came before any.
+    Thought { said: bool },
+    /// A step: the rows one tool wrote at one time; whether a number it
+    /// made was flagged.
     Step { flagged: bool },
+    /// An entry of the agent's: what was seen, or a note.
+    Seen,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct Node {
     pub kind: Kind,
-    /// What the drawing shows: a file's name, a step's tool.
+    /// What the drawing shows: the entry's kind (H1, Figure 2B), a step's
+    /// tool.
     pub label: String,
-    /// The second line: a step's server and time.
+    /// The second line: the person's words, a step's server and time.
     pub detail: String,
-    /// Everything, for a tooltip: a file's path, a step's summary.
+    /// A step's outputs, by name.
+    pub files: Vec<String>,
+    /// Everything, for a tooltip.
     pub title: String,
-    layer: usize,
-    order: f64,
+    /// The person's entry it falls under, by its place along the top.
+    pub column: usize,
 }
 
 pub(crate) struct Graph {
     pub nodes: Vec<Node>,
-    /// From, to: a file to the step that read it, a step to a file it made.
-    pub edges: Vec<(usize, usize)>,
+    /// From, to: a step to a later one that read a file it made.
+    pub files: Vec<(usize, usize)>,
 }
 
 /// The longest a label is drawn.
 const LABEL: usize = 30;
+/// The most a column shows under its entry; the rest are in the steps'
+/// table.
+const SHOWN: usize = 6;
+/// The notebook kinds that are the person's words, when the legume server
+/// wrote them.
+const THEIRS: [&str; 6] = [
+    "plan",
+    "data",
+    "hypothesis",
+    "evidence",
+    "figure",
+    "summary",
+];
 
 impl Graph {
-    /// The graph of `steps` (rows of `INDEX.tsv`, in order).
-    pub(crate) fn of(steps: &[&Step]) -> Self {
+    /// The trail of `steps` (rows of `INDEX.tsv`, in order) and the day's
+    /// `notebook`, in the order they happened.
+    pub(crate) fn of(steps: &[&Step], notebook: &[Entry]) -> Self {
+        // A step is the rows one tool wrote at one time, in a row.
+        let mut groups: Vec<Vec<&Step>> = Vec::new();
+        for &s in steps {
+            match groups.last_mut() {
+                Some(g)
+                    if (&g[0].date, &g[0].time, &g[0].server, &g[0].tool)
+                        == (&s.date, &s.time, &s.server, &s.tool) =>
+                {
+                    g.push(s)
+                }
+                _ => groups.push(vec![s]),
+            }
+        }
+        // Entries before steps of the same second: the question comes
+        // before what it asked for.
+        enum Event<'a> {
+            Entry(&'a Entry),
+            Step(&'a [&'a Step]),
+        }
+        let mut events: Vec<((bool, &str), u8, Event)> = notebook
+            .iter()
+            .map(|e| (in_day(&e.time), 0, Event::Entry(e)))
+            .chain(
+                groups
+                    .iter()
+                    .map(|g| (in_day(&g[0].time), 1, Event::Step(g.as_slice()))),
+            )
+            .collect();
+        events.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+
         let mut g = Graph {
             nodes: Vec::new(),
-            edges: Vec::new(),
+            files: Vec::new(),
         };
-        let mut files: HashMap<String, usize> = HashMap::new();
-        let mut file = |g: &mut Graph, path: &str| -> usize {
-            *files.entry(path.to_string()).or_insert_with(|| {
-                let name = path.rsplit('/').next().unwrap_or(path);
-                g.nodes.push(Node {
-                    kind: Kind::File { made: false },
-                    label: short(name),
-                    detail: String::new(),
-                    title: path.to_string(),
-                    layer: 0,
-                    order: 0.0,
-                });
-                g.nodes.len() - 1
-            })
-        };
-        // A step is the rows one tool wrote at one time, in a row.
-        let mut i = 0;
-        while i < steps.len() {
-            let s = steps[i];
-            let same = |t: &Step| {
-                (&t.date, &t.time, &t.server, &t.tool) == (&s.date, &s.time, &s.server, &s.tool)
-            };
-            let rows: Vec<&Step> = steps[i..].iter().copied().take_while(|t| same(t)).collect();
-            i += rows.len();
-            let flagged = rows
-                .iter()
-                .any(|r| r.facts.iter().any(|f| f.flagged().is_some()));
-            g.nodes.push(Node {
-                kind: Kind::Step { flagged },
-                label: short(&s.tool),
-                detail: format!("{} · {} {}", s.server, s.date, clock(&s.time)),
-                title: format!("{} {}: {}", s.server, s.tool, s.summary),
-                layer: 0,
-                order: 0.0,
-            });
-            let step = g.nodes.len() - 1;
-            let mut inputs: Vec<&String> = rows.iter().flat_map(|r| &r.inputs).collect();
-            inputs.dedup();
-            for input in inputs {
-                let f = file(&mut g, input);
-                if !g.edges.contains(&(f, step)) {
-                    g.edges.push((f, step));
+        let mut column: Option<usize> = None;
+        let mut made: HashMap<&str, usize> = HashMap::new();
+        for (_, _, event) in events {
+            let node = match event {
+                Event::Entry(e) if is_theirs(e) => {
+                    let c = column.map_or(0, |c| c + 1);
+                    column = Some(c);
+                    g.nodes.push(thought(e, c));
+                    continue;
                 }
-            }
-            for r in &rows {
-                let f = file(&mut g, &r.output);
-                g.nodes[f].kind = Kind::File { made: true };
-                if f != step && !g.edges.contains(&(step, f)) {
-                    g.edges.push((step, f));
+                Event::Entry(e) => Node {
+                    kind: Kind::Seen,
+                    label: short(&e.kind),
+                    detail: short(first_line(&e.text)),
+                    files: Vec::new(),
+                    title: format!("{} {}: {}", clock(&e.time), e.kind, e.text),
+                    column: 0,
+                },
+                Event::Step(rows) => {
+                    let s = rows[0];
+                    let mut files: Vec<String> = rows.iter().map(|r| name(&r.output)).collect();
+                    files.dedup();
+                    Node {
+                        kind: Kind::Step {
+                            flagged: rows
+                                .iter()
+                                .any(|r| r.facts.iter().any(|f| f.flagged().is_some())),
+                        },
+                        label: short(&s.tool),
+                        detail: format!("{} · {}", s.server, clock(&s.time)),
+                        files,
+                        title: format!("{} {}: {}", s.server, s.tool, s.summary),
+                        column: 0,
+                    }
+                }
+            };
+            let c = *column.get_or_insert_with(|| {
+                g.nodes.push(Node {
+                    kind: Kind::Thought { said: false },
+                    label: "No question yet".into(),
+                    detail: "nothing in the person's words".into(),
+                    files: Vec::new(),
+                    title: "Steps run before the person's first entry of the day".into(),
+                    column: 0,
+                });
+                0
+            });
+            g.nodes.push(Node { column: c, ..node });
+            let v = g.nodes.len() - 1;
+            if let Event::Step(rows) = event {
+                let mut inputs: Vec<&str> = rows
+                    .iter()
+                    .flat_map(|r| r.inputs.iter().map(String::as_str))
+                    .collect();
+                inputs.dedup();
+                for input in inputs {
+                    if let Some(&from) = made.get(input) {
+                        if from != v && !g.files.contains(&(from, v)) {
+                            g.files.push((from, v));
+                        }
+                    }
+                }
+                for r in rows {
+                    made.insert(&r.output, v);
                 }
             }
         }
-        g.layout();
         g
     }
 
-    /// Columns by the longest path from the data; within one, an order
-    /// that keeps the lines between columns from crossing much.
-    fn layout(&mut self) {
-        let n = self.nodes.len();
-        let mut preds = vec![Vec::new(); n];
-        let mut succs = vec![Vec::new(); n];
-        for &(a, b) in &self.edges {
-            preds[b].push(a);
-            succs[a].push(b);
-        }
-        // Longest path from a node with no inputs; a cycle (a file a step
-        // both read and made) is cut where it closes.
-        let mut layer: Vec<Option<usize>> = vec![None; n];
-        fn deepest(
-            v: usize,
-            preds: &[Vec<usize>],
-            layer: &mut [Option<usize>],
-            on: &mut [bool],
-        ) -> usize {
-            if let Some(l) = layer[v] {
-                return l;
-            }
-            on[v] = true;
-            let mut l = 0;
-            for &p in &preds[v] {
-                if !on[p] {
-                    l = l.max(deepest(p, preds, layer, on) + 1);
-                }
-            }
-            on[v] = false;
-            layer[v] = Some(l);
-            l
-        }
-        let mut on = vec![false; n];
-        for v in 0..n {
-            deepest(v, &preds, &mut layer, &mut on);
-        }
-        for (v, l) in layer.iter().enumerate() {
-            self.nodes[v].layer = l.unwrap_or(0);
-            self.nodes[v].order = v as f64;
-        }
-        // Data stands just before the first step that reads it, not all at
-        // the far left.
-        for v in 0..n {
-            if preds[v].is_empty() {
-                if let Some(first) = succs[v].iter().map(|&u| self.nodes[u].layer).min() {
-                    self.nodes[v].layer = first.saturating_sub(1);
-                }
-            }
-        }
-        let layers = self
-            .nodes
-            .iter()
-            .map(|x| x.layer)
-            .max()
-            .map_or(0, |m| m + 1);
-        // Each node at the mean place of its neighbours in the column
-        // before (then after), a few times over.
-        for round in 0..4 {
-            let down = round % 2 == 0;
-            let order: Vec<usize> = if down {
-                (1..layers).collect()
-            } else {
-                (0..layers.saturating_sub(1)).rev().collect()
-            };
-            for l in order {
-                let place = self.places();
-                let mut column: Vec<usize> = (0..n).filter(|&v| self.nodes[v].layer == l).collect();
-                let near = |v: usize| if down { &preds[v] } else { &succs[v] };
-                let key: Vec<f64> = column
-                    .iter()
-                    .map(|&v| {
-                        let ns = near(v);
-                        if ns.is_empty() {
-                            place[v]
-                        } else {
-                            ns.iter().map(|&u| place[u]).sum::<f64>() / ns.len() as f64
-                        }
-                    })
-                    .collect();
-                let mut keyed: Vec<(f64, usize)> = key.into_iter().zip(column.drain(..)).collect();
-                keyed.sort_by(|a, b| a.0.total_cmp(&b.0));
-                for (i, (_, v)) in keyed.into_iter().enumerate() {
-                    self.nodes[v].order = i as f64;
-                }
-            }
-        }
-    }
-
-    /// Each node's place in its column, 0 first.
-    fn places(&self) -> Vec<f64> {
-        let mut place = vec![0.0; self.nodes.len()];
-        let layers = self
-            .nodes
-            .iter()
-            .map(|x| x.layer)
-            .max()
-            .map_or(0, |m| m + 1);
-        for l in 0..layers {
-            let mut column: Vec<usize> = (0..self.nodes.len())
-                .filter(|&v| self.nodes[v].layer == l)
-                .collect();
-            column.sort_by(|&a, &b| self.nodes[a].order.total_cmp(&self.nodes[b].order));
-            for (i, v) in column.into_iter().enumerate() {
-                place[v] = i as f64;
-            }
-        }
-        place
-    }
-
-    /// The graph drawn: files as plain boxes (data grey, outputs dark),
-    /// steps as rounded ones (a flagged step's in red), lines left to
-    /// right.
-    pub(crate) fn svg(&self) -> String {
-        self.drawn().0
-    }
-
-    /// The SVG, and its width and height.
-    pub(crate) fn drawn(&self) -> (String, f64, f64) {
+    /// The trail drawn as SVG, shaped to fit about `aspect` (width over
+    /// height), and its width and height: the person's entries joined by
+    /// arrows, in rows that wrap, each over a panel of what ran (rounded,
+    /// a flagged step's in red) and was seen (dashed) after it.
+    pub(crate) fn drawn(&self, aspect: f64) -> (String, f64, f64) {
         const CHAR: f64 = 7.2;
         const PAD: f64 = 10.0;
-        const GAP_X: f64 = 56.0;
-        const GAP_Y: f64 = 14.0;
-        const FILE_H: f64 = 26.0;
-        const STEP_H: f64 = 38.0;
+        const GUTTER: f64 = 100.0;
+        const GAP_X: f64 = 44.0;
+        const GAP_Y: f64 = 10.0;
+        const DROP: f64 = 34.0;
+        const BAND_GAP: f64 = 36.0;
+        const TURN: f64 = 22.0;
+        const THOUGHT_H: f64 = 54.0;
+        const LINE: f64 = 13.0;
+        let height = |v: &Node| match v.kind {
+            Kind::Thought { .. } => THOUGHT_H,
+            Kind::Step { .. } => 38.0 + LINE * v.files.len().min(2) as f64,
+            Kind::Seen => 38.0,
+        };
         let width = |v: &Node| {
-            let chars = v
-                .label
-                .chars()
-                .count()
-                .max(v.detail.chars().count() * 5 / 6);
+            let mut chars = v.label.chars().count();
+            for l in v.detail.lines() {
+                chars = chars.max(l.chars().count() * 5 / 6);
+            }
+            for f in v.files.iter().take(2) {
+                chars = chars.max(f.chars().count() * 5 / 6 + 2);
+            }
             chars as f64 * CHAR + 2.0 * PAD
         };
-        let height = |v: &Node| match v.kind {
-            Kind::Step { .. } => STEP_H,
-            Kind::File { .. } => FILE_H,
-        };
-        let place = self.places();
-        let layers = self
-            .nodes
-            .iter()
-            .map(|x| x.layer)
-            .max()
-            .map_or(0, |m| m + 1);
-        // Each column as wide as its widest node; as tall as its nodes.
-        let mut col_w = vec![0.0f64; layers];
-        let mut col_h = vec![0.0f64; layers];
-        for v in &self.nodes {
-            col_w[v.layer] = col_w[v.layer].max(width(v));
-            col_h[v.layer] += height(v) + GAP_Y;
-        }
-        let total_h = col_h.iter().cloned().fold(0.0, f64::max).max(FILE_H) + GAP_Y;
-        let mut col_x = vec![GAP_Y; layers];
-        for l in 1..layers {
-            col_x[l] = col_x[l - 1] + col_w[l - 1] + GAP_X;
-        }
-        let total_w = col_x.last().zip(col_w.last()).map_or(0.0, |(x, w)| x + w) + GAP_Y;
-        // Top left of each node: its column's nodes centred, in order.
-        let mut at = vec![(0.0, 0.0); self.nodes.len()];
-        for l in 0..layers {
-            let mut column: Vec<usize> = (0..self.nodes.len())
-                .filter(|&v| self.nodes[v].layer == l)
-                .collect();
-            column.sort_by(|&a, &b| place[a].total_cmp(&place[b]));
-            let mut y = (total_h - col_h[l]) / 2.0 + GAP_Y / 2.0;
-            for v in column {
-                let node = &self.nodes[v];
-                let x = col_x[l] + (col_w[l] - width(node)) / 2.0;
-                at[v] = (x, y);
-                y += height(node) + GAP_Y;
+        let columns = self.nodes.iter().map(|v| v.column + 1).max().unwrap_or(0);
+        // Each column's entry and what it shows under it, in order.
+        let mut top = vec![None; columns];
+        let mut under: Vec<Vec<usize>> = vec![Vec::new(); columns];
+        for (v, node) in self.nodes.iter().enumerate() {
+            match node.kind {
+                Kind::Thought { .. } => top[node.column] = Some(v),
+                _ => under[node.column].push(v),
             }
         }
+        let hidden: Vec<usize> = under
+            .iter()
+            .map(|u| u.len().saturating_sub(SHOWN))
+            .collect();
+        let shown = |c: usize| &under[c][..under[c].len().min(SHOWN)];
+        let mut col_w = vec![0.0f64; columns];
+        let mut col_h = vec![0.0f64; columns];
+        for c in 0..columns {
+            for &v in top[c].iter().chain(shown(c)) {
+                col_w[c] = col_w[c].max(width(&self.nodes[v]));
+            }
+            col_h[c] = shown(c)
+                .iter()
+                .map(|&v| height(&self.nodes[v]) + GAP_Y)
+                .sum::<f64>()
+                + if hidden[c] > 0 { LINE + GAP_Y } else { 0.0 };
+            col_w[c] += 2.0 * PAD;
+        }
+        // Rows of `per` entries, as many to a row as fit the shape best.
+        let all: Vec<usize> = (0..columns).collect();
+        let band_h = |band: &[usize]| {
+            THOUGHT_H + DROP + band.iter().map(|&c| col_h[c]).fold(0.0, f64::max) + GAP_Y
+        };
+        let size = |per: usize| {
+            let (mut w, mut h) = (0.0f64, 0.0);
+            for band in all.chunks(per) {
+                w = w.max(band.iter().map(|&c| col_w[c] + GAP_X).sum::<f64>() - GAP_X);
+                h += band_h(band) + BAND_GAP;
+            }
+            (GUTTER + w + TURN + PAD, h - BAND_GAP + 2.0 * PAD)
+        };
+        let per = (1..=columns.max(1))
+            .max_by(|&a, &b| {
+                let fit = |n| {
+                    let (w, h) = size(n);
+                    (aspect / w).min(1.0 / h)
+                };
+                fit(a).total_cmp(&fit(b))
+            })
+            .unwrap_or(1);
+        let (total_w, total_h) = size(per);
+        let mut col_x = vec![0.0; columns];
+        let mut col_y = vec![0.0; columns];
+        let mut y = PAD;
+        for band in all.chunks(per) {
+            let mut x = GUTTER;
+            for &c in band {
+                (col_x[c], col_y[c]) = (x, y);
+                x += col_w[c] + GAP_X;
+            }
+            y += band_h(band) + BAND_GAP;
+        }
+        let panel_y = |c: usize| col_y[c] + THOUGHT_H + DROP;
+        // Each node drawn: its top left, width and height; what is under
+        // an entry as wide as its panel.
+        let mut at: Vec<Option<(f64, f64, f64, f64)>> = vec![None; self.nodes.len()];
+        for c in 0..columns {
+            if let Some(v) = top[c] {
+                let w = width(&self.nodes[v]);
+                at[v] = Some((col_x[c] + (col_w[c] - w) / 2.0, col_y[c], w, THOUGHT_H));
+            }
+            let mut y = panel_y(c) + GAP_Y;
+            for &v in shown(c) {
+                let h = height(&self.nodes[v]);
+                at[v] = Some((col_x[c] + PAD, y, col_w[c] - 2.0 * PAD, h));
+                y += h + GAP_Y;
+            }
+        }
+
         let mut out = String::new();
         let _ = writeln!(
             out,
@@ -281,131 +284,254 @@ impl Graph {
         );
         let _ = writeln!(
             out,
-            r##"<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#888"/></marker></defs>"##
+            r##"<defs>{}{}{}</defs>"##,
+            marker("a", "#999999"),
+            marker("t", "#1d3557"),
+            marker("f", "#b8b8b8")
         );
         let _ = writeln!(out, r##"<rect width="100%" height="100%" fill="white"/>"##);
-        for &(a, b) in &self.edges {
-            let (ax, ay) = at[a];
-            let (bx, by) = at[b];
-            let (x1, y1) = (
-                ax + width(&self.nodes[a]),
-                ay + height(&self.nodes[a]) / 2.0,
-            );
-            let (x2, y2) = (bx, by + height(&self.nodes[b]) / 2.0);
-            let mid = (x1 + x2) / 2.0;
-            let _ = writeln!(
-                out,
-                r##"<path d="M{x1:.1},{y1:.1} C{mid:.1},{y1:.1} {mid:.1},{y2:.1} {x2:.1},{y2:.1}" fill="none" stroke="#888" stroke-width="1.2" marker-end="url(#a)"/>"##
-            );
-        }
-        for (v, node) in self.nodes.iter().enumerate() {
-            let (x, y) = at[v];
-            let (w, h) = (width(node), height(node));
-            let title = format!("<title>{}</title>", xml(&node.title));
-            match node.kind {
-                Kind::File { made } => {
-                    let (fill, stroke, ink) = if made {
-                        ("#f4f6fb", "#4a5a7a", "#1d2433")
-                    } else {
-                        ("#f2f2f2", "#9a9a9a", "#555555")
-                    };
+        for c in 0..columns {
+            let x = col_x[c];
+            // The rows' names, in the gutter of each band.
+            if c % per == 0 {
+                for (y, name) in [
+                    (col_y[c] + THOUGHT_H / 2.0, "The person"),
+                    (panel_y(c) + GAP_Y + 19.0, "What ran"),
+                ] {
                     let _ = writeln!(
                         out,
-                        r##"<g>{title}<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" fill="{fill}" stroke="{stroke}"/><text x="{:.1}" y="{:.1}" text-anchor="middle" fill="{ink}">{}</text></g>"##,
-                        x + w / 2.0,
-                        y + h / 2.0 + 4.0,
-                        xml(&node.label)
-                    );
-                }
-                Kind::Step { flagged } => {
-                    let stroke = if flagged { "#b03a2e" } else { "#2f6f4f" };
-                    let _ = writeln!(
-                        out,
-                        r##"<g>{title}<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" rx="9" fill="#eef7f1" stroke="{stroke}" stroke-width="{}"/><text x="{:.1}" y="{:.1}" text-anchor="middle" font-weight="bold" fill="#14301f">{}</text><text x="{:.1}" y="{:.1}" text-anchor="middle" font-size="10" fill="#4d6b58">{}</text></g>"##,
-                        if flagged { 2.2 } else { 1.2 },
-                        x + w / 2.0,
-                        y + 16.0,
-                        xml(&node.label),
-                        x + w / 2.0,
-                        y + 30.0,
-                        xml(&node.detail)
+                        r##"<text x="{PAD}" y="{:.1}" font-size="11" font-weight="bold" fill="#777">{name}</text>"##,
+                        y + 4.0
                     );
                 }
             }
+            // The panel, and the arrow down to it.
+            if !shown(c).is_empty() {
+                let _ = writeln!(
+                    out,
+                    r##"<rect x="{x:.1}" y="{:.1}" width="{:.1}" height="{:.1}" rx="6" fill="#f7f7f5" stroke="#dddddd"/>"##,
+                    panel_y(c),
+                    col_w[c],
+                    col_h[c] + GAP_Y
+                );
+                let mid = x + col_w[c] / 2.0;
+                let _ = writeln!(
+                    out,
+                    r##"<path d="M{mid:.1},{:.1} L{mid:.1},{:.1}" stroke="#999" stroke-width="1.2" marker-end="url(#a)"/>"##,
+                    col_y[c] + THOUGHT_H,
+                    panel_y(c) - 1.0
+                );
+            }
+            if hidden[c] > 0 {
+                let _ = writeln!(
+                    out,
+                    r##"<text x="{:.1}" y="{:.1}" text-anchor="middle" font-size="10" fill="#777">… {} more, in the steps' table</text>"##,
+                    x + col_w[c] / 2.0,
+                    panel_y(c) + col_h[c] - 2.0,
+                    hidden[c]
+                );
+            }
+            // The arrow from the entry before: along the row, or round
+            // to the start of the next.
+            if c == 0 {
+                continue;
+            }
+            let (Some(Some((ax, ay, aw, _))), Some(Some((bx, by, _, _)))) =
+                (top[c - 1].map(|a| at[a]), top[c].map(|b| at[b]))
+            else {
+                continue;
+            };
+            let (y1, y2) = (ay + THOUGHT_H / 2.0, by + THOUGHT_H / 2.0);
+            let path = if col_y[c] == col_y[c - 1] {
+                format!("M{:.1},{y1:.1} L{:.1},{y2:.1}", ax + aw, bx - 1.0)
+            } else {
+                let right = col_x[c - 1] + col_w[c - 1] + TURN;
+                let left = col_x[c] - TURN;
+                let between = col_y[c] - BAND_GAP / 2.0;
+                format!(
+                    "M{:.1},{y1:.1} L{right:.1},{y1:.1} L{right:.1},{between:.1} L{left:.1},{between:.1} L{left:.1},{y2:.1} L{:.1},{y2:.1}",
+                    ax + aw,
+                    bx - 1.0
+                )
+            };
+            let _ = writeln!(
+                out,
+                r##"<path d="{path}" fill="none" stroke="#1d3557" stroke-width="1.6" marker-end="url(#t)"/>"##
+            );
+        }
+        // A step to one that read its file: faint, under the boxes.
+        for &(a, b) in &self.files {
+            let (Some((ax, ay, aw, ah)), Some((bx, by, _, bh))) = (at[a], at[b]) else {
+                continue;
+            };
+            let (y1, y2) = (ay + ah / 2.0, by + bh / 2.0);
+            let path = if self.nodes[a].column == self.nodes[b].column {
+                // One above the other: round the right.
+                let x = ax + aw;
+                let bend = x + 18.0;
+                format!("M{x:.1},{y1:.1} C{bend:.1},{y1:.1} {bend:.1},{y2:.1} {x:.1},{y2:.1}")
+            } else {
+                let (x1, x2) = (ax + aw, bx);
+                let mid = (x1 + x2) / 2.0;
+                format!("M{x1:.1},{y1:.1} C{mid:.1},{y1:.1} {mid:.1},{y2:.1} {x2:.1},{y2:.1}")
+            };
+            let _ = writeln!(
+                out,
+                r##"<path d="{path}" fill="none" stroke="#b8b8b8" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#f)"/>"##
+            );
+        }
+        for (v, node) in self.nodes.iter().enumerate() {
+            let Some((x, y, w, h)) = at[v] else {
+                continue;
+            };
+            let cx = x + w / 2.0;
+            let title = format!("<title>{}</title>", xml(&node.title));
+            let (rect, ink, sub) = match node.kind {
+                Kind::Thought { said: true } => (
+                    r##"rx="4" fill="#e8eef6" stroke="#1d3557" stroke-width="1.4""##,
+                    "#1d3557",
+                    r##"font-style="italic" fill="#333333""##,
+                ),
+                Kind::Thought { said: false } => (
+                    r##"rx="4" fill="white" stroke="#999999" stroke-dasharray="4 3""##,
+                    "#777777",
+                    r##"fill="#999999""##,
+                ),
+                Kind::Step { flagged: true } => (
+                    r##"rx="9" fill="#eef7f1" stroke="#b03a2e" stroke-width="2.2""##,
+                    "#14301f",
+                    r##"fill="#4d6b58""##,
+                ),
+                Kind::Step { flagged: false } => (
+                    r##"rx="9" fill="#eef7f1" stroke="#2f6f4f" stroke-width="1.2""##,
+                    "#14301f",
+                    r##"fill="#4d6b58""##,
+                ),
+                Kind::Seen => (
+                    r##"rx="2" fill="white" stroke="#aaaaaa" stroke-dasharray="3 2""##,
+                    "#555555",
+                    r##"font-style="italic" fill="#555555""##,
+                ),
+            };
+            let _ = write!(
+                out,
+                r##"<g>{title}<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" {rect}/><text x="{cx:.1}" y="{:.1}" text-anchor="middle" font-weight="bold" fill="{ink}">{}</text>"##,
+                y + 16.0,
+                xml(&node.label),
+            );
+            for (i, l) in node.detail.lines().enumerate() {
+                let _ = write!(
+                    out,
+                    r##"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" font-size="10" {sub}>{}</text>"##,
+                    y + 30.0 + LINE * i as f64,
+                    xml(l)
+                );
+            }
+            let more = node.files.len().saturating_sub(2);
+            for (i, f) in node.files.iter().take(2).enumerate() {
+                let f = if i == 1 && more > 0 {
+                    format!("{f} +{more}")
+                } else {
+                    f.clone()
+                };
+                let _ = write!(
+                    out,
+                    r##"<text x="{cx:.1}" y="{:.1}" text-anchor="middle" font-size="10" fill="#1d2433">{}</text>"##,
+                    y + 44.0 + LINE * i as f64,
+                    xml(&f)
+                );
+            }
+            out.push_str("</g>\n");
         }
         out.push_str("</svg>\n");
         (out, total_w, total_h)
     }
+}
 
-    /// The graph for Graphviz (`dot -Tpdf`).
-    pub(crate) fn dot(&self) -> String {
-        let mut out = String::from(
-            "digraph provenance {\n  rankdir=LR;\n  node [fontname=\"Helvetica\", fontsize=11];\n",
-        );
-        for (v, node) in self.nodes.iter().enumerate() {
-            let (shape, color) = match node.kind {
-                Kind::File { made: true } => ("box", "#4a5a7a"),
-                Kind::File { made: false } => ("box", "#9a9a9a"),
-                Kind::Step { flagged: true } => ("box, style=rounded", "#b03a2e"),
-                Kind::Step { flagged: false } => ("box, style=rounded", "#2f6f4f"),
-            };
-            let label = if node.detail.is_empty() {
-                dot_text(&node.title)
-            } else {
-                format!("{}\\n{}", dot_text(&node.label), dot_text(&node.detail))
-            };
-            let _ = writeln!(
-                out,
-                "  n{v} [label=\"{label}\", shape={shape}, color=\"{color}\", tooltip=\"{}\"];",
-                dot_text(&node.title)
-            );
-        }
-        for &(a, b) in &self.edges {
-            let _ = writeln!(out, "  n{a} -> n{b};");
-        }
-        out.push_str("}\n");
-        out
-    }
+/// An arrowhead `id`, in `fill`.
+fn marker(id: &str, fill: &str) -> String {
+    format!(
+        r##"<marker id="{id}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="{fill}"/></marker>"##
+    )
+}
 
-    /// The graph as lines: each step, what it read and what it made.
-    pub(crate) fn text(&self) -> String {
-        let mut out = String::new();
-        for (v, node) in self.nodes.iter().enumerate() {
-            let Kind::Step { flagged } = node.kind else {
-                continue;
-            };
-            let paths = |ends: Vec<usize>| -> String {
-                let p: Vec<&str> = ends.iter().map(|&f| self.nodes[f].title.as_str()).collect();
-                if p.is_empty() {
-                    "nothing recorded".into()
-                } else {
-                    p.join(", ")
-                }
-            };
-            let read = paths(
-                self.edges
-                    .iter()
-                    .filter(|e| e.1 == v)
-                    .map(|e| e.0)
-                    .collect(),
-            );
-            let made = paths(
-                self.edges
-                    .iter()
-                    .filter(|e| e.0 == v)
-                    .map(|e| e.1)
-                    .collect(),
-            );
-            let _ = writeln!(
-                out,
-                "{} ({}){}\n  from {read}\n  made {made}",
-                node.label,
-                node.detail,
-                if flagged { ", a number flagged" } else { "" }
-            );
-        }
-        out
+/// Whether `e` is the person's words: one of their kinds, written by the
+/// legume server, or a note the person wrote (in any tool's watch view:
+/// `user` before 0.5.0).
+fn is_theirs(e: &Entry) -> bool {
+    let kind = e.kind.split(' ').next().unwrap_or("");
+    e.server == crate::brain::NAME && THEIRS.contains(&kind)
+        || e.kind == "note (user)"
+        || e.kind == "user"
+}
+
+/// The top-row node of the person's entry `e`: its kind as a name (H1,
+/// Figure 2B), their words under it.
+fn thought(e: &Entry, column: usize) -> Node {
+    let (kind, rest) = e.kind.split_once(' ').unwrap_or((&e.kind, ""));
+    let label = match kind {
+        "plan" => "Question".into(),
+        "data" => match e.text.split_once("verdict: ") {
+            Some((_, v)) => format!("Data: {}", v.lines().next().unwrap_or("").trim()),
+            None => "Data".into(),
+        },
+        "hypothesis" => rest.to_string(),
+        "evidence" => format!("Evidence, {rest}"),
+        "figure" => format!("Figure {rest}"),
+        "summary" => "Summary".into(),
+        _ => "Note".into(),
+    };
+    let words = e
+        .text
+        .lines()
+        .find_map(|l| l.strip_prefix("> "))
+        .unwrap_or_else(|| first_line(&e.text));
+    Node {
+        kind: Kind::Thought { said: true },
+        label: short(&label),
+        detail: wrapped(words, 34, 2),
+        files: Vec::new(),
+        title: format!("{} {}: {}", clock(&e.time), e.kind, e.text),
+        column,
     }
+}
+
+/// `text` in at most `lines` lines of `width` characters, broken between
+/// words, the last cut short (…) when there is more.
+fn wrapped(text: &str, width: usize, lines: usize) -> String {
+    let mut out: Vec<String> = vec![String::new()];
+    for word in text.split_whitespace() {
+        let n = out.len();
+        let line = &mut out[n - 1];
+        if line.is_empty() || line.chars().count() + 1 + word.chars().count() <= width {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        } else if n < lines {
+            out.push(word.to_string());
+        } else {
+            line.push_str(" …");
+            break;
+        }
+    }
+    for line in &mut out {
+        if line.chars().count() > width {
+            *line = format!("{}…", line.chars().take(width - 1).collect::<String>());
+        }
+    }
+    out.join("\n")
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+}
+
+fn name(path: &str) -> String {
+    short(path.rsplit('/').next().unwrap_or(path))
 }
 
 /// `text` cut to [`LABEL`] characters.
@@ -435,17 +561,6 @@ fn xml(text: &str) -> String {
         .collect()
 }
 
-/// `text` safe in a DOT string.
-fn dot_text(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control())
-        .flat_map(|c| match c {
-            '"' | '\\' => vec!['\\', c],
-            c => vec![c],
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,71 +583,135 @@ mod tests {
         }
     }
 
-    #[test]
-    fn steps_join_through_the_files_they_share() {
-        let rows = [
-            step("10:00:00", "qc", &["data/a.h5"], "r/a.qc.zip", true),
-            step("10:05:00", "fit", &["r/a.qc.zip"], "r/fit.json", false),
-            step("10:05:00", "fit", &["r/a.qc.zip"], "r/fit.<b>.png", false),
-            step(
-                "10:09:00",
-                "annotate",
-                &["r/fit.json", "panel.tsv"],
-                "r/round1",
-                false,
-            ),
-        ];
-        let refs: Vec<&Step> = rows.iter().collect();
-        let g = Graph::of(&refs);
-        // 3 steps; files: a.h5, a.qc.zip, fit.json, fit.png, panel.tsv, round1.
-        assert_eq!(g.nodes.len(), 9);
-        let layer = |label: &str| g.nodes.iter().find(|n| n.label == label).unwrap().layer;
-        assert_eq!(layer("a.h5"), 0);
-        assert_eq!(layer("qc"), 1);
-        assert_eq!(layer("fit"), 3);
-        assert_eq!(layer("round1"), 6);
-        assert_eq!(layer("panel.tsv"), 4, "beside the step that reads it");
-        // Data that no step made, and outputs, are told apart.
-        let kind = |label: &str| {
-            g.nodes
-                .iter()
-                .find(|n| n.label == label)
-                .unwrap()
-                .kind
-                .clone()
-        };
-        assert_eq!(kind("panel.tsv"), Kind::File { made: false });
-        assert_eq!(kind("fit.json"), Kind::File { made: true });
-        assert_eq!(kind("qc"), Kind::Step { flagged: true });
+    fn entry(time: &str, server: &str, kind: &str, text: &str) -> Entry {
+        Entry {
+            time: time.into(),
+            server: server.into(),
+            kind: kind.into(),
+            text: text.into(),
+        }
+    }
 
-        let svg = g.svg();
-        assert!(svg.starts_with("<svg "), "{svg}");
-        assert!(
-            svg.contains("fit.&lt;b&gt;.png"),
-            "names are escaped: {svg}"
-        );
-        assert_eq!(svg.matches("marker-end").count(), g.edges.len());
-        let dot = g.dot();
-        assert!(dot.contains("rankdir=LR") && dot.contains(" -> "), "{dot}");
-        let text = g.text();
-        assert!(
-            text.contains(
-                "annotate (srv · 2026-10-28 10:09)\n  from r/fit.json, panel.tsv\n  made r/round1"
-            ),
-            "{text}"
-        );
-        assert!(
-            text.contains("qc (srv · 2026-10-28 10:00), a number flagged"),
-            "{text}"
-        );
+    fn find<'a>(g: &'a Graph, label: &str) -> &'a Node {
+        g.nodes.iter().find(|n| n.label == label).unwrap()
     }
 
     #[test]
-    fn a_step_that_reads_what_it_writes_does_not_loop() {
-        let rows = [step("10:00:00", "fix", &["r/x"], "r/x", false)];
+    fn each_step_falls_under_the_persons_entry_before_it() {
+        let brain = crate::brain::NAME;
+        let rows = [
+            step("09:00:00", "info", &["data/a.h5"], "r/a.info.txt", false),
+            step("10:00:00", "qc", &["data/a.h5"], "r/a.qc.zip", true),
+            step("10:05:00", "fit", &["r/a.qc.zip"], "r/fit.json", false),
+            step("10:05:00", "fit", &["r/a.qc.zip"], "r/fit.<b>.png", false),
+            step("10:09:00", "annotate", &["r/fit.json"], "r/round1", false),
+        ];
+        let notebook = [
+            entry(
+                "10:00:00",
+                brain,
+                "plan",
+                "> Why is <4> apart, rather than with 2?",
+            ),
+            entry(
+                "10:01:00",
+                brain,
+                "data",
+                "`data/a.h5`, verdict: caveats\n\n> one donor",
+            ),
+            entry(
+                "10:02:00",
+                "senna",
+                "plan",
+                "the agent's own plan, from an older tool",
+            ),
+            entry("10:06:00", brain, "observation", "fit: 12 clusters"),
+            entry("10:07:00", brain, "hypothesis H1", "> 4 is a doublet group"),
+        ];
         let refs: Vec<&Step> = rows.iter().collect();
-        let g = Graph::of(&refs);
-        assert_eq!(g.nodes.len(), 2);
-        assert!(g.svg().ends_with("</svg>\n"));
+        let g = Graph::of(&refs, &notebook);
+
+        // Along the top: the stand-in for the step before any entry, then
+        // the person's entries in order; an older tool's plan is not theirs.
+        let top: Vec<&str> = g
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, Kind::Thought { .. }))
+            .map(|n| n.label.as_str())
+            .collect();
+        assert_eq!(top, ["No question yet", "Question", "Data: caveats", "H1"]);
+        assert_eq!(find(&g, "info").column, 0);
+        assert_eq!(
+            find(&g, "qc").column,
+            1,
+            "after the plan of the same second"
+        );
+        assert_eq!(find(&g, "fit").column, 2);
+        assert_eq!(find(&g, "fit").files, ["fit.json", "fit.<b>.png"]);
+        assert_eq!(find(&g, "observation").column, 2);
+        assert_eq!(find(&g, "plan").kind, Kind::Seen);
+        assert_eq!(find(&g, "annotate").column, 3);
+        assert_eq!(find(&g, "qc").kind, Kind::Step { flagged: true });
+        // qc made what fit read, fit what annotate read.
+        assert_eq!(g.files.len(), 2);
+
+        let svg = g.drawn(2.6).0;
+        assert!(svg.starts_with("<svg "), "{svg}");
+        assert!(
+            svg.contains("Why is &lt;4&gt; apart, rather") && svg.contains(">2?<"),
+            "words escaped: {svg}"
+        );
+        assert!(svg.contains("fit.&lt;b&gt;.png"), "names escaped: {svg}");
+        // 3 arrows along the top, 4 down to the panels, 2 between files.
+        assert_eq!(svg.matches("marker-end").count(), 3 + 4 + 2);
+    }
+
+    #[test]
+    fn the_persons_words_break_between_words() {
+        assert_eq!(wrapped("a few words", 34, 2), "a few words");
+        assert_eq!(wrapped("aaa bbb ccc", 7, 2), "aaa bbb\nccc");
+        assert_eq!(wrapped("aaa bbb ccc dd eee", 7, 2), "aaa bbb\nccc dd…");
+        assert_eq!(wrapped("abcdefghij", 7, 2), "abcdef…");
+    }
+
+    #[test]
+    fn a_long_day_wraps_into_rows() {
+        let notebook: Vec<Entry> = (0..8)
+            .map(|i| entry(&format!("10:0{i}:00"), crate::brain::NAME, "summary", "> s"))
+            .collect();
+        let (_, w, h) = Graph::of(&[], &notebook).drawn(2.6);
+        assert!(w / h < 6.0, "{w} x {h}");
+    }
+
+    #[test]
+    fn the_small_hours_come_after_the_evening() {
+        let rows = [
+            step("01:30:00", "late", &[], "r/late", false),
+            step("22:00:00", "evening", &[], "r/evening", false),
+        ];
+        let notebook = [entry("23:00:00", crate::brain::NAME, "summary", "> done")];
+        let refs: Vec<&Step> = rows.iter().collect();
+        let g = Graph::of(&refs, &notebook);
+        assert_eq!(find(&g, "evening").column, 0);
+        assert_eq!(find(&g, "late").column, 1, "under the summary");
+    }
+
+    #[test]
+    fn a_long_column_shows_its_first_steps_and_counts_the_rest() {
+        let rows: Vec<Step> = (0..9)
+            .map(|i| {
+                step(
+                    &format!("10:0{i}:00"),
+                    &format!("s{i}"),
+                    &[],
+                    &format!("r/{i}"),
+                    false,
+                )
+            })
+            .collect();
+        let refs: Vec<&Step> = rows.iter().collect();
+        let svg = Graph::of(&refs, &[]).drawn(2.6).0;
+        assert!(svg.contains(">s5<") && !svg.contains(">s6<"), "{svg}");
+        assert!(svg.contains("… 3 more, in the steps' table"), "{svg}");
     }
 }

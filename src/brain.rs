@@ -13,8 +13,7 @@ use std::path::PathBuf;
 
 use crate::project::Project;
 use crate::{
-    evidence, notebook, project, Call, Content, Handler, Options, Prompt, Role, ServerInfo,
-    ToolSpec,
+    evidence, project, Call, Content, Handler, Options, Prompt, Role, ServerInfo, ToolSpec,
 };
 
 /// The server's name, as clients register it.
@@ -53,14 +52,15 @@ fn info() -> ServerInfo {
         name: NAME.into(),
         version: env!("CARGO_PKG_VERSION").into(),
         instructions: Some(format!(
-            "The legume server keeps the reasoning the legume tools share: what results \
-             might mean, what the user decided, and how each hypothesis stands against \
-             independent sources of evidence. The tools' own servers run the steps. \
+            "The legume server keeps the project's notebook, the one the legume tools \
+             share: the person's plan, their data verdicts, their hypotheses, and how each \
+             stands against independent sources of evidence. The tools' own servers run \
+             the steps. \
              `guide` lists the sections of the guide to this work and gives any one of \
              them; read the quick card below first. `status` says where the project \
-             stands: its data, recent outputs, today's notebook, a question waiting for the \
-             user, and the hypotheses. `hypotheses` gives one hypothesis's triangulation \
-             table.\n\nQuick card for agents:{card}"
+             stands: its data, recent outputs, today's notebook, the hypotheses and what \
+             is open for the person; with a `hypothesis`, its triangulation table. \
+             `report` makes the day's slides.\n\nQuick card for agents:{card}"
         )),
     }
 }
@@ -133,7 +133,7 @@ pub(crate) fn sections() -> Vec<Section> {
     out
 }
 
-fn section(id: &str) -> Option<Section> {
+pub(crate) fn section(id: &str) -> Option<Section> {
     sections().into_iter().find(|s| s.id == id)
 }
 
@@ -167,14 +167,13 @@ pub fn guide(id: Option<&str>) -> Result<String> {
 }
 
 /// The recipes for whole pieces of work, as MCP prompts: what a person
-/// starts with (`/mcp__legume__explore` in Claude Code), or a local model's
-/// chat starts a stage with.
+/// starts with (`/mcp__legume__explore` in Claude Code).
 pub(crate) fn prompts() -> Vec<Prompt> {
     vec![
         Prompt::new(
             "explore",
             "Explore a data set",
-            "Work through a data set with the person, stage by stage, from a survey to hypotheses tested against independent sources (guide sections 4 and 13).",
+            "Work through a data set with the person, step by step: they ask, predict, judge and write; you run the tools, show the facts and ask (guide sections 4 and 13).",
             EXPLORE,
         )
         .arg("question", "What the person wants to know, if anything yet", false)
@@ -182,10 +181,10 @@ pub(crate) fn prompts() -> Vec<Prompt> {
         Prompt::new(
             "triangulate",
             "Triangulate a hypothesis",
-            "Test a hypothesis the person chose against sources of evidence that share little with each other, and say the verb they allow (guide section 8).",
+            "Test the person's hypothesis against sources that could corroborate or nullify it; they choose and judge each, and the table sets the verb (guide section 8).",
             TRIANGULATE,
         )
-        .arg("hypothesis", "The hypothesis, as H1, H2, ... (`hypotheses` lists them)", false),
+        .arg("hypothesis", "The hypothesis, as H1, H2, ... (`status` lists them)", false),
     ]
 }
 
@@ -195,26 +194,25 @@ Let us explore a data set together, the way the legume guide says (its sections 
 Question: {question}
 Data: {data}
 
-1. Call `status` (this server) to see the project: its data, recent outputs, any \
-question waiting for me, and the hypotheses so far. If the project folder looks \
-wrong (source code, a home folder), tell me first.
-2. If there is no question, the question is \"what varies in this data, and which \
-differences are worth testing?\". Put it as a contrast: a fact rather than a foil.
-3. Record a `plan` in the notebook: the question, the data, two or more sources of \
-evidence that share as little as possible (guide 8.3), and how the result will be \
-checked (held-out donors, say).
-4. Work in stages, and stop after each one to show me what you found:
-   survey (cells, genes, donors, quality), structure (axes, clusters, cell \
-types), contrast (where conditions differ), shortlist (three to five \
-hypotheses, each a contrast), triangulate (one new source at a time), report.
-   Read-only tools first; record an `observation` with the numbers after each \
-step; follow a job with `job_wait` until it is done.
-5. When a result needs interpreting, propose two or more readings \
-(`interpretation`) and ask me which hold. Never decide what a result means \
-alone. Record my reply as an `answer` with my exact words.
-6. The result of exploring is hypotheses, not findings: say so at the end, with \
-where the records are and, for each hypothesis, the source still missing. Build \
-the day's slides with `report`, your story in `story`, and tell me where they are.
+1. Call `status` (this server) and show me where the project stands, in plain \
+words: the data and what is not recorded about it, what was done, the hypotheses, \
+and what is open for me. If the project folder looks wrong (source code, a home \
+folder), tell me first.
+2. Ask me my question, as a contrast (this rather than that), and what result \
+would change my mind. Record my words as the `plan`. If I have no question yet, \
+ask what I expect to vary in this data.
+3. For data whose origin or quality I have not given: run the read-only checks, \
+explain what each number measures and what is typical, say what argues against the \
+data, and ask me. Record my words as `data`.
+4. Work in steps, and stop after each to show me what came out: ask me first what \
+I expect, then show it. Read-only tools first; record an `observation` with the \
+numbers after each step. Tell me plainly what is running and how long it takes.
+5. Never say what a result means. Ask me; when I state a hypothesis, ask what \
+else could explain it and what would nullify it, and record my words as a \
+`hypothesis`. When I want a figure or table for the paper, record it as a \
+`figure` with my number and take-home.
+6. At the end, ask me for the day's summary and record my words as `summary`; then \
+build the slides with `report` and tell me where the records and the slides are.
 
 Read a guide section with `guide` when a step is unclear.";
 
@@ -223,19 +221,19 @@ Let us test a hypothesis against independent sources of evidence (the legume gui
 
 Hypothesis: {hypothesis}
 
-1. Call `hypotheses` (this server): without an id it lists them with their \
-standing. If no hypothesis was named, show me the list and ask which one.
-2. Call `hypotheses` with its id: its table, the verb its sources allow now, and \
-the kinds of source not yet used.
-3. For each source already looked at but not in the table, record what it says \
-as notebook kind `evidence` (hypothesis, source, class, verdict, the numbers in \
-`text`). Several tools on the same data are one source. A gene-set or term test \
+1. Call `status` (this server): it lists the hypotheses with their standing. If \
+no hypothesis was named, show me the list and ask which one.
+2. Call `status` with its `hypothesis`: its table, the verb its sources allow now, \
+and the kinds of source not yet used. If I have not said what would nullify it, ask \
+me before anything else.
+3. Tell me, in plain words, which sources could corroborate or nullify it and what \
+each shares with our cells; I choose which to pursue, or to stop.
+4. Run what I chose and show me the numbers. Ask me whether it agrees, disagrees or \
+is mixed, and why; record it as `evidence` with the numbers in `text` and my words \
+in `words`. Several tools on the same data are one source. A gene-set or term test \
 on our cells is our cells, not curated knowledge.
-4. Offer the next sources as notebook kind `offer` with numbered options, those \
-that share least with the sources that agree first (guide 8.6); stopping can be \
-one. Ask me, and record my reply as kind `choice` with my exact words.
-5. Run what I chose, record its `evidence`, and go back to 2 until I stop.
-6. Use only the verb the table allows. Name what disagrees. \"Drives\" needs \
+5. Go back to 2 until I stop.
+6. Use only the verb the table allows, and name what disagrees. \"Drives\" needs \
 genetic, perturbation or applied-treatment evidence that agrees.";
 
 struct Brain;
@@ -254,26 +252,19 @@ impl Handler for Brain {
             .read_only(),
             ToolSpec::new(
                 "status",
-                "Where the project stands: its data, recent outputs, today's notebook, a question waiting for the user's reply, and the hypotheses with how far each got.",
-                json!({ "type": "object", "properties": {} }),
-            )
-            .read_only(),
-            ToolSpec::new(
-                "hypotheses",
-                "The project's hypotheses (the readings the user chose), each with how far it got; with `id`, its triangulation table, the verb it allows and the sources not yet used.",
+                "Where the project stands: its data, recent outputs, today's notebook, the hypotheses with how far each got, and what is open for the person. With `hypothesis`, that hypothesis's triangulation table, the verb it allows and the sources not yet used.",
                 json!({
                     "type": "object",
-                    "properties": { "id": { "type": "string", "description": "A hypothesis, as H1, H2, ..." } },
+                    "properties": { "hypothesis": { "type": "string", "description": "A hypothesis, as H1, H2, ..." } },
                 }),
             )
             .read_only(),
             ToolSpec::new(
                 "report",
-                "The day's work as slides, built from the records, in results/<day>/report/ (report.typ, its provenance graph graph.svg, and report.pdf when Typst is installed; a story replaced is kept): the question, the data, the steps and their numbers, the figures with the commands that made them, what was seen, the person's interpretation (or \"not yet interpreted\"), each hypothesis's triangulation table, and how to replay it. The `story` is the one part you write: a few short paragraphs on what was asked, done and found, as hypotheses, with the verbs the tables allow; the slides label it as yours. Build it when the person asks for a report or the day's work ends, and show them where it is.",
+                "The day's work as slides, built from the records, in results/<day>/report/: report.pdf, the same slides as text in report.md, and the trail of the day's steps in graph.svg. The person's summary of the day, their question, the data, the steps and their numbers, the figures with the commands that made them, what was seen, each hypothesis's triangulation table, and how to replay it. Every word is read from the records or is the person's own; you write none of it. Build it when the person asks for a report or the day's work ends, and show them where it is.",
                 json!({
                     "type": "object",
                     "properties": {
-                        "story": { "type": "string", "description": "What was asked, done and found, in a few short paragraphs, from the records; it replaces the day's story. Left out, the story written before is kept." },
                         "day": { "type": "string", "description": "YYYY-MM-DD; today when left out" },
                     },
                 }),
@@ -290,16 +281,13 @@ impl Handler for Brain {
     fn call(&mut self, name: &str, args: Value, cx: &Call) -> Result<Vec<Content>> {
         let text = match name {
             "guide" => guide(args["section"].as_str())?,
-            "status" => status(records(cx)?),
-            "hypotheses" => hypotheses(records(cx)?, &args["id"])?,
+            "status" => match &args["hypothesis"] {
+                Value::Null => status(records(cx)?),
+                id => hypothesis(records(cx)?, id)?,
+            },
             "report" => {
                 let p = records(cx)?;
-                let built = crate::report::build(
-                    p.root(),
-                    args["day"].as_str(),
-                    args["story"].as_str(),
-                    true,
-                )?;
+                let built = crate::report::build(p.root(), args["day"].as_str())?;
                 crate::report::said(p.root(), &built)
             }
             _ => anyhow::bail!("no tool `{name}`"),
@@ -322,18 +310,10 @@ fn ledger(p: &Project) -> (Vec<evidence::Hypothesis>, Vec<evidence::Evidence>) {
     )
 }
 
-fn hypotheses(p: &Project, id: &Value) -> Result<String> {
+/// A hypothesis's triangulation table, the verb it allows and what to
+/// look at next.
+fn hypothesis(p: &Project, id: &Value) -> Result<String> {
     let (hyps, all) = ledger(p);
-    if id.is_null() {
-        if hyps.is_empty() {
-            return Ok(
-                "No hypotheses yet: a reading becomes one when the user chooses it in an `answer`."
-                    .into(),
-            );
-        }
-        let lines: Vec<String> = hyps.iter().map(|h| evidence::standing(h, &all)).collect();
-        return Ok(lines.join("\n"));
-    }
     let args = json!({ "hypothesis": id });
     let h = evidence::find(&args, &hyps)?;
     Ok(format!(
@@ -343,32 +323,44 @@ fn hypotheses(p: &Project, id: &Value) -> Result<String> {
     ))
 }
 
-/// The last `n` lines of `text` that `keep`.
-fn tail(text: &str, n: usize, keep: impl Fn(&str) -> bool) -> Vec<&str> {
-    let mut lines: Vec<&str> = text.lines().filter(|l| keep(l)).collect();
-    lines.drain(..lines.len().saturating_sub(n));
-    lines
-}
-
 pub(crate) fn status(p: &Project) -> String {
     let root = p.root();
-    let read = |rel: &str| project::read_record(&root.join(rel));
+    let r = crate::records::Records::read(root, &project::now().0);
     let mut out = format!("Project: {}\n", root.display());
-    let data = read("data/README.md");
-    let data = tail(&data, 10, |l| l.starts_with("- "));
-    out.push_str("\nData (data/README.md):\n");
-    if data.is_empty() {
-        out.push_str("  none recorded\n");
+    out.push_str("\nData (data/):\n");
+    if r.data.is_empty() {
+        out.push_str("  none yet: the person's data goes in data/\n");
     }
-    for l in data {
-        out.push_str(&format!("  {l}\n"));
+    let listed = 20;
+    if r.data.len() > listed {
+        let undescribed = r.data.iter().filter(|d| d.from.is_empty()).count();
+        out.push_str(&format!(
+            "  {} files ({undescribed} not described); the first {listed}:\n",
+            r.data.len()
+        ));
     }
-    let steps = crate::records::steps(root);
-    out.push_str("\nRecent outputs (results/INDEX.tsv), with the numbers each step made:\n");
-    if steps.is_empty() {
+    for d in r.data.iter().take(listed) {
+        let size = match d.bytes {
+            0 => String::new(),
+            b if b >= 1 << 30 => format!(" ({:.1} GB)", b as f64 / (1u64 << 30) as f64),
+            b if b >= 1 << 20 => format!(" ({} MB)", b >> 20),
+            b => format!(" ({} kB)", (b >> 10).max(1)),
+        };
+        let from = match d.from.as_str() {
+            "" => "where it came from is not recorded".to_string(),
+            f => format!("\"{f}\""),
+        };
+        let verdict = match d.verdict.as_str() {
+            "" => String::new(),
+            v => format!("; the person's verdict: {v}"),
+        };
+        out.push_str(&format!("  {}{size}: {from}{verdict}\n", d.path));
+    }
+    out.push_str("\nRecent outputs (results/INDEX.tsv), with the key numbers each step made:\n");
+    if r.steps.is_empty() {
         out.push_str("  none yet\n");
     }
-    for s in &steps[steps.len().saturating_sub(8)..] {
+    for s in &r.steps[r.steps.len().saturating_sub(8)..] {
         out.push_str(&format!(
             "  {} {} {} {}: {} ({})\n",
             s.date, s.time, s.server, s.tool, s.output, s.summary
@@ -378,7 +370,8 @@ pub(crate) fn status(p: &Project) -> String {
             out.push_str(&format!("      {}\n", facts.join("; ")));
         }
     }
-    let flagged: Vec<String> = steps
+    let flagged: Vec<String> = r
+        .steps
         .iter()
         .flat_map(|s| {
             s.facts
@@ -389,26 +382,18 @@ pub(crate) fn status(p: &Project) -> String {
         .collect();
     if !flagged.is_empty() {
         out.push_str(
-            "\nFlagged by the tools (look at these with the user before building on them):\n",
+            "\nFlagged by the tools (look at these with the person before building on them):\n",
         );
         for f in &flagged[flagged.len().saturating_sub(8)..] {
             out.push_str(f);
         }
     }
-    let today = p.notebook_today();
-    let heads: Vec<&str> = notebook::entries(&today)
-        .into_iter()
-        .filter_map(|e| e.lines().next())
-        .collect();
     out.push_str("\nToday's notebook (results/<today>/notebook.md), latest entries:\n");
-    if heads.is_empty() {
-        out.push_str("  none yet: start with a `plan`\n");
+    if r.notebook.is_empty() {
+        out.push_str("  none yet: start with the person's `plan`\n");
     }
-    for h in &heads[heads.len().saturating_sub(8)..] {
-        out.push_str(&format!("  {h}\n"));
-    }
-    if let Some(q) = notebook::open_question(&today) {
-        out.push_str(&format!("\nWaiting for the user: {q}\n"));
+    for e in &r.notebook[r.notebook.len().saturating_sub(8)..] {
+        out.push_str(&format!("  {} · {} · {}\n", e.time, e.server, e.kind));
     }
     let (hyps, all) = ledger(p);
     out.push_str("\nHypotheses (results/HYPOTHESES.tsv, EVIDENCE.tsv):\n");
@@ -417,6 +402,26 @@ pub(crate) fn status(p: &Project) -> String {
     }
     for h in &hyps {
         out.push_str(&format!("  {}\n", evidence::standing(h, &all)));
+    }
+    if !r.figures.is_empty() {
+        out.push_str("\nKept for the paper (results/FIGURES.tsv):\n");
+        for f in &r.figures {
+            let claim = match f.hypothesis.as_str() {
+                "" => String::new(),
+                h => format!(", for {h}"),
+            };
+            out.push_str(&format!(
+                "  {}: {}{claim}: \"{}\"\n",
+                f.number, f.output, f.take_home
+            ));
+        }
+    }
+    let open = r.open();
+    if !open.is_empty() {
+        out.push_str("\nOpen for the person (ask, in plain words):\n");
+        for o in open {
+            out.push_str(&format!("  {o}\n"));
+        }
     }
     out
 }
@@ -447,6 +452,6 @@ mod tests {
         assert!(info()
             .instructions
             .unwrap()
-            .contains("First call: notebook kind \"plan\""));
+            .contains("First, call `status` on the legume server"));
     }
 }

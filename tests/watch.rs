@@ -149,7 +149,7 @@ fn a_person_follows_stops_and_leaves_a_note() {
         &|b| matches!(b, Body::Result { id, ok: false, text, .. } if id == "a" && text.contains("stopped by the user"))
     ));
     assert!(has(
-        &|b| matches!(b, Body::Notebook { entry, text } if entry == "user" && text == "look at cluster 3")
+        &|b| matches!(b, Body::Notebook { entry, text } if entry == "note (user)" && text == "> look at cluster 3")
     ));
     assert!(has(
         &|b| matches!(b, Body::State { id, state } if id == "2" && state["focus"] == json!([3]))
@@ -178,7 +178,7 @@ fn a_person_follows_stops_and_leaves_a_note() {
         .map(|e| std::fs::read_to_string(e.path().join("notebook.md")).unwrap())
         .unwrap();
     assert!(
-        notebook.contains("· t · user\n\nlook at cluster 3"),
+        notebook.contains("· t · note (user)\n\n> look at cluster 3"),
         "{notebook}"
     );
 }
