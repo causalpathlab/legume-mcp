@@ -35,16 +35,15 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 clap = { version = "4.6", optional = true }
 
 # The report's PDF, typeset in this program: Typst and the fonts it ships
-# (`pdf`, on by default; a tool that uses only the library takes
-# `default-features = false`). Typst 0.15 needs Rust 1.92; the library
-# without it keeps rust-version.
+# (`pdf`, for the `legume` binary: `cargo install legume-mcp --features
+# pdf`). The tools take the library without it. Typst 0.15 needs Rust
+# 1.92; the library without it keeps rust-version.
 typst = { version = "0.15.1", optional = true }
 typst-assets = { version = "0.15.1", features = ["fonts"], optional = true }
 typst-layout = { version = "0.15.1", optional = true }
 typst-pdf = { version = "0.15.1", optional = true }
 
 [features]
-default = ["pdf"]
 pdf = ["dep:typst", "dep:typst-assets", "dep:typst-layout", "dep:typst-pdf"]
 tui = ["dep:legume-tui", "dep:ratatui"]
 clap = ["dep:clap"]

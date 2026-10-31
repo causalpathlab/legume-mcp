@@ -187,9 +187,12 @@ enum Block {
     Field(String, String),
     Table(Vec<String>, Vec<Vec<Cell>>),
     /// An image under the project, its caption and a note on how it was
-    /// made; `wide`: as wide as the slide, else as tall as its room.
+    /// made; `wide`: as wide as the slide, else as tall as its room. `view`:
+    /// for a PDF figure, the picture beside it that a Markdown viewer can
+    /// show.
     Image {
         path: String,
+        view: Option<String>,
         caption: String,
         note: String,
         wide: bool,
@@ -325,6 +328,7 @@ fn slides(
             title: "The trail".into(),
             blocks: vec![Block::Image {
                 path: format!("results/{day}/report/graph.svg"),
+                view: None,
                 caption: "The person's entries in order (blue); under each, what ran (rounded; \
                           red flagged a number) and was seen (dashed) after it. A faint line: \
                           a step read a file another made."
@@ -410,6 +414,7 @@ fn slides(
             let path = sharpest(root, &f.output);
             shown.push(path.clone());
             blocks.push(Block::Image {
+                view: viewable(root, &path),
                 path,
                 caption: f.take_home.clone(),
                 note: made(&f.output),
@@ -444,6 +449,7 @@ fn slides(
         deck.push(Slide {
             title: format!("Image: {}", file_name(&st.output)),
             blocks: vec![Block::Image {
+                view: viewable(root, &path),
                 path,
                 caption: st.summary.clone(),
                 note: made_by(&runall, st, day),
@@ -634,6 +640,19 @@ fn sharpest(root: &Path, output: &str) -> String {
     output.into()
 }
 
+/// For a PDF figure, the picture of the same name beside it (`.svg`, `.png`,
+/// `.jpg`) that a Markdown viewer can show, which cannot show a PDF.
+fn viewable(root: &Path, path: &str) -> Option<String> {
+    let (stem, ext) = path.rsplit_once('.')?;
+    if !ext.eq_ignore_ascii_case("pdf") {
+        return None;
+    }
+    ["svg", "png", "jpg", "jpeg"]
+        .iter()
+        .map(|e| format!("{stem}.{e}"))
+        .find(|p| is_figure(root, p))
+}
+
 /// Whether `output` is a figure the slides can show: an image (or a PDF
 /// figure) inside the project that is there, and that Typst may read (the
 /// person's own file: no link, none others can change).
@@ -817,6 +836,7 @@ fn typst_block(b: &Block) -> String {
             caption,
             note,
             wide,
+            ..
         } => {
             let size = if *wide {
                 "width: 100%, height: 9cm, fit: \"contain\"".to_string()
@@ -923,38 +943,46 @@ fn md_block(b: &Block, day: &str) -> String {
         }
         Block::Image {
             path,
+            view,
             caption,
             note,
             ..
         } => {
             // The report is in results/<day>/report/: three folders down.
             let own = format!("results/{day}/report/");
-            let link = match path.strip_prefix(&own) {
-                Some(name) => name.to_string(),
-                None => format!("../../../{path}"),
+            let to_link = |path: &str| -> String {
+                let link = match path.strip_prefix(&own) {
+                    Some(name) => name.to_string(),
+                    None => format!("../../../{path}"),
+                };
+                // Any character a link could end at, or be read as, escaped.
+                link.chars()
+                    .map(|c| match c {
+                        'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '.' | '_' | '~' | '/' => {
+                            c.to_string()
+                        }
+                        c => c.to_string().bytes().map(|b| format!("%{b:02X}")).collect(),
+                    })
+                    .collect()
             };
-            // Any character a link could end at, or be read as, escaped.
-            let link: String = link
-                .chars()
-                .map(|c| match c {
-                    'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '.' | '_' | '~' | '/' => {
-                        c.to_string()
-                    }
-                    c => c.to_string().bytes().map(|b| format!("%{b:02X}")).collect(),
-                })
-                .collect();
-            // Markdown viewers show images, not PDFs: a PDF is a link.
-            let bang = if link.to_ascii_lowercase().ends_with(".pdf") {
-                ""
-            } else {
-                "!"
+            let link = to_link(path);
+            // Markdown viewers show images, not PDFs: a PDF is shown by the
+            // picture beside it, if there is one, and linked.
+            let pdf = link.to_ascii_lowercase().ends_with(".pdf");
+            let mut s = match view {
+                Some(view) if pdf => format!(
+                    "![{}]({})\n\n_{}_ ([PDF]({link}))\n\n",
+                    one(caption),
+                    to_link(view),
+                    one(caption)
+                ),
+                _ => format!(
+                    "{}[{}]({link})\n\n_{}_\n\n",
+                    if pdf { "" } else { "!" },
+                    one(caption),
+                    one(caption)
+                ),
             };
-            let mut s = format!(
-                "{bang}[{}]({})\n\n_{}_\n\n",
-                one(caption),
-                link,
-                one(caption)
-            );
             if !note.is_empty() {
                 let _ = write!(s, "_{}_\n\n", one(note));
             }
@@ -973,7 +1001,11 @@ fn pdf(root: &Path, source: &str) -> std::result::Result<Vec<u8>, String> {
 
 #[cfg(not(feature = "pdf"))]
 fn pdf(_: &Path, _: &str) -> std::result::Result<Vec<u8>, String> {
-    Err("this legume was built without PDFs (feature `pdf`); report.md has the slides".into())
+    Err(
+        "this legume was built without PDFs: report.md has the slides \
+         (`cargo install legume-mcp --features pdf` makes them a PDF too)"
+            .into(),
+    )
 }
 
 /// Typst, in this program: the slides' source, the fonts Typst ships, and
@@ -1101,6 +1133,7 @@ mod tests {
             md_block(
                 &Block::Image {
                     path: path.into(),
+                    view: None,
                     caption: "qc".into(),
                     note: String::new(),
                     wide: false,
@@ -1115,6 +1148,27 @@ mod tests {
         assert!(image("results/2026-10-27/report/graph.svg")
             .starts_with("![qc](../../../results/2026-10-27/report/graph.svg)"));
         assert!(image("results/a (1).png").starts_with("![qc](../../../results/a%20%281%29.png)"));
+
+        // A PDF figure, in Markdown, by the picture beside it.
+        std::fs::remove_file(root.join("qc.svg")).unwrap();
+        assert_eq!(viewable(root, "qc.pdf").as_deref(), Some("qc.png"));
+        assert_eq!(viewable(root, "qc.png"), None);
+        let shown = md_block(
+            &Block::Image {
+                path: "results/2026-10-28/qc.pdf".into(),
+                view: Some("results/2026-10-28/qc.png".into()),
+                caption: "qc".into(),
+                note: String::new(),
+                wide: true,
+            },
+            "2026-10-28",
+        );
+        assert!(
+            shown.starts_with(
+                "![qc](../../../results/2026-10-28/qc.png)\n\n_qc_ ([PDF](../../../results/2026-10-28/qc.pdf))"
+            ),
+            "{shown}"
+        );
     }
 
     #[test]
