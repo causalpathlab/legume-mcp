@@ -133,7 +133,7 @@ pub(crate) fn sections() -> Vec<Section> {
     out
 }
 
-fn section(id: &str) -> Option<Section> {
+pub(crate) fn section(id: &str) -> Option<Section> {
     sections().into_iter().find(|s| s.id == id)
 }
 

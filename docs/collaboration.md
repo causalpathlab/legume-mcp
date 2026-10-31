@@ -67,9 +67,9 @@ each number measures and asks the person to predict before it shows a result.
  9. Use only the verb the table allows. "Drives" only with genetic,
     perturbation or applied-treatment evidence.
 10. When the person wants a figure or table for the paper: have the tool
-    write it as SVG or PDF (data-beans `plot` with `out` ending .svg;
-    senna or pinto `view_export` with `pdf`), so it stays sharp on slides
-    and in print. Then kind "figure" with "output", their "number" (2B) and
+    write it as SVG or PDF (data-beans `qc` or `statistics` with `figure`
+    ending .svg; senna or pinto `view_export` with `pdf`), so it stays sharp
+    on slides and in print. Then kind "figure" with "output", their "number" (2B) and
     their take-home in "words"; ask which hypothesis it supports.
 11. At the end of the day: ask for their summary (what changed, what argues
     against it, what is next) and record their words, kind "summary". Then
@@ -693,7 +693,7 @@ map.
 | Tool | What it does | Main tools (MCP) |
 |---|---|---|
 | **faba** | Turns aligned reads (BAM) into per-cell matrices: gene counts, depth, RNA editing, m6A, polyadenylation, SNPs. | `count`, `run`, `qc`, `pileup`, `cluster`, `docs` |
-| **data-beans** | Stores single-cell matrices. Imports, inspects, filters (QC), subsets, splits, merges. | `info`, `names`, `statistics`, `values`, `qc`, `plot`, `import`, `subset`, `split`, `merge` |
+| **data-beans** | Stores single-cell matrices. Imports, inspects, filters (QC), subsets, splits, merges. | `info`, `names`, `statistics`, `values`, `qc` (both with a `figure`), `import`, `subset`, `split`, `merge` |
 | **senna** | Embeds cells (topics, layouts, clusters) and shows them on a map. | `run_fit`, `view_open`, `view_map`, `view_markers`, `view_cell`, `view_export` |
 | **pinto** | Fits spatial models and shows them on the tissue. | `run_fit`, `view_open`, `view_map`, `view_markers`, `view_export` |
 | **lupin** | Labels clusters with cell types (decisions with a rationale), places them in the Cell Ontology, tests GO or pathway terms (also gene sets from other sources, as `gmt`), and orders types into trajectories. | `annotate_run`, `annotate_review`, `annotate_genes`, `annotate_preview`, `annotate_relabel`, `trajectory_run`, `trajectory_read` |
@@ -768,7 +768,7 @@ let them steer.
 
 | Stage | Goal | Typical tools | Ends with |
 |---|---|---|---|
-| 1. Survey | What is in the data: cells, genes, samples, conditions, quality, and how much variance lies between donors' genomes. | data-beans `info`, `statistics`, `qc`, `plot`; mung `donors` | An observation with the key numbers. |
+| 1. Survey | What is in the data: cells, genes, samples, conditions, quality, and how much variance lies between donors' genomes. | data-beans `info`, and `statistics` and `qc` with their `figure`; mung `donors` | An observation with the key numbers. |
 | 2. Structure | Main axes of variation, clusters, cell types. | senna `run_fit`, `view_map`; lupin `annotate_*` | The person's labels and what they make of the clusters, in their words. |
 | 3. Contrast | Where conditions differ: composition, programs, effects. | cocoa; lupin; chickpea | What the person makes of the differences, in their words. |
 | 4. Shortlist | Three to five of the person's hypotheses, each as a contrast, with rivals and what would nullify it. | notebook `hypothesis` | Hypotheses H1, H2, ... in the person's words. |
@@ -783,7 +783,7 @@ The result of exploring is **hypotheses**, not findings. Say so.
 |---|---|
 | Records: `runall.sh`, `notebook.md`, `INDEX.tsv`, `data/README.md` | Available |
 | Background jobs (`job_status`, `job_wait`, `job_cancel`), sessions with `attach` | Available |
-| `legume init`: a project connected to Claude Code and Cursor (`.mcp.json`, `.cursor/mcp.json`) and marked (`.legume/`) | New in legume-mcp 0.5.0 |
+| `legume init`: a project connected to the agents (Claude Code, Codex, Cursor, VS Code, Gemini CLI, Antigravity, opencode), their instructions in `AGENTS.md`, and the project marked (`.legume/`) | New in legume-mcp 0.5.0 |
 | The `legume` server (`legume mcp`): `guide`, `status` (with a hypothesis's table, the data on disk and what is open), `report`, `notebook` | New in legume-mcp 0.5.0 |
 | One notebook, the `legume` server's: `plan`, `data`, `observation`, `hypothesis`, `evidence`, `figure`, `summary`, `note`; the person's kinds take their words only | New in legume-mcp 0.5.0 |
 | Hypotheses H1, H2, ... with rivals and what would nullify each (`HYPOTHESES.tsv`); evidence with the person's reason (`EVIDENCE.tsv`); the table, its verb and the sources not yet used (section 8.5) | New in legume-mcp 0.5.0 |

@@ -4,9 +4,11 @@
 //! agent.
 
 const USAGE: &str = "\
-usage: legume init [...]   connect this project to Claude Code and Cursor (legume init --help)
+usage: legume init [...]   connect this project to the agents: Claude Code, Codex, Cursor,
+                           VS Code, Gemini CLI, Antigravity, opencode (legume init --help)
 
-Then start `claude` or `agent` in the project and ask: where are we? The
+Then start the agent in the project (`claude`, `codex`, `agent`, ...) and
+ask: where are we? AGENTS.md tells it how to work with you. The
 agent reaches the rest through the `legume` server, which it starts itself
 (`legume mcp`).";
 

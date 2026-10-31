@@ -14,10 +14,13 @@ implements `Handler` (its tools and how each is called) and hands it to
   it when the client cancels.
 - stdout carries the protocol: tools must log to stderr and run anything that
   prints as a child.
-- Only serde_json, anyhow, base64 and log; no async runtime.
+- Only serde_json, anyhow, base64 and log, and no async runtime, for a tool
+  that takes the library with `default-features = false`. The default
+  feature, `pdf`, typesets `legume report`'s slides with Typst (Rust 1.92).
 
 `cargo install legume-mcp` installs the `legume` command: `legume init`
-connects a project to the agents ([below](#connecting-a-project-legume-init)),
+connects a project to the agents (Claude Code, Codex, Cursor, VS Code,
+Gemini CLI, Antigravity, opencode) ([below](#connecting-a-project-legume-init)),
 and the agents start the [legume server](#the-legume-server) (`legume mcp`).
 The person asks the agent; there is nothing else to type.
 
@@ -104,13 +107,30 @@ sources of evidence until the person stops.
 
 ## Connecting a project: legume init
 
-`legume init`, in a project's folder, lists the `legume` server and each
-legume tool on the PATH that serves MCP (`<tool> mcp`) in the project's own
-MCP settings: `.mcp.json` for Claude Code and `.cursor/mcp.json` for Cursor's
-`agent`. It writes those of the agents on the PATH (both when neither is
-there; `--claude` or `--cursor` to choose); servers already listed there are
-kept, and nothing is installed. The agent started in that folder then has
-them all, after asking once before it runs a project's servers.
+`legume init`, in a project's folder, connects it to the agents. It lists
+the `legume` server and each legume tool on the PATH that serves MCP
+(`<tool> mcp`) in each agent's own MCP settings in the project, and writes
+the instructions they all read:
+
+| Agent | Settings | Instructions |
+|---|---|---|
+| Claude Code (`claude`) | `.mcp.json` | `CLAUDE.md`, which imports `AGENTS.md` |
+| Codex (`codex`) | `.codex/config.toml`, read once you trust the project | `AGENTS.md` |
+| Cursor (`agent`, the editor) | `.cursor/mcp.json` | `AGENTS.md` |
+| VS Code, Copilot Chat in Agent mode | `.vscode/mcp.json` | `AGENTS.md` |
+| Gemini CLI (`gemini`) | `.gemini/settings.json`, with `AGENTS.md` among its context files | `AGENTS.md` |
+| Antigravity (`agy`) | `.agents/mcp_config.json` | `AGENTS.md` |
+| opencode (`opencode`) | `opencode.json` | `AGENTS.md` |
+
+It writes all of them, or only those named (`--claude`, `--codex`,
+`--cursor`, `--vscode`, `--gemini`, `--antigravity`, `--opencode`). Servers
+already listed are kept as they are. The instructions are one section of
+`AGENTS.md` (and of `CLAUDE.md`), between two marked lines: init rewrites
+that section and leaves the rest of the file to you. They are how to work
+with the person and the tools: the rule (the person thinks; the agent runs
+the tools, shows the facts, asks and checks), the guide's quick card, where
+the records are, and what to do when a tool is not connected. Nothing is
+installed.
 
 ```text
 $ legume init
@@ -118,10 +138,19 @@ Project: /Users/me/work/pbmc
 Servers: legume, data-beans, senna, lupin, pinto, cocoa, chickpea, faba
   not included (not on the PATH, or no MCP server): mung
 Wrote .mcp.json for Claude Code
+Wrote .codex/config.toml for Codex
 Wrote .cursor/mcp.json for Cursor
+Wrote .vscode/mcp.json for VS Code
+Wrote .gemini/settings.json for Gemini CLI
+Wrote .agents/mcp_config.json for Antigravity
+Wrote opencode.json for opencode
+Wrote AGENTS.md
+Wrote CLAUDE.md
 
-Start `claude` in this folder: it asks once before it runs the project's servers.
-Start `agent` in this folder: it asks once before it runs the project's servers.
+Claude Code: start `claude` in this folder and approve the project's servers when it asks; /mcp__legume__explore starts the guided work.
+Codex: start `codex` in this folder and trust it when it asks: Codex reads a project's servers only in a project you trust.
+Also ready for Cursor, VS Code, Gemini CLI, Antigravity, opencode (not on this PATH; `legume init --help` says where each looks).
+Then ask it to look at your data: AGENTS.md tells it how to work with you.
 ```
 
 ## The report
