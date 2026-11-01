@@ -10,13 +10,19 @@ usage: legume init [...]   connect this project to the agents: Claude Code, Code
 Then start the agent in the project (`claude`, `codex`, `agent`, ...) and
 ask: where are we? AGENTS.md tells it how to work with you. The
 agent reaches the rest through the `legume` server, which it starts itself
-(`legume mcp`).";
+(`legume mcp`).
+
+legume --version           which legume-mcp this is";
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("mcp") if args.len() == 1 => legume_mcp::brain::serve(),
         Some("init") => legume_mcp::init::main(&args[1..], &mut std::io::stdout()),
+        Some("-V" | "--version" | "version") => {
+            println!("legume-mcp {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
             Ok(())
