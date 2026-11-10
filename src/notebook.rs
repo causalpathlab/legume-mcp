@@ -19,6 +19,19 @@ step that writes is added to results/<today>/runall.sh, which repeats the work \
 without you; results/INDEX.tsv lists each output with a summary, its inputs and \
 its key numbers. ";
 
+/// What every server tells the agent of figures: the box the day's report
+/// sets each in. When to draw for it rather than for print is the guide's
+/// (`docs/collaboration.md`).
+pub(crate) fn figures_note() -> String {
+    let b = crate::report::FIGURE_BOX;
+    format!(
+        "The day's report (the `legume` server's `report`) sets each figure on a 16:9 \
+         slide, in a box {:.1} cm wide and {:.1} cm tall: a figure drawn for that box \
+         fills it with its text at the size it was drawn. ",
+        b.width_cm, b.height_cm
+    )
+}
+
 /// What a tool's server adds: the notebook is the `legume` server's.
 pub(crate) const TOOL_NOTE: &str = "\
 The notebook is the `legume` server's (`legume init` connects it): record there \

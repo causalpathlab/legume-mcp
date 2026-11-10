@@ -309,10 +309,16 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert!(by_id(&msgs, 1)["result"]["instructions"]
-        .as_str()
-        .unwrap()
-        .contains("results/<today>/runall.sh"));
+    let told = by_id(&msgs, 1)["result"]["instructions"].as_str().unwrap();
+    assert!(told.contains("results/<today>/runall.sh"));
+    let b = legume_mcp::FIGURE_BOX;
+    assert!(
+        told.contains(&format!(
+            "{:.1} cm wide and {:.1} cm tall",
+            b.width_cm, b.height_cm
+        )),
+        "the agent is told what the report's slides hold: {told}"
+    );
     let tools = by_id(&msgs, 2)["result"]["tools"].as_array().unwrap();
     assert!(
         !tools.iter().any(|t| t["name"] == "notebook"),

@@ -69,7 +69,9 @@ each number measures and asks the person to predict before it shows a result.
 10. When the person wants a figure or table for the paper: have the tool
     write it as SVG or PDF (data-beans `qc` or `statistics` with `figure`
     ending .svg; senna or pinto `view_export` with `pdf`), so it stays sharp
-    on slides and in print. Then kind "figure" with "output", their "number" (2B) and
+    on slides and in print. Where the tool draws for slides or for paper
+    (lupin's `page`), draw for slides for the day's report, and for paper
+    when the figure is for print. Then kind "figure" with "output", their "number" (2B) and
     their take-home in "words"; ask which hypothesis it supports.
 11. At the end of the day: ask for their summary (what changed, what argues
     against it, what is next) and record their words, kind "summary". Then

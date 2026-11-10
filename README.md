@@ -186,6 +186,17 @@ made. In order:
 10. replay: `bash results/<day>/runall.sh`, the tools' versions and where
     each record is.
 
+Each figure is set in the same box on its slide: the text's width (about
+31 cm) and 9 cm tall (`legume_mcp::FIGURE_BOX`), the caption and the
+command that made it below. A figure drawn for that box fills it with its
+text at the size it was drawn; a figure drawn for a page is shrunk to the
+box's height. So every server tells its agent the box, and the guide asks
+it to draw for slides where a tool offers the choice (lupin's figure tools
+take `page: slide`, and do by default), and for paper when the person wants
+a figure for print. A
+figure's PDF turned onto its page (`/Rotate`, as lupin turns a chart too
+tall for a slide) is set turned, as a viewer shows it.
+
 The agent writes none of it. The trail (section 5) draws a step that
 flagged a number in red, the agent's observations dashed, and a faint line
 where a step read a file another made. Every word from the records goes
