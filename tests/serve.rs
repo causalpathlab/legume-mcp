@@ -492,7 +492,7 @@ fn the_notebook_keeps_the_persons_words_and_numbers_their_hypotheses() {
             ),
             note(
                 5,
-                json!({ "kind": "hypothesis", "hypothesis": "H1", "rivals": ["batch", "a donor"], "nullify": "no ISGs in donors 5-6" }),
+                json!({ "kind": "hypothesis", "hypothesis": "H1", "rivals": ["batch", "a donor"], "nullify": "no response genes in donors 5-6" }),
             ),
             note(
                 6,
@@ -574,7 +574,7 @@ fn the_notebook_keeps_the_persons_words_and_numbers_their_hypotheses() {
     assert!(
         hyps.contains("\tH1\tthe person, notebook ")
             && hyps.ends_with(
-                "\tTopic 7 is an interferon response\tbatch; a donor\tno ISGs in donors 5-6\n"
+                "\tTopic 7 is an interferon response\tbatch; a donor\tno response genes in donors 5-6\n"
             ),
         "{hyps}"
     );
@@ -588,7 +588,7 @@ fn the_notebook_keeps_the_persons_words_and_numbers_their_hypotheses() {
     for part in [
         " · legume · plan\n\n> Why topic 7, rather than topic 2?\n> Not if donors split it.\n",
         " · legume · hypothesis H1\n\n> Topic 7 is an interferon response\n",
-        " · legume · hypothesis H1 (revised)\n\n> Topic 7 is an interferon response\n\nRivals they named: batch; a donor\n\nWould nullify it: no ISGs in donors 5-6\n",
+        " · legume · hypothesis H1 (revised)\n\n> Topic 7 is an interferon response\n\nRivals they named: batch; a donor\n\nWould nullify it: no response genes in donors 5-6\n",
         " · legume · note (user)\n\n> Mine.\n",
         " · legume · data\n\n`data/a.h5`, verdict: caveats\n\n> the core's 10x run\n",
         " · legume · summary\n\n> Topic 7 looks like IFN; one donor only.\n",
@@ -611,7 +611,7 @@ fn evidence_builds_each_hypothesis_triangulation_table() {
             note(1, ev("H1", "s", "our_cells", "agrees", "t")),
             note(
                 2,
-                json!({ "kind": "hypothesis", "words": "IFN drives topic 7", "nullify": "no ISGs in held-out donors" }),
+                json!({ "kind": "hypothesis", "words": "IFN drives topic 7", "nullify": "no response genes in held-out donors" }),
             ),
             note(
                 3,
@@ -627,7 +627,7 @@ fn evidence_builds_each_hypothesis_triangulation_table() {
                     "donors 1-4",
                     "our_cells",
                     "agrees",
-                    "ISG15, MX1 top markers; cocoa 212 genes at FDR < 0.1",
+                    "GENE1, GENE2 top markers; cocoa 212 genes at FDR < 0.1",
                 ),
             ),
             note(
@@ -648,7 +648,7 @@ fn evidence_builds_each_hypothesis_triangulation_table() {
                     "eQTL catalogue",
                     "genetics",
                     "agrees",
-                    "IRF7 eQTL in monocytes",
+                    "GENE3 eQTL in CT1 cells",
                 ),
             ),
             note(
@@ -841,7 +841,7 @@ fn the_notebook_is_the_legume_servers_alone() {
             call(
                 4,
                 "notebook",
-                json!({ "kind": "evidence", "hypothesis": "H1", "source": "donors 1-4", "class": "our_cells", "verdict": "agrees", "text": "ISGs top", "words": "clear in all four" }),
+                json!({ "kind": "evidence", "hypothesis": "H1", "source": "donors 1-4", "class": "our_cells", "verdict": "agrees", "text": "response genes top", "words": "clear in all four" }),
             ),
             call(5, "status", json!({})),
             call(6, "status", json!({ "hypothesis": "H1" })),
@@ -934,7 +934,7 @@ fn the_notebook_is_the_legume_servers_alone() {
     );
     assert!(
         said(&msgs, 6).contains(
-            "| donors 1-4 | our cells | everything | agrees | ISGs top | clear in all four |"
+            "| donors 1-4 | our cells | everything | agrees | response genes top | clear in all four |"
         ),
         "{}",
         said(&msgs, 6)

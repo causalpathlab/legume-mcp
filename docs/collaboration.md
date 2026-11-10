@@ -7,6 +7,9 @@ tools run the steps; the `legume` server (`legume mcp`, from legume-mcp)
 keeps the project's notebook, and serves this paper a section at a time (its
 `guide` tool).
 
+The examples name cell types, genes and files with placeholders (`CT1`,
+`GENE1`, `data/cells.h5`): in a study they are its own.
+
 It is written for two readers:
 
 - **People** who run analyses with an agent and want to know what to expect.
@@ -208,7 +211,7 @@ Two practical rules:
 Examples:
 
 ```json
-{"tool": "notebook", "args": {"kind": "plan", "words": "Why do the treated donors' monocytes differ from the controls'? I'd drop it if donors 5 and 6 don't show it.", "text": "Data: data/pbmc.zarr.zip, 6 donors (3 control, 3 IFN). Check: held-out donors 5 and 6."}}
+{"tool": "notebook", "args": {"kind": "plan", "words": "Why do the treated donors' CT1 cells differ from the controls'? I'd drop it if donors 5 and 6 don't show it.", "text": "Data: data/cells.zarr.zip, 6 donors (3 control, 3 IFN). Check: held-out donors 5 and 6."}}
 
 {"tool": "notebook", "args": {"kind": "observation", "text": "QC kept 9,812 of 11,204 cells (12% dropped). Donor 4 lost 30%, the others 8-11%."}}
 ```
@@ -240,9 +243,9 @@ Example:
 ```json
 {"tool": "notebook", "args": {
   "kind": "hypothesis",
-  "words": "Topic 7 is higher in treated monocytes because of the interferon response",
+  "words": "Topic 7 is higher in treated CT1 cells because of the interferon response",
   "rivals": ["two treated donors carry most of it", "a batch effect"],
-  "nullify": "donors 5 and 6 show no rise in ISG15 or MX1"}}
+  "nullify": "donors 5 and 6 show no rise in GENE1 or GENE2"}}
 ```
 
 A call the tool refuses: `{"kind": "hypothesis", "text": "Topic 7 is clearly
@@ -254,8 +257,8 @@ The other kinds the person writes:
 
 | What | Call |
 |---|---|
-| Where a file came from, and their verdict | `{"kind": "data", "path": "data/pbmc.h5", "words": "the core's 10x run of donors 1-6", "verdict": "caveats"}` |
-| A figure kept for the paper (first have the tool write it as SVG or PDF: a PNG blurs on a slide) | `{"kind": "figure", "output": "results/2026-10-28/umap.svg", "number": "2B", "hypothesis": "H1", "words": "cluster 4 sits apart from the other monocytes"}` |
+| Where a file came from, and their verdict | `{"kind": "data", "path": "data/cells.h5", "words": "the core's 10x run of donors 1-6", "verdict": "caveats"}` |
+| A figure kept for the paper (first have the tool write it as SVG or PDF: a PNG blurs on a slide) | `{"kind": "figure", "output": "results/2026-10-28/umap.svg", "number": "2B", "hypothesis": "H1", "words": "cluster 4 sits apart from the other CT1 cells"}` |
 | The day's summary | `{"kind": "summary", "words": "<what changed, what argues against it, what is next, as they said it>"}` |
 | Anything else they said | `{"kind": "note", "by": "user", "text": "<their words>"}` |
 
@@ -294,15 +297,15 @@ marked **Rule**.
 A result is never explained on its own. We explain why something happens
 here *rather than* there: the **fact** and the **foil**.
 
-- Fact: monocytes of IFN-treated donors express topic 7.
-- Foil: monocytes of control donors do not.
+- Fact: CT1 cells of IFN-treated donors express topic 7.
+- Foil: CT1 cells of control donors do not.
 
 A hypothesis names a **difference** between the two sides that could cause
 the contrast (Lipton's difference condition).
 
 **Rule.** Help the person put each claim as "<fact> rather than <foil>,
 because <difference>". For example: "Topic 7 is higher in treated than in
-control monocytes because of the interferon response." Ask; do not rephrase
+control CT1 cells because of the interferon response." Ask; do not rephrase
 their claim for them.
 
 **Rule.** Choose the foil as close to the fact as you can: the same cell
@@ -395,9 +398,9 @@ published data".
 
 **Rule.** A treatment the experimenter applied (cells stimulated in the dish,
 animals assigned at random) is a perturbation for the treatment's own
-effect: once replicated, "IFN raises GZMB in NK cells" is allowed. In our
+effect: once replicated, "IFN raises GENE4 in CT2 cells" is allowed. In our
 own data the treatment is part of the design, not a source of its own. It is not
-a perturbation for anything downstream: "ISG peaks regulate GZMB" still
+a perturbation for anything downstream: "response-gene peaks regulate GENE4" still
 needs its own source. A treatment people chose or happened to have
 (patients, exposures in a cohort) is an exposure, not a perturbation. If you
 do not know how the treatment was given, ask the person; until they say,
@@ -413,7 +416,7 @@ terms every source has. lupin supplies them.
 - **Cell types as Cell Ontology terms.** lupin places each label in the Cell
   Ontology, and `lupin data suggest-cl` (command line) gives the nearest
   terms for any label, another study's too. Write the contrast with the
-  terms ("CD14-positive monocyte rather than CD16-positive monocyte"), and
+  terms ("CT3 rather than CT4", two subsets of one type), and
   map the other study's labels the same way before comparing.
 - **Programmes as gene sets.** A single gene often does not carry across
   platforms, modalities (peaks linked to genes) or species; a gene set does.
@@ -456,7 +459,7 @@ hypothesis as kind `evidence`, with the analyses and numbers in `text`:
 | `text` | what it shows, with numbers and thresholds |
 
 ```json
-{"tool": "notebook", "args": {"kind": "evidence", "hypothesis": "H1", "source": "our cells, donors 1-4", "class": "our_cells", "verdict": "agrees", "text": "ISG15 and MX1 top markers of topic 7; cocoa: 212 genes at FDR < 0.1, ISGs top"}}
+{"tool": "notebook", "args": {"kind": "evidence", "hypothesis": "H1", "source": "our cells, donors 1-4", "class": "our_cells", "verdict": "agrees", "text": "GENE1 and GENE2 top markers of topic 7; cocoa: 212 genes at FDR < 0.1, response genes top"}}
 
 {"tool": "notebook", "args": {"kind": "evidence", "hypothesis": "H1", "source": "held-out donors 5-6", "class": "other_donors", "verdict": "agrees", "text": "topic 7 higher in both treated donors than in both controls, panel frozen"}}
 ```
@@ -466,11 +469,11 @@ hypothesis's table, one row per source (a source's latest word counts, and
 counts once):
 
 ```text
-**H1. Topic 7 is higher in treated than in control monocytes because of the interferon response**
+**H1. Topic 7 is higher in treated than in control CT1 cells because of the interferon response**
 
 | Source | Kind | Shares with our cells (by kind) | Says | Evidence |
 |---|---|---|---|---|
-| our cells, donors 1-4 | our cells | everything | agrees | ISG15 and MX1 top markers ... |
+| our cells, donors 1-4 | our cells | everything | agrees | GENE1 and GENE2 top markers ... |
 | held-out donors 5-6 | other donors, same study | lab, platform | agrees | topic 7 higher in both ... |
 
 Verb: "is associated with". Standing: replicated: sources that share no cells agree.
@@ -516,8 +519,8 @@ include stopping:
 > corroborate it, or nullify it:
 >
 > 1. Held-out donors 5 and 6: other donors, same lab (minutes; the split is
->    done). You said no rise in ISG15 or MX1 there would make you drop it.
-> 2. The same cells' ATAC: chickpea peak-to-gene links for the ISG genes
+>    done). You said no rise in GENE1 or GENE2 there would make you drop it.
+> 2. The same cells' ATAC: chickpea peak-to-gene links for the response genes
 >    (shares the cells; about an hour).
 > 3. Another study: a published IFN data set (section 9).
 > 4. Perturbation: a published IFN-receptor knockout's genes, as a gene set
@@ -559,7 +562,7 @@ outside data out of later lists for that hypothesis unless they bring it up.
 **How to ask.** Put the purposes as numbers (or a multiple-choice question):
 
 > Shall I look for published data sets to test H1, "Topic 7 is higher in
-> treated than in control monocytes because of the interferon response"?
+> treated than in control CT1 cells because of the interferon response"?
 > Pick any:
 >
 > 1. To confirm it: a similar data set where it should hold.
@@ -598,7 +601,7 @@ This fixes the predictions before the data are seen. Then ask which to use
 ("D1", "D2", or "None of these").
 
 ```json
-{"tool": "notebook", "args": {"kind": "plan", "words": "D1 should show topic 7 higher in treated monocytes in most donors; if not, H1 is in trouble. D2 (LPS) should stay low; if LPS raises it as much, it's general activation, not interferon.", "text": "Outside data for H1.\nD1 <accession, as found>: PBMCs, IFN-beta vs control, 8 donors, 10x 3'. Purpose: confirm. Differences: other chemistry, IFN-beta not IFN-alpha. Access: open, 4 GB.\nD2 <accession, as found>: same cells, untreated, stimulated with LPS. Purpose: disprove. Access: open, 3 GB."}}
+{"tool": "notebook", "args": {"kind": "plan", "words": "D1 should show topic 7 higher in treated CT1 cells in most donors; if not, H1 is in trouble. D2 (LPS) should stay low; if LPS raises it as much, it's general activation, not interferon.", "text": "Outside data for H1.\nD1 <accession, as found>: cells, IFN-beta vs control, 8 donors, 10x 3'. Purpose: confirm. Differences: other chemistry, IFN-beta not IFN-alpha. Access: open, 4 GB.\nD2 <accession, as found>: same cells, untreated, stimulated with LPS. Purpose: disprove. Access: open, 3 GB."}}
 ```
 
 **Bringing it in.**
@@ -812,9 +815,9 @@ it); if it is not, ask the person to run `legume init`.
 ## 15. A short worked example
 
 ```text
-Person:  Explore the IFN-treated PBMCs. I have no specific hypothesis.
+Person:  Explore the IFN-treated cells. I have no specific hypothesis.
 
-Agent:   [status]  The project holds data/pbmc.zarr.zip (6 donors); nobody
+Agent:   [status]  The project holds data/cells.zarr.zip (6 donors); nobody
          has recorded where it came from or whether it is good.
          Where did it come from?
 
@@ -833,15 +836,15 @@ Agent:   [notebook data, verdict "caveats", words "Donor 4 was a bad prep ..."]
          [notebook observation]  Kept 10,412 of 11,204 cells; donor 4 lost 14%.
          Before I cluster: what do you expect to separate the treated cells?
 
-Person:  Monocytes, an interferon program.
+Person:  CT1 cells, an interferon program.
 
-Agent:   [senna fit; view_map]  Topic 7 is high in treated monocytes:
-         ISG15 and MX1 lead it. What do you think it is?
+Agent:   [senna fit; view_map]  Topic 7 is high in treated CT1 cells:
+         GENE1 and GENE2 lead it. What do you think it is?
 
 Person:  The interferon response, I'm fairly sure.
 
 Agent:   [notebook hypothesis, words "Topic 7 is the interferon response in
-          treated monocytes"]  Recorded as H1. What else could explain it?
+          treated CT1 cells"]  Recorded as H1. What else could explain it?
          And what result would make you drop it?
 
 Person:  Could be two donors carrying it. I'd drop it if donors 5 and 6

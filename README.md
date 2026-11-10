@@ -135,7 +135,7 @@ installed.
 
 ```text
 $ legume init
-Project: /Users/me/work/pbmc
+Project: /Users/me/work/project
 Servers: legume, data-beans, senna, lupin, pinto, cocoa, chickpea, faba
   not included (not on the PATH, or no MCP server): mung
 Wrote .mcp.json for Claude Code
