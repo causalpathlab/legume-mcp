@@ -123,14 +123,16 @@ impl ToolSpec {
         self
     }
 
-    /// It writes new files and replaces none, as every legume step does.
+    /// It writes new files and replaces none, as a legume step does unless
+    /// it is [`Step::replacing`] (then [`Self::destructive`]).
     pub fn writes(mut self) -> Self {
         self.annotations.read_only = Some(false);
         self.annotations.destructive = Some(false);
         self
     }
 
-    /// It may remove or stop something (cancel a job, delete a file).
+    /// It may remove, stop or replace something (cancel a job, delete a
+    /// file, rewrite a [`Step::replacing`] step's outputs).
     pub fn destructive(mut self) -> Self {
         self.annotations.read_only = Some(false);
         self.annotations.destructive = Some(true);
@@ -138,7 +140,8 @@ impl ToolSpec {
     }
 
     /// Calling it again with the same arguments does nothing more (a step
-    /// whose outputs exist is not run again).
+    /// whose outputs exist is not run again, unless it is
+    /// [`Step::replacing`]).
     pub fn idempotent(mut self) -> Self {
         self.annotations.idempotent = Some(true);
         self
@@ -319,7 +322,7 @@ impl Call {
         self.run_child(cmd)
     }
 
-    /// [`Self::run`] for a step that writes `outputs`: the driver script
+    /// [`Self::run`] for a step that writes new `outputs`: the driver script
     /// skips it when they all exist, and `results/INDEX.tsv` lists each
     /// with `summary` (one line: what was made, from what). [`Self::run_step`]
     /// with the step's inputs read from `cmd`.
@@ -328,15 +331,19 @@ impl Call {
     }
 
     /// [`Self::run`] for `step`: the driver script skips it when its outputs
-    /// all exist, and `results/INDEX.tsv` lists each with the step's
-    /// summary, inputs and facts (those found once it is done too).
+    /// all exist (runs it every time when it is [`Step::replacing`]), and
+    /// `results/INDEX.tsv` lists each with the step's summary, inputs and
+    /// facts (those found once it is done too).
     pub fn run_step(&self, cmd: Command, mut step: Step) -> Result<String> {
         self.ensure_free(&step.outputs)?;
         step.resolve_inputs(&cmd);
         let bare = self.records.as_ref().map(|p| p.command(&cmd));
-        let result = self
-            .run_child(cmd)
-            .and_then(|out| made(&step.outputs).map(|()| out));
+        let before = stamps(&step);
+        let result = self.run_child(cmd).and_then(|out| {
+            made(&step.outputs)
+                .and_then(|()| rewritten(&before))
+                .map(|()| out)
+        });
         if let Ok(out) = &result {
             step.conclude(out);
         }
@@ -419,6 +426,7 @@ impl Call {
             });
         }
         let bare = self.records.as_ref().map(|p| p.command(&cmd));
+        let before = stamps(&step);
         let (records, feed, steer) = (self.records.clone(), self.feed.clone(), self.steer.clone());
         let tool = self.tool.clone();
         std::thread::Builder::new()
@@ -437,8 +445,12 @@ impl Call {
                         });
                     }
                 };
-                let result = run_child(cmd, &|| job.cancelled() || stopped(), &progress)
-                    .and_then(|out| made(&step.outputs).map(|()| out));
+                let result =
+                    run_child(cmd, &|| job.cancelled() || stopped(), &progress).and_then(|out| {
+                        made(&step.outputs)
+                            .and_then(|()| rewritten(&before))
+                            .map(|()| out)
+                    });
                 if let Ok(out) = &result {
                     step.conclude(out);
                 }
@@ -461,9 +473,10 @@ impl Call {
     }
 }
 
-/// Record `step`, which ran `bare` (when records are kept): its guarded
-/// line in the driver script and its outputs in the index when it
-/// succeeded, a commented line saying why when it did not.
+/// Record `step`, which ran `bare` (when records are kept): its line in the
+/// driver script (guarded, unless it replaces its outputs) and its outputs
+/// in the index when it succeeded, a commented line saying why when it did
+/// not.
 fn record_step(
     records: &Records,
     tool: &str,
@@ -474,7 +487,11 @@ fn record_step(
     let (Some(p), Some(bare)) = (records, bare) else {
         return;
     };
-    let line = p.guarded(&bare, &step.outputs);
+    let line = if step.replaces {
+        p.replacing(&bare, &step.outputs)
+    } else {
+        p.guarded(&bare, &step.outputs)
+    };
     match result {
         Ok(_) => {
             p.script_step(&format!("{line}\n"), Some(&bare));
@@ -502,6 +519,50 @@ fn made(outputs: &[PathBuf]) -> Result<()> {
         missing.join(", ")
     );
     Ok(())
+}
+
+/// Fail a step that replaces its outputs ([`Step::replacing`]) but left a
+/// file that was there `before` it ran as it was.
+fn rewritten(before: &[(PathBuf, Stamp)]) -> Result<()> {
+    let unchanged: Vec<String> = before
+        .iter()
+        .filter(|(o, b)| stamp(o).as_ref() == Some(b))
+        .map(|(o, _)| o.display().to_string())
+        .collect();
+    anyhow::ensure!(
+        unchanged.is_empty(),
+        "finished without rewriting {}",
+        unchanged.join(", ")
+    );
+    Ok(())
+}
+
+/// A file as it is: its size, when it was last written and, on unix,
+/// which file it is. Rewriting it changes one of them.
+#[derive(PartialEq)]
+struct Stamp(u64, Option<std::time::SystemTime>, u64);
+
+/// `path`'s [`Stamp`], when it is a file (a folder's own time does not
+/// change as the files in it are rewritten).
+fn stamp(path: &Path) -> Option<Stamp> {
+    let m = std::fs::metadata(path).ok().filter(|m| m.is_file())?;
+    #[cfg(unix)]
+    let file = std::os::unix::fs::MetadataExt::ino(&m);
+    #[cfg(not(unix))]
+    let file = 0;
+    Some(Stamp(m.len(), m.modified().ok(), file))
+}
+
+/// The files `step` replaces as they are before it runs, for
+/// [`rewritten`]: none for a step that writes new files.
+fn stamps(step: &Step) -> Vec<(PathBuf, Stamp)> {
+    if !step.replaces {
+        return Vec::new();
+    }
+    step.outputs
+        .iter()
+        .filter_map(|o| Some((o.clone(), stamp(o)?)))
+        .collect()
 }
 
 /// What a failed child's stderr is quoted as, [`STDERR_TAIL`] lines at

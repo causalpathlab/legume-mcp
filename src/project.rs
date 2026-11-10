@@ -21,7 +21,8 @@
 //! `runall.sh` holds each tool call as a comment (read-only ones too), each
 //! child a tool ran through [`crate::Call::run`] as its command line (the
 //! server's own binary under the server's name, paths under the project
-//! relative to it, skipped when its outputs exist), and each input a tool
+//! relative to it, skipped when its outputs exist; a
+//! [`crate::Step::replacing`] step runs every time), and each input a tool
 //! wrote through [`crate::Call::write_file`] as a heredoc. Steps that failed
 //! or were cancelled stay as comments. Dates and times are local.
 //!
@@ -280,9 +281,10 @@ impl Project {
             format!(
                 "#!/usr/bin/env bash\n\
                  # {}: the steps agents ran through the legume MCP servers, in order.\n\
-                 # `#` lines are the calls (read-only ones too) and the steps that did not\n\
-                 # succeed. Paths are relative to the project. A step whose outputs exist\n\
-                 # is skipped: delete them to redo it.\n\
+                 # `#` lines are the calls (read-only ones too), the steps that did not\n\
+                 # succeed and the outputs a step replaces. Paths are relative to the\n\
+                 # project. A step whose outputs exist is skipped (delete them to redo\n\
+                 # it), unless it replaces them.\n\
                  set -euo pipefail\n\
                  cd \"$(dirname \"$0\")/../..\"\n",
                 now().0
@@ -357,6 +359,12 @@ impl Project {
         }
     }
 
+    /// `output` as `INDEX.tsv` and a `# replaces` comment name it: relative
+    /// to the project, on one line.
+    pub(crate) fn indexed(&self, output: &Path) -> String {
+        one_line(&self.rel(&output.to_string_lossy()))
+    }
+
     /// `line`, skipped when every one of `outputs` exists and run with
     /// their folders made.
     pub(crate) fn guarded(&self, line: &str, outputs: &[PathBuf]) -> String {
@@ -366,12 +374,27 @@ impl Project {
         let word = |s: &str| quote(&self.rel(s));
         let missing: Vec<String> = outputs
             .iter()
-            .map(|o| format!("[ ! -e {} ]", word(&o.to_string_lossy())))
+            .map(|o| guard_test(&word(&o.to_string_lossy())))
             .collect();
         let dirs = self
             .mkdirs(outputs.iter().map(PathBuf::as_path))
             .map_or(String::new(), |m| format!("{m}\n  "));
         format!("if {}; then\n  {dirs}{line}\nfi", missing.join(" || "))
+    }
+
+    /// `line` for a step that rewrites `outputs` ([`crate::Step::replacing`]):
+    /// run on every replay, their folders made, after a `# replaces` comment
+    /// for each (its name on one line, as `INDEX.tsv` names it: a line break
+    /// would end the comment).
+    pub(crate) fn replacing(&self, line: &str, outputs: &[PathBuf]) -> String {
+        let names: String = outputs
+            .iter()
+            .map(|o| format!("{}\n", replaces_line(&quote(&self.indexed(o)))))
+            .collect();
+        let dirs = self
+            .mkdirs(outputs.iter().map(PathBuf::as_path))
+            .map_or(String::new(), |m| format!("{m}\n"));
+        format!("{names}{dirs}{line}")
     }
 
     /// `mkdir -p` of the folders `paths` go in, project-relative; none when
@@ -383,7 +406,7 @@ impl Project {
             .map(|d| quote(&d))
             .collect();
         dirs.dedup();
-        (!dirs.is_empty()).then(|| format!("mkdir -p {}", dirs.join(" ")))
+        (!dirs.is_empty()).then(|| format!("{MKDIR}{}", dirs.join(" ")))
     }
 
     /// A heredoc that writes `contents` to `path`: as it is when it is plain
@@ -431,15 +454,14 @@ impl Project {
     pub(crate) fn index(&self, tool: &str, step: &crate::Step) {
         let (date, time) = now();
         let summary = one_line(&step.summary);
-        let rel = |p: &Path| one_line(&self.rel(&p.to_string_lossy()));
-        let inputs: Vec<String> = step.input_paths().iter().map(|i| rel(i)).collect();
+        let inputs: Vec<String> = step.input_paths().iter().map(|i| self.indexed(i)).collect();
         let inputs = inputs.join(";");
         let facts = crate::step::facts_cell(&step.facts);
         let rows: String = step
             .outputs
             .iter()
             .map(|o| {
-                let o = rel(o);
+                let o = self.indexed(o);
                 format!(
                     "{date}\t{time}\t{}\t{tool}\t{o}\t{summary}\t{inputs}\t{facts}\n",
                     self.name
@@ -729,6 +751,23 @@ fn trusted(m: &std::fs::Metadata) -> bool {
 }
 
 /// `s` on one line: tabs and line breaks become spaces.
+/// The comment a step that replaces the output named `word` (quoted as the
+/// script writes it) puts before its command.
+pub(crate) fn replaces_line(word: &str) -> String {
+    format!("{REPLACES}{word}")
+}
+
+/// What starts each of a replacing step's comments in `runall.sh`.
+pub(crate) const REPLACES: &str = "# replaces ";
+
+/// The test of a guarded step that its output named `word` is missing.
+pub(crate) fn guard_test(word: &str) -> String {
+    format!("[ ! -e {word} ]")
+}
+
+/// What starts the line that makes a step's folders.
+pub(crate) const MKDIR: &str = "mkdir -p ";
+
 pub(crate) fn one_line(s: &str) -> String {
     s.split(['\t', '\n', '\r'])
         .filter(|w| !w.is_empty())
@@ -822,6 +861,39 @@ mod tests {
         );
         assert_eq!(p.rel("/proj"), ".");
         assert_eq!(p.rel("/project/x"), "/project/x", "only the root itself");
+    }
+
+    #[test]
+    fn a_replacing_step_runs_on_every_replay_with_its_folders_made() {
+        let p = Project::new(PathBuf::from("/proj"), "tool", "0");
+        let outs = [
+            PathBuf::from("/proj/results/d/run.coords.tsv"),
+            PathBuf::from("/proj/results/d/a b.tsv"),
+        ];
+        let line = p.replacing("x --out results/d/run", &outs);
+        assert_eq!(
+            line,
+            "# replaces results/d/run.coords.tsv\n\
+             # replaces 'results/d/a b.tsv'\n\
+             mkdir -p results/d\n\
+             x --out results/d/run"
+        );
+        assert_eq!(
+            p.replacing("x", &[PathBuf::from("/proj/o.tsv")]),
+            "# replaces o.tsv\nx",
+            "no folder to make"
+        );
+        assert_eq!(p.replacing("x", &[]), "x");
+        // A line break in a name does not end the comment early.
+        assert_eq!(
+            p.replacing("x", &[PathBuf::from("/proj/r\ntouch pwned #.tsv")]),
+            "# replaces 'r touch pwned #.tsv'\nx"
+        );
+        // The guarded form is as it was.
+        assert_eq!(
+            p.guarded("x", &outs[..1]),
+            "if [ ! -e results/d/run.coords.tsv ]; then\n  mkdir -p results/d\n  x\nfi"
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ struct Tools {
 impl Handler for Tools {
     fn tools(&self) -> Vec<ToolSpec> {
         [
-            "echo", "fail", "count", "child", "picture", "panic", "write", "make", "peek",
+            "echo", "fail", "count", "child", "picture", "panic", "write", "make", "peek", "redo",
         ]
         .map(|n| ToolSpec::new(n, n, json!({ "type": "object" })))
         .into()
@@ -77,6 +77,19 @@ impl Handler for Tools {
                     });
                 cx.run_step(cmd, step)?;
                 cx.provenance(&out, &format!("copied from {name}"));
+                Ok(vec![])
+            }
+            "redo" => {
+                // A step that rewrites its output, as a layout redone.
+                let (out, from) = (
+                    args["out"].as_str().unwrap(),
+                    args["from"].as_str().unwrap(),
+                );
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", "cp \"$0\" \"$1\"", from, out]);
+                let out = std::path::PathBuf::from(out);
+                let step = Step::new(std::slice::from_ref(&out), "redone from in.tsv").replacing();
+                cx.run_step(cmd, step)?;
                 Ok(vec![])
             }
             _ => panic!("boom"),
@@ -273,6 +286,8 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
     std::fs::create_dir_all(proj.join("data")).unwrap();
     let at = |p: &str| proj.join(p).to_string_lossy().into_owned();
     let made = at("data/made.txt");
+    let redone = at("data/redone.txt");
+    std::fs::write(&redone, "an earlier run").unwrap();
     let input: String = [
         json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
         json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
@@ -285,6 +300,7 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
         call(6, "write", json!({ "path": at("odd.txt"), "text": ODD })),
         call(7, "make", json!({ "out": made, "from": at("in.tsv") })),
         call(8, "child", json!({ "script": "exit 2" })),
+        call(9, "redo", json!({ "out": redone, "from": at("in.tsv") })),
         call(10, "peek", json!({})),
     ]
     .iter()
@@ -350,6 +366,11 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
         script.contains("if [ ! -e data/made.txt ]; then\n  mkdir -p data\n  sh -c "),
         "restartable: {script}"
     );
+    assert!(
+        script.contains("# replaces data/redone.txt\nmkdir -p data\nsh -c ")
+            && !script.contains("[ ! -e data/redone.txt ]"),
+        "a replacing step runs on every replay: {script}"
+    );
     assert!(script.contains("# did not succeed ("), "{script}");
     assert!(
         script.contains(" t 0 peek {}\n") && !script.contains("echo seen"),
@@ -372,6 +393,10 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
              [{\"name\":\"bytes\",\"value\":19,\"rule\":\"cp\",\"flag\":\"more than 10\"}]"
         ),
         "the inputs the command names, and the facts: {index}"
+    );
+    assert!(
+        rows[2].ends_with("\tt\tredo\tdata/redone.txt\tredone from in.tsv\tin.tsv\t"),
+        "a replacing step's output is listed too: {index}"
     );
     // The legume server shows them, the flagged ones apart.
     let sink = Sink::default();
@@ -429,8 +454,14 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
     );
     assert_eq!(std::fs::read_to_string(copy.join("odd.txt")).unwrap(), ODD);
     assert!(!copy.join("pwned").exists(), "nothing past a false end ran");
-    // Run again: the step whose output exists is skipped.
+    assert_eq!(
+        std::fs::read_to_string(copy.join("data/redone.txt")).unwrap(),
+        "a\tb\nLEGUME_MCP_EOF\n"
+    );
+    // Run again: the step whose output exists is skipped; the one that
+    // replaces its output runs.
     std::fs::write(copy.join("data/made.txt"), "kept").unwrap();
+    std::fs::write(copy.join("data/redone.txt"), "kept").unwrap();
     assert!(Command::new("bash")
         .arg(copy.join(rel_day).join("runall.sh"))
         .status()
@@ -439,6 +470,10 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
     assert_eq!(
         std::fs::read_to_string(copy.join("data/made.txt")).unwrap(),
         "kept"
+    );
+    assert_eq!(
+        std::fs::read_to_string(copy.join("data/redone.txt")).unwrap(),
+        "a\tb\nLEGUME_MCP_EOF\n"
     );
     std::fs::remove_dir_all(&base).unwrap();
 }

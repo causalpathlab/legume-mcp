@@ -27,7 +27,10 @@ const STOP_GRACE: Duration = Duration::from_secs(10);
 /// Folders of jobs a server saw end, kept this long.
 const KEEP_SEEN: Duration = Duration::from_secs(24 * 3600);
 
-/// A step to run in a session of the tool's own TUI.
+/// A step to run in a session of the tool's own TUI. It writes new files:
+/// the driver script skips it when its outputs exist. A step that rewrites
+/// its outputs ([`crate::Step::replacing`]) runs through
+/// [`crate::Call::spawn_step`] instead.
 pub struct SessionJob {
     /// The tool whose session it is (`senna`, for `senna attach`).
     pub tool: legume_tui::Tool,

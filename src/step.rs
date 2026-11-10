@@ -128,12 +128,16 @@ type After = Box<dyn FnOnce(&str, &[PathBuf]) -> Vec<Fact> + Send>;
 /// cx.run_step(cmd, step)?;
 /// # Ok(()) }
 /// ```
+///
+/// A step writes new files: the driver script skips it when its outputs
+/// exist. One that rewrites them (a layout redone) is [`Step::replacing`].
 pub struct Step {
     pub(crate) outputs: Vec<PathBuf>,
     pub(crate) summary: String,
     inputs: Option<Vec<PathBuf>>,
     pub(crate) facts: Vec<Fact>,
     after: Option<After>,
+    pub(crate) replaces: bool,
 }
 
 impl Step {
@@ -146,6 +150,7 @@ impl Step {
             inputs: None,
             facts: Vec::new(),
             after: None,
+            replaces: false,
         }
     }
 
@@ -159,6 +164,19 @@ impl Step {
     /// A number known before it runs (the cells it is given, say).
     pub fn fact(mut self, fact: Fact) -> Self {
         self.facts.push(fact);
+        self
+    }
+
+    /// It rewrites outputs that may exist already. The driver script runs
+    /// it on every replay, not only when they are missing; its outputs are
+    /// still listed in `INDEX.tsv`, refused while a job writes them, and
+    /// checked to be there once it is done, each file that was there
+    /// rewritten. Run it through [`crate::Call::run_step`] or
+    /// [`crate::Call::spawn_step`]: a session job's step (`SessionJob`) is
+    /// always recorded as one that writes new files, skipped on replay when
+    /// its outputs exist.
+    pub fn replacing(mut self) -> Self {
+        self.replaces = true;
         self
     }
 

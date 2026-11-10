@@ -370,9 +370,8 @@ pub(crate) fn status(p: &Project) -> String {
             out.push_str(&format!("      {}\n", facts.join("; ")));
         }
     }
-    let flagged: Vec<String> = r
-        .steps
-        .iter()
+    let flagged: Vec<String> = crate::records::current(r.steps.iter())
+        .into_iter()
         .flat_map(|s| {
             s.facts
                 .iter()
@@ -453,5 +452,34 @@ mod tests {
             .instructions
             .unwrap()
             .contains("First, call `status` on the legume server"));
+    }
+
+    #[test]
+    fn a_flag_on_an_output_since_replaced_is_not_raised() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("results")).unwrap();
+        let row = |time: &str, tool: &str, out: &str, facts: &[crate::Fact]| {
+            format!(
+                "2026-10-28\t{time}\ts\t{tool}\tr/{out}\t\t\t{}\n",
+                crate::step::facts_cell(facts)
+            )
+        };
+        let flagged = |name: &str| [crate::Fact::value(name, 1.0).flag("odd")];
+        std::fs::write(
+            root.join("results/INDEX.tsv"),
+            format!(
+                "{}\n{}{}{}",
+                crate::project::INDEX_HEAD,
+                row("10:00:00", "fit", "a.tsv", &flagged("first")),
+                row("10:01:00", "fit", "b.tsv", &flagged("kept")),
+                row("10:02:00", "layout", "a.tsv", &[]),
+            ),
+        )
+        .unwrap();
+        let s = status(&Project::new(root.to_path_buf(), "legume", "0"));
+        let (_, raised) = s.split_once("Flagged by the tools").unwrap();
+        assert!(raised.contains("r/b.tsv (s fit): kept"), "{s}");
+        assert!(!raised.contains("r/a.tsv (s fit)"), "{s}");
     }
 }

@@ -17,10 +17,10 @@ It is written for two readers:
   agent follows. They are plain steps on purpose. If you are an agent, read
   them fully before you call a tool.
 
-Some features are new in legume-mcp 0.5.0 or still planned; section 14 lists
-what is available now. For how to call a tool's own functions (its
-arguments, what `out` does), follow that tool's instructions. For the
-notebook, follow this paper.
+Some features are new in legume-mcp 0.5.0 or later, or still planned;
+section 14 lists what is available now. For how to call a tool's own
+functions (its arguments, what `out` does), follow that tool's
+instructions. For the notebook, follow this paper.
 
 **One notebook.** The `legume` server's `notebook` is the project's only
 one: the tools' servers have none. It writes `results/<day>/notebook.md`.
@@ -144,6 +144,9 @@ What each record is for:
 
 - **`runall.sh`** repeats the work without the agent:
   `bash results/<day>/runall.sh`. Steps that failed stay in it as comments.
+  A step whose outputs exist is skipped (delete them to redo it), unless it
+  rewrites them (a layout redone, under a `# replaces` comment): that one
+  runs every time.
 - **`notebook.md`** is the story of the day. The agent's entries say what was
   done and seen; everything else is the person's words, quoted.
 - **`INDEX.tsv`** says which file came from which tool, with a one-line
@@ -798,6 +801,7 @@ The result of exploring is **hypotheses**, not findings. Say so.
 | Recipes as MCP prompts on the `legume` server: `explore`, `triangulate` | New in legume-mcp 0.5.0 |
 | `next` hints in results ("Next, if the person agrees"); tool annotations (read-only, writes, destructive) | New in legume-mcp 0.5.0; the job tools give them, each tool adds its own |
 | Testing on outside data (section 9): `plan` and data-beans `import` | Available with 0.5.0 |
+| Steps that rewrite their outputs (`Step::replacing`): run on every replay, still in `INDEX.tsv`, in the background too | New in legume-mcp 0.5.2 |
 | lupin `decided_by` on labelling decisions | Available |
 | lupin: Cell Ontology placement, `suggest-cl` (command line), term tests on GO, GAF or GMT gene sets (section 8.4) | Available |
 | `legume paper`: a manuscript draft from the kept figures and the person's text | Planned |

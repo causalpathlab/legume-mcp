@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use legume_mcp::watch::{self, Body, From};
-use legume_mcp::{serve_with, Call, Content, Handler, Options, ServerInfo, ToolSpec};
+use legume_mcp::{serve_with, Call, Content, Handler, Options, ServerInfo, Step, ToolSpec};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Lines, PipeReader, Write};
 use std::path::PathBuf;
@@ -31,14 +31,19 @@ impl Handler for Tools {
         let touch = if args["write"] == false {
             String::new()
         } else {
-            format!("touch '{}';", out.display())
+            format!("printf new > '{}';", out.display())
         };
         let script = format!(
             "echo fitting >&2; sleep {}; {touch} printf fitted",
             args["seconds"]
         );
         cmd.args(["-c", &script]);
-        let id = cx.spawn_job(cmd, std::slice::from_ref(&out), "a model fit")?;
+        let mut step = Step::new(std::slice::from_ref(&out), "a model fit");
+        // `replace: true` rewrites an output that may exist.
+        if args["replace"] == true {
+            step = step.replacing();
+        }
+        let id = cx.spawn_step(cmd, step)?;
         Ok(vec![Content::Json(json!({ "job": id }))])
     }
 }
@@ -208,6 +213,74 @@ fn a_long_step_runs_as_a_job_and_is_recorded_when_it_ends() {
     let index = std::fs::read_to_string(project.join("results/INDEX.tsv")).unwrap();
     assert!(!index.contains("never"), "{index}");
     assert!(!project.join("a").exists() && !project.join("b").exists());
+
+    // A step that replaces its output runs in the background too: it holds
+    // the output while it runs, rewrites it, and is recorded unguarded.
+    let coords = project.join("coords.tsv");
+    std::fs::write(&coords, "old").unwrap();
+    let slow = structured(&c.call(
+        "fit",
+        json!({ "out": coords, "seconds": 30, "replace": true }),
+    ))["job"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for replace in [true, false] {
+        let refused = c.call(
+            "fit",
+            json!({ "out": coords, "seconds": 0, "replace": replace }),
+        );
+        assert_eq!(refused["isError"], true, "{refused}");
+        let why = refused["content"][0]["text"].as_str().unwrap();
+        assert!(
+            why.contains(&format!("is being written by {slow}")),
+            "{why}"
+        );
+    }
+    c.call("job_cancel", json!({ "id": slow }));
+    c.call("job_wait", json!({ "id": slow, "seconds": 10 }));
+    let redo = structured(&c.call(
+        "fit",
+        json!({ "out": coords, "seconds": 0, "replace": true }),
+    ))["job"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let w = c.call("job_wait", json!({ "id": redo, "seconds": 10 }));
+    assert_eq!(structured(&w)["state"], "done", "{w}");
+    assert_eq!(std::fs::read_to_string(&coords).unwrap(), "new");
+    let script = std::fs::read_to_string(day.join("runall.sh")).unwrap();
+    assert!(
+        script.contains("# replaces coords.tsv\nsh -c ") && !script.contains("[ ! -e coords.tsv ]"),
+        "{script}"
+    );
+    let index = std::fs::read_to_string(project.join("results/INDEX.tsv")).unwrap();
+    assert!(
+        index.contains("\tt\tfit\tcoords.tsv\ta model fit"),
+        "{index}"
+    );
+    // One that exits well without its output failed, as any step.
+    let gone = project.join("gone.tsv");
+    let quiet = structured(&c.call(
+        "fit",
+        json!({ "out": gone, "seconds": 0, "write": false, "replace": true }),
+    ))["job"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let w = c.call("job_wait", json!({ "id": quiet, "seconds": 10 }));
+    assert_eq!(structured(&w)["state"], "failed", "{w}");
+    // So did one that left the output it replaces as it was.
+    let stale = structured(&c.call(
+        "fit",
+        json!({ "out": coords, "seconds": 0, "write": false, "replace": true }),
+    ))["job"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let w = c.call("job_wait", json!({ "id": stale, "seconds": 10 }));
+    assert_eq!(structured(&w)["state"], "failed", "{w}");
+    assert!(w.to_string().contains("without rewriting"), "{w}");
 
     // A person following sees each job as a call of its own.
     drop(c);
