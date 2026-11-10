@@ -206,8 +206,9 @@ record, however written, is read as markup or code.
 ## Hints for the agent and the client
 
 - **Annotations.** `ToolSpec::new(..).read_only()` for a tool that changes
-  nothing, `.writes()` for one that writes new files and replaces none (every
-  legume step), `.destructive()` for one that removes or stops something;
+  nothing, `.writes()` for one that writes new files and replaces none (a
+  legume step, unless `Step::replacing`), `.destructive()` for one that
+  removes, stops or replaces something;
   `.idempotent()`, `.open_world()` and `.titled(..)` too. They go to
   `tools/list` as MCP's `annotations`, which clients use to decide what to
   ask the person first. A tool without them sends none. The built-in tools
@@ -245,6 +246,15 @@ cx.run_step(cmd, step)?;                           // or cx.spawn_step(cmd, step
 - `after` finds the numbers known once the step is done; it runs only when
   the step succeeded. A session job's TUI gives them as it ends:
   `Reporter::finish_with(end, facts)`.
+- A step writes new files: replayed, it is skipped when its outputs exist.
+  One that rewrites outputs that may exist (a layout redone) says so with
+  `.replacing()`: the driver script runs it every time, after a
+  `# replaces <output>` comment for each and their folders' `mkdir -p`. Its outputs
+  are still listed in `INDEX.tsv`, refused while a job writes them, and
+  checked to be there once it is done, each file that was there rewritten;
+  it runs through `run_step` and `spawn_step` alike (a session job is
+  always recorded as a step that writes new files). Give its tool
+  `.destructive()`.
 - A fact is a count or a value, out of how many (`of`), by which `rule`, and
   a `flag` when it looks wrong. The `legume` server's `status` shows each
   output's facts and lists the flagged ones apart, for the agent to raise
@@ -374,8 +384,9 @@ can be found again, redone without the agent, and written up:
 - `runall.sh` holds each tool call as a comment, each `Call::run` /
   `Call::run_making` child as its command line (the server's binary under its
   name, project paths relative, skipped when its outputs exist, their folders
-  made first), and each `Call::write_file` input as a heredoc (base64 when it
-  holds control bytes). Steps that did not succeed stay as comments. A copy of
+  made first; a `Step::replacing` step runs every time, after a
+  `# replaces` comment for each output), and each `Call::write_file` input
+  as a heredoc (base64 when it holds control bytes). Steps that did not succeed stay as comments. A copy of
   the project replays it: `bash results/<day>/runall.sh`.
 - Environment values whose names look secret (`*TOKEN*`, `*KEY*`, …) are not
   written down; the script asks for them at replay. The script is owner-only.

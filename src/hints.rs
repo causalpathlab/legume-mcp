@@ -15,8 +15,9 @@ pub struct Annotations {
     pub title: Option<String>,
     /// It changes nothing.
     pub read_only: Option<bool>,
-    /// It may remove or replace something (it is never set for a tool that
-    /// only writes new files, as the legume tools do).
+    /// It may remove or replace something: set for a tool whose step
+    /// rewrites its outputs ([`crate::Step::replacing`]), never for one that
+    /// only writes new files, as most legume tools do.
     pub destructive: Option<bool>,
     /// Calling it again with the same arguments does nothing more.
     pub idempotent: Option<bool>,

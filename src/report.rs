@@ -21,8 +21,8 @@
 
 use crate::evidence;
 use crate::graph::Graph;
-use crate::project::read_record;
-use crate::records::{Entry, Records, Step};
+use crate::project::{guard_test, read_record, replaces_line, MKDIR, REPLACES};
+use crate::records::{current, Entry, Records, Step};
 use anyhow::{Context, Result};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -232,6 +232,8 @@ fn slides(
 ) -> Vec<Slide> {
     let dir = root.join("results").join(day);
     let notebook = format!("results/{day}/notebook.md");
+    // The row that says what each output is now.
+    let now = current(steps.iter().copied());
     let entries = |keep: &dyn Fn(&str) -> bool| -> Vec<&Entry> {
         records.notebook.iter().filter(|e| keep(&e.kind)).collect()
     };
@@ -399,7 +401,7 @@ fn slides(
             ],
             rows,
         ));
-        let flagged: Vec<String> = steps
+        let flagged: Vec<String> = now
             .iter()
             .flat_map(|st| {
                 st.facts
@@ -423,7 +425,7 @@ fn slides(
     // The figures the person kept, then the day's other images.
     let runall = read_record(&dir.join("runall.sh"));
     let made = |output: &str| -> String {
-        match steps.iter().find(|st| st.output == output) {
+        match now.iter().find(|st| st.output == output) {
             Some(st) => made_by(&runall, st, day),
             None => String::new(),
         }
@@ -462,7 +464,8 @@ fn slides(
             blocks,
         });
     }
-    for st in steps.iter().filter(|st| is_figure(root, &st.output)) {
+    // Each as the step that made it last says.
+    for st in now.iter().filter(|st| is_figure(root, &st.output)) {
         let path = sharpest(root, &st.output);
         if shown.contains(&path) {
             continue;
@@ -695,18 +698,26 @@ fn file_name(path: &str) -> &str {
 }
 
 /// Where in `runall.sh` the step that made `st.output` is: its line and
-/// command.
+/// command. That is the last step that replaced it, else the first that
+/// made it (a later guarded one is skipped).
 fn made_by(runall: &str, st: &Step, day: &str) -> String {
     let lines: Vec<&str> = runall.lines().collect();
-    let guard = lines
-        .iter()
-        .position(|l| l.starts_with("if [ ! -e ") && l.contains(st.output.as_str()));
-    if let Some(i) = guard {
+    // The output's name, as the script writes it.
+    let name = crate::project::quote(&st.output);
+    let (replaced, guard) = (replaces_line(&name), guard_test(&name));
+    let step = lines.iter().rposition(|l| *l == replaced).or_else(|| {
+        lines
+            .iter()
+            .position(|l| l.starts_with("if ") && l.contains(&guard))
+    });
+    if let Some(i) = step {
+        // Past its other outputs' comments and its folders' `mkdir -p`, its
+        // command.
         let command = lines[i + 1..]
             .iter()
             .map(|l| l.trim())
             .take_while(|l| *l != "fi")
-            .find(|l| !l.starts_with("mkdir -p "));
+            .find(|l| !l.starts_with(REPLACES) && !l.starts_with(MKDIR));
         if let Some(c) = command {
             return format!(
                 "results/{day}/runall.sh, line {}: {}",
@@ -1399,6 +1410,124 @@ mod tests {
         assert!(
             e.to_string().contains("is an output of senna view_export"),
             "{e}"
+        );
+    }
+
+    #[test]
+    fn an_output_is_made_by_the_last_step_that_replaced_it() {
+        let st = |output: &str| Step {
+            date: "d".into(),
+            time: "10:00:00".into(),
+            server: "senna".into(),
+            tool: "layout".into(),
+            output: output.into(),
+            summary: String::new(),
+            inputs: Vec::new(),
+            facts: Vec::new(),
+        };
+        let runall = "#!/usr/bin/env bash\n\
+                      if [ ! -e results/d/run.coords.tsv ]; then\n  mkdir -p results/d\n  senna fit\nfi\n\
+                      # replaces results/d/run.coords.tsv\nmkdir -p results/d\nsenna layout --first\n\
+                      # replaces results/d/run.coords.tsv\nsenna layout --again\n\
+                      # replaces results/d/other.tsv\nsenna layout --other\n";
+        assert_eq!(
+            made_by(runall, &st("results/d/run.coords.tsv"), "d"),
+            "results/d/runall.sh, line 9: senna layout --again"
+        );
+        // Made once, by a guarded step.
+        let guarded =
+            "x\nif [ ! -e results/d/a.tsv ]; then\n  mkdir -p results/d\n  senna fit\nfi\n";
+        assert_eq!(
+            made_by(guarded, &st("results/d/a.tsv"), "d"),
+            "results/d/runall.sh, line 2: senna fit"
+        );
+        // A name is matched whole: a longer name that starts with it is
+        // another output.
+        let longer = "if [ ! -e results/d/m.png.tsv ]; then\n  senna fit\nfi\n\
+                      if [ ! -e results/d/m.png ]; then\n  senna view export\nfi\n\
+                      # replaces results/d/m.png.tsv\nsenna layout\n\
+                      # replaces 'results/d/a b.png'\nsenna layout --spaced\n\
+                      # replaces results/d/b\n# replaces 'results/d/a b c'\nmkdir -p results/d\nsenna layout --two\n\
+                      # replaces 'results/d/x results/d/y z'\nsenna layout --odd\n";
+        assert_eq!(
+            made_by(longer, &st("results/d/m.png"), "d"),
+            "results/d/runall.sh, line 4: senna view export"
+        );
+        assert_eq!(
+            made_by(longer, &st("results/d/a b.png"), "d"),
+            "results/d/runall.sh, line 9: senna layout --spaced"
+        );
+        // A step replacing two outputs is found from either, and a name is
+        // never matched inside another's quotes.
+        for (out, line) in [("results/d/b", 11), ("results/d/a b c", 12)] {
+            assert_eq!(
+                made_by(longer, &st(out), "d"),
+                format!("results/d/runall.sh, line {line}: senna layout --two")
+            );
+        }
+        for unmade in ["results/d/a", "results/d/y"] {
+            assert!(made_by(longer, &st(unmade), "d").starts_with("Made by "));
+        }
+    }
+
+    #[test]
+    fn an_output_replaced_shows_its_latest_step_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let day = crate::project::now().0;
+        let d = root.join("results").join(&day);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("map.png"), "x").unwrap();
+        let row = |time: &str, tool: &str, out: &str, summary: &str, facts: &[Fact]| {
+            format!(
+                "{day}\t{time}\tsenna\t{tool}\tresults/{day}/{out}\t{summary}\t\t{}\n",
+                crate::step::facts_cell(facts)
+            )
+        };
+        std::fs::write(
+            root.join("results/INDEX.tsv"),
+            format!(
+                "{}\n{}{}{}",
+                crate::project::INDEX_HEAD,
+                row(
+                    "10:00:00",
+                    "export",
+                    "map.png",
+                    "the first map",
+                    &[Fact::value("spread", 0.01).flag("collapsed")]
+                ),
+                row(
+                    "10:01:00",
+                    "fit",
+                    "other.tsv",
+                    "another",
+                    &[Fact::value("loss", 9.0).flag("high")]
+                ),
+                row("10:02:00", "layout", "map.png", "the map redone", &[]),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("runall.sh"),
+            format!(
+                "#!/usr/bin/env bash\n\
+                 if [ ! -e results/{day}/map.png ]; then\n  senna export\nfi\n\
+                 # replaces results/{day}/map.png\nsenna layout\n"
+            ),
+        )
+        .unwrap();
+        let built = build(root, Some(&day)).unwrap();
+        let md = std::fs::read_to_string(&built.md).unwrap();
+        assert!(
+            md.contains(&format!(
+                "_the map redone_\n\n_results/{day}/runall.sh, line 5: senna layout_"
+            )),
+            "the caption and the note of one step: {md}"
+        );
+        assert!(!md.contains("_the first map_"), "{md}");
+        assert!(
+            md.contains("other.tsv (senna fit): loss") && !md.contains("(senna export): spread"),
+            "only the flags of the files as they are now: {md}"
         );
     }
 }

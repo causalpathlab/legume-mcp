@@ -90,6 +90,16 @@ pub(crate) fn steps(root: &Path) -> Vec<Step> {
     steps
 }
 
+/// The rows of `steps` (oldest first) that say what each output is now:
+/// a later row for the same output (a step that replaced it) supersedes
+/// the earlier ones. In their order.
+pub(crate) fn current<'a>(steps: impl DoubleEndedIterator<Item = &'a Step>) -> Vec<&'a Step> {
+    let mut seen = std::collections::HashSet::new();
+    let mut rows: Vec<&Step> = steps.rev().filter(|s| seen.insert(&s.output)).collect();
+    rows.reverse();
+    rows
+}
+
 /// `time` (HH:MM:SS) in the order of the working day, which turns over at
 /// 5 a.m. (`project::DAY_TURNS`): the small hours after the evening.
 pub(crate) fn in_day(time: &str) -> (bool, &str) {
