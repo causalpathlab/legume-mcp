@@ -1290,12 +1290,12 @@ mod tests {
     #[test]
     fn the_slides_come_from_the_records_and_the_persons_words() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("pbmc");
+        let root = dir.path().join("project");
         let day = crate::project::now().0;
         let d = root.join("results").join(&day);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::create_dir_all(root.join("data")).unwrap();
-        std::fs::write(root.join("data/pbmc.h5"), "x").unwrap();
+        std::fs::write(root.join("data/cells.h5"), "x").unwrap();
         // A real PNG, 1x1, for the PDF to embed.
         std::fs::write(
             d.join("umap.png"),
@@ -1310,7 +1310,7 @@ mod tests {
             root.join("results/INDEX.tsv"),
             format!(
                 "{}\n\
-                 {day}\t10:00:00\tdata-beans\tqc\tresults/{day}/qc.zarr.zip\tkept cells\tdata/pbmc.h5\t{}\n\
+                 {day}\t10:00:00\tdata-beans\tqc\tresults/{day}/qc.zarr.zip\tkept cells\tdata/cells.h5\t{}\n\
                  {day}\t10:05:00\tsenna\tview_export\tresults/{day}/umap.png\tthe map by cluster\tresults/{day}/qc.zarr.zip\t[]\n\
                  2026-10-27\t09:00:00\tsenna\tfit\tresults/2026-10-27/old.json\told\t\t[]\n",
                 crate::project::INDEX_HEAD,
@@ -1338,10 +1338,10 @@ mod tests {
             json!({ "kind": "plan", "words": "Why is cluster 4 apart, rather than with 2? #set page(width: 1cm)" }),
         );
         note(
-            json!({ "kind": "data", "path": "data/pbmc.h5", "words": "10x PBMC, from 10x Genomics", "verdict": "caveats" }),
+            json!({ "kind": "data", "path": "data/cells.h5", "words": "a public 10x run", "verdict": "caveats" }),
         );
         note(
-            json!({ "kind": "hypothesis", "words": "Cluster 4 is stressed *monocytes*", "rivals": ["damaged cells"] }),
+            json!({ "kind": "hypothesis", "words": "Cluster 4 is stressed *CT1 cells*", "rivals": ["damaged cells"] }),
         );
         note(
             json!({ "kind": "figure", "output": format!("results/{day}/umap.png"), "number": "2B", "hypothesis": "H1", "words": "cluster 4 sits apart" }),
@@ -1355,12 +1355,12 @@ mod tests {
             "## The day, in the person's words",
             "> We asked why cluster 4 stands apart.",
             "> Why is cluster 4 apart, rather than with 2? \\#set page(width: 1cm)",
-            "| data/pbmc.h5 | 10x PBMC, from 10x Genomics | **caveats** |",
+            "| data/cells.h5 | a public 10x run | **caveats** |",
             "(flagged: above 0.2)**",
             "## Figure 2B",
             "](../../../results/",
             "## Hypothesis H1",
-            "> Cluster 4 is stressed \\*monocytes\\*",
+            "> Cluster 4 is stressed \\*CT1 cells\\*",
             "**Rivals:** damaged cells",
             "**Would nullify it:** not said yet",
             "runall.sh, line 4: senna view export",
@@ -1375,7 +1375,7 @@ mod tests {
         );
         let source = typst(
             &slides(&root, &day, &Records::read(&root, &day), &[], None),
-            "pbmc",
+            "project",
             &day,
         );
         assert!(source

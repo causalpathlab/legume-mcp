@@ -413,7 +413,7 @@ mod tests {
         for i in 0..7 {
             std::fs::write(root.join(format!("data/s{i}.h5")), "x").unwrap();
         }
-        std::fs::write(root.join("raw/pbmc.h5"), "12").unwrap();
+        std::fs::write(root.join("raw/cells.h5"), "12").unwrap();
         let p = Project::new(root.to_path_buf(), "legume", "0");
         let row =
             |path: &str, verdict: &str, why: &str| vec![path.into(), verdict.into(), why.into()];
@@ -422,7 +422,7 @@ mod tests {
             &[
                 row("./data/run1/", "good", "10x run 1, core facility"),
                 row("data/run1", "", "10x run 1, donors 1-6 only"),
-                row("raw/pbmc.h5", "caveats", "a public set"),
+                row("raw/cells.h5", "caveats", "a public set"),
                 row("raw/gone.h5", "bad", "deleted since"),
             ],
         );
@@ -434,7 +434,7 @@ mod tests {
             ("10x run 1, donors 1-6 only", "good")
         );
         assert_eq!(
-            of("raw/pbmc.h5").verdict,
+            of("raw/cells.h5").verdict,
             "caveats",
             "outside data/, while it is there"
         );

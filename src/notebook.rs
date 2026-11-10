@@ -457,7 +457,7 @@ mod tests {
         let (_dir, p) = project();
         let (label, told) = record(
             &p,
-            json!({ "kind": "hypothesis", "words": "Cluster 4 is stressed monocytes" }),
+            json!({ "kind": "hypothesis", "words": "Cluster 4 is stressed CT1 cells" }),
         )
         .unwrap();
         assert_eq!(label, "hypothesis H1");
@@ -475,7 +475,7 @@ mod tests {
         assert_eq!(told.unwrap(), "Recorded as H1.");
         let h = evidence::hypotheses(&p.read_ledger(evidence::HYPOTHESES));
         assert_eq!(h.len(), 1);
-        assert_eq!(h[0].claim, "Cluster 4 is stressed monocytes");
+        assert_eq!(h[0].claim, "Cluster 4 is stressed CT1 cells");
         assert_eq!(h[0].rivals, "damaged cells; a sample artefact");
         let (label, _) = record(
             &p,
@@ -522,7 +522,7 @@ mod tests {
         assert!(e.to_string().contains("not inside the project"), "{e}");
         let (_, told) = record(
             &p,
-            json!({ "kind": "data", "path": "data/a.h5", "words": "10x PBMC from the core" }),
+            json!({ "kind": "data", "path": "data/a.h5", "words": "10x run from the core" }),
         )
         .unwrap();
         assert!(told.unwrap().contains("ask whether it is good"));
@@ -533,7 +533,7 @@ mod tests {
         .unwrap();
         let readme = std::fs::read_to_string(dir.path().join("data/README.md")).unwrap();
         assert!(
-            readme.contains("`data/a.h5`: 10x PBMC from the core"),
+            readme.contains("`data/a.h5`: 10x run from the core"),
             "{readme}"
         );
         let (label, told) = record(
