@@ -27,6 +27,28 @@ use anyhow::{Context, Result};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+/// A 16:9 slide's width and its side margins, in cm (Typst's
+/// `presentation-16-9` paper and [`PREAMBLE`]'s margins).
+const SLIDE_WIDTH_CM: f64 = 33.867;
+const MARGIN_X_CM: f64 = 1.4;
+
+/// The box a figure is set in on its slide, in cm across and down: the
+/// text's width, and the height that leaves room for the title bar above
+/// and the caption and the command that made it below. A figure drawn for
+/// this box (lupin's `page: slide`) fills it with its text at the size it
+/// was drawn; a taller one is shrunk to the box's height.
+pub const FIGURE_BOX: FigureBox = FigureBox {
+    width_cm: SLIDE_WIDTH_CM - 2.0 * MARGIN_X_CM,
+    height_cm: 9.0,
+};
+
+/// A box on a slide, in cm.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FigureBox {
+    pub width_cm: f64,
+    pub height_cm: f64,
+}
+
 /// The room for the graph on its slide, in cm: width, height.
 const GRAPH_ROOM: (f64, f64) = (26.0, 10.0);
 
@@ -839,7 +861,10 @@ fn typst_block(b: &Block) -> String {
             ..
         } => {
             let size = if *wide {
-                "width: 100%, height: 9cm, fit: \"contain\"".to_string()
+                format!(
+                    "width: 100%, height: {}cm, fit: \"contain\"",
+                    FIGURE_BOX.height_cm
+                )
             } else {
                 format!("height: {}cm", GRAPH_ROOM.1)
             };
@@ -1101,6 +1126,34 @@ mod tests {
     use crate::project::Project;
     use crate::Fact;
     use serde_json::json;
+
+    #[test]
+    fn a_figure_is_set_in_the_box_the_tools_are_told_of() {
+        let FigureBox {
+            width_cm: w,
+            height_cm: h,
+        } = FIGURE_BOX;
+        let image = Block::Image {
+            path: "results/2026-10-28/x.png".into(),
+            view: None,
+            caption: "c".into(),
+            note: String::new(),
+            wide: true,
+        };
+        let set = typst_block(&image);
+        assert!(
+            set.contains(&format!("width: 100%, height: {h}cm")),
+            "{set}"
+        );
+        assert!(
+            PREAMBLE.contains(&format!("margin: (x: {MARGIN_X_CM}cm")),
+            "the box's width is the text's"
+        );
+        assert!(
+            PREAMBLE.contains("paper: \"presentation-16-9\""),
+            "the slide is {SLIDE_WIDTH_CM} cm wide, the box {w} cm"
+        );
+    }
 
     #[test]
     fn record_text_is_a_string_never_markup_or_code() {

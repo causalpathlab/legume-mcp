@@ -55,6 +55,7 @@ mod jobs;
 mod notebook;
 mod records;
 mod report;
+pub use report::{FigureBox, FIGURE_BOX};
 #[cfg(all(feature = "sessions", unix))]
 mod session;
 #[cfg(not(all(feature = "sessions", unix)))]
@@ -927,7 +928,9 @@ where
         } else {
             notebook::TOOL_NOTE
         };
-        let note = notebook::RECORDS_NOTE.replace("{root}", &p.root().display().to_string()) + rest;
+        let note = notebook::RECORDS_NOTE.replace("{root}", &p.root().display().to_string())
+            + &notebook::figures_note()
+            + rest;
         info.instructions = Some(match info.instructions.take() {
             Some(text) => format!("{text}\n\n{note}"),
             None => note,
