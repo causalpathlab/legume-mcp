@@ -271,6 +271,35 @@ fn same_bytes_same_key() {
     }
 }
 
+// A cell is done when its folder's done.json has its key: one of a stale
+// key, or unreadable, is not.
+#[test]
+fn done_counts_only_cells_of_their_key() {
+    let p = Project::new();
+    p.tool("TOOL1", "true");
+    p.tool("TOOL2", "true");
+    let spec = p.spec("S1.json", TWO);
+    ok(&p.legume(&["plan", spec.to_str().unwrap()]));
+    let plan = p.plan("N1");
+    let cells = plan["cells"].as_array().unwrap();
+    for (c, done) in cells.iter().zip([
+        format!("{{\"key\": {}}}", cells[0]["key"]),
+        "{\"key\": \"0\"}".to_string(),
+        "{\"key\"".to_string(),
+    ]) {
+        let dir = Path::new(c["dir"].as_str().unwrap());
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("done.json"), done).unwrap();
+    }
+    let o = p.legume(&["plan", spec.to_str().unwrap()]);
+    ok(&o);
+    assert!(
+        stdout(&o).contains("done 1 of 8 (by key)\n"),
+        "{}",
+        stdout(&o)
+    );
+}
+
 // The spec's key is its canonical content: another key order, spacing
 // and file name plan the same spec file and keys.
 #[test]

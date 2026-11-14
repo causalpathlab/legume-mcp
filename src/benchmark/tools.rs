@@ -397,4 +397,83 @@ mod tests {
             "#!/bin/sh\necho v1\n"
         );
     }
+
+    // A changed tool keeps only a snapshot that is still a file in the
+    // benchmark's folder: one deleted, or one versions.tsv names outside
+    // it, gives way to a new snapshot of the one installed, which rekeys.
+    #[test]
+    fn a_lost_or_outside_snapshot_is_not_kept() {
+        let d = tempfile::tempdir().unwrap();
+        let bin = d.path().join("bin");
+        let bench = d.path().join("bench");
+        std::fs::create_dir_all(&bin).unwrap();
+        let t = script(&bin, "TOOL1", "echo v1");
+        let found = [Found {
+            word: "TOOL1".into(),
+            source: t.clone(),
+            snapshot: true,
+        }];
+        let (first, _) = settle(&bench, &found, false, VERSION_TIMEOUT).unwrap();
+        script(&bin, "TOOL1", "echo v2");
+        let k2 = key::file_key(&t).unwrap();
+        let fresh = bench.join("tools").join(&k2).join("TOOL1");
+        let rekeyed = "planned with the one installed, which rekeys its cells";
+
+        std::fs::remove_dir_all(bench.join("tools")).unwrap();
+        std::fs::write(bench.join("versions.tsv"), versions_tsv(&first)).unwrap();
+        let (lost, drift) = settle(&bench, &found, false, VERSION_TIMEOUT).unwrap();
+        assert_eq!((&lost[0].content_key, &lost[0].exec), (&k2, &fresh));
+        assert!(drift[0].ends_with(rekeyed), "{drift:?}");
+
+        std::fs::remove_dir_all(bench.join("tools")).unwrap();
+        let outside = script(d.path(), "TOOL1-old", "echo v1");
+        let mut row = first.clone();
+        row[0].exec = outside;
+        std::fs::write(bench.join("versions.tsv"), versions_tsv(&row)).unwrap();
+        let (moved, drift) = settle(&bench, &found, false, VERSION_TIMEOUT).unwrap();
+        assert_eq!((&moved[0].content_key, &moved[0].exec), (&k2, &fresh));
+        assert!(drift[0].ends_with(rekeyed), "{drift:?}");
+    }
+
+    // A tool found somewhere else than the plan before found it is said,
+    // though its bytes are the same.
+    #[test]
+    fn a_tool_found_elsewhere_is_said() {
+        let d = tempfile::tempdir().unwrap();
+        let bench = d.path().join("bench");
+        let (a, b) = (d.path().join("a"), d.path().join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let found = |source: PathBuf| {
+            [Found {
+                word: "TOOL1".into(),
+                source,
+                snapshot: true,
+            }]
+        };
+        let (ta, tb) = (script(&a, "TOOL1", "true"), script(&b, "TOOL1", "true"));
+        let (first, _) = settle(&bench, &found(ta.clone()), false, VERSION_TIMEOUT).unwrap();
+        std::fs::write(bench.join("versions.tsv"), versions_tsv(&first)).unwrap();
+        let (_, drift) = settle(&bench, &found(tb.clone()), false, VERSION_TIMEOUT).unwrap();
+        assert_eq!(
+            drift,
+            [format!("TOOL1: now {}, was {}", tb.display(), ta.display())]
+        );
+    }
+
+    // A tool whose bytes are not its key once copied (rebuilt meanwhile)
+    // is refused, and leaves no copy behind.
+    #[test]
+    fn a_tool_changed_while_copied_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let t = script(d.path(), "TOOL1", "true");
+        let k = "0".repeat(32);
+        let e = snapshot(&d.path().join("bench"), &t, &k, "TOOL1").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            format!("{} changed while it was copied; plan again", t.display())
+        );
+        let folder = d.path().join("bench/tools").join(&k);
+        assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0);
+    }
 }

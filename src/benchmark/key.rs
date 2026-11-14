@@ -216,5 +216,37 @@ mod tests {
             dir_key(d.path()).unwrap(),
             "a nested file is listed"
         );
+
+        // A rewrite of the same size is seen by its mtime.
+        let c = std::fs::File::options()
+            .write(true)
+            .open(sub.join("c"))
+            .unwrap();
+        let listed = dir_key(d.path()).unwrap();
+        c.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_ne!(listed, dir_key(d.path()).unwrap(), "a nested mtime");
+    }
+
+    // A folder's key is of its listing in name order, whatever order the
+    // system lists it in: each entry's path, size and mtime in ns.
+    #[test]
+    fn a_folder_is_keyed_by_its_listing_in_name_order() {
+        let d = tempfile::tempdir().unwrap();
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(1_000_000_007);
+        let mut rows = Vec::new();
+        for i in (0..16).rev() {
+            let name = format!("F{i:02}");
+            std::fs::write(d.path().join(&name), b"GENE1").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(d.path().join(&name))
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+            rows.push(format!("{name}\t5\t1000000007\n"));
+        }
+        rows.sort();
+        assert_eq!(dir_key(d.path()).unwrap(), key(rows.concat().as_bytes()));
     }
 }

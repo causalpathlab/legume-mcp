@@ -1290,6 +1290,36 @@ mod tests {
         }
     }
 
+    // Nested inputs found by one path enter the key in the order of their
+    // names, not in the order a map of them gives.
+    #[test]
+    fn inputs_found_by_path_are_keyed_in_name_order() {
+        let s = spec(
+            r#"{"name": "N1", "seeds": {"n": 1},
+            "inputs": {"R1": {"path": "R"}, "R2": {"path": "R/S"}, "R3": {"path": "R/S/T"}},
+            "stages": [{"name": "sim", "run": ["T1", "/I/R/S/T/a"], "makes": ["m.score.tsv"]}]}"#,
+        );
+        let tools = tools(&s);
+        // Each map of the same inputs iterates in an order of its own.
+        let key = || {
+            let inputs: HashMap<String, (PathBuf, String)> =
+                [("R1", "/I/R"), ("R2", "/I/R/S"), ("R3", "/I/R/S/T")]
+                    .into_iter()
+                    .map(|(n, p)| (n.to_string(), (PathBuf::from(p), format!("H-{n}"))))
+                    .collect();
+            let ctx = Context {
+                dir: PathBuf::from("/B"),
+                tools: &tools,
+                inputs: &inputs,
+            };
+            cells(&s, &ctx).unwrap().remove(0).key
+        };
+        let first = key();
+        for _ in 0..32 {
+            assert_eq!(key(), first);
+        }
+    }
+
     // {legume} inside a word of another tool's argv runs legume: its bytes
     // enter the key, as a run[0] tool's do.
     #[test]
@@ -1373,6 +1403,15 @@ mod tests {
             "stages[1].methods.M3.makes: lists 0 *.score.tsv; lane M3 ends here, and the last \
              stage of each lane makes exactly one"
         );
+        let two_scores = LANES.replace(
+            r#""makes": ["m.score.tsv"]}}}]}"#,
+            r#""makes": ["m.score.tsv", "n.score.tsv"]}}}]}"#,
+        );
+        assert_eq!(
+            refused(&two_scores),
+            "stages[2].methods.M1.makes: lists 2 *.score.tsv; lane M1 ends here, and the last \
+             stage of each lane makes exactly one"
+        );
     }
 
     #[test]
@@ -1426,6 +1465,12 @@ mod tests {
             {"name": "fit", "run": ["T", "--truth", "{sim}/sim.ground_truth.tsv.gz"], "makes": ["fit.tsv"]},
             {"name": "score", "run": ["T", "{fit}/fit.tsv"], "makes": ["m.score.tsv"]}]}"#;
         check(&spec(diagnostic)).unwrap();
+        // A score may read any other file of that stage.
+        let other_file = r#"{"name": "N1", "seeds": {"n": 1}, "stages": [
+            {"name": "sim", "run": ["data-beans-sim", "multiome", "--reference-atac", "R.zarr"],
+             "makes": ["sim.h5ad"]},
+            {"name": "score", "run": ["T", "{sim}/sim.h5ad"], "makes": ["m.score.tsv"]}]}"#;
+        check(&spec(other_file)).unwrap();
     }
 
     #[test]
