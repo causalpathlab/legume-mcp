@@ -53,8 +53,9 @@ pub struct Counts {
 }
 
 /// `scores` ranked against `labels`, one label per score, cleaned as the
-/// module says: the universe is sorted once and its [`Metrics`] read off the
-/// tie groups in one pass.
+/// module says: the scored items are sorted once, the unscored block is added
+/// as the last tie group, and the [`Metrics`] are read off the groups in one
+/// pass.
 ///
 /// # Panics
 ///
