@@ -53,6 +53,7 @@ pub use hints::{Annotations, Next, Prompt, PromptArg};
 mod graph;
 pub mod job;
 mod jobs;
+pub mod metric;
 mod notebook;
 mod procgroup;
 mod records;
