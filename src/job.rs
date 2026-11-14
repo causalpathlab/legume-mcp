@@ -112,9 +112,16 @@ pub(crate) fn read_end(dir: &Path) -> Option<End> {
 
 /// `bytes` as `name` in `dir`, replaced whole: a reader never sees half.
 pub(crate) fn replace(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = dir.join(format!(".{name}.{}", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(tmp, dir.join(name))
+    // Numbered too, so two threads of this process never share one.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.{}.{n}", std::process::id()));
+    let replaced = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, dir.join(name)));
+    if replaced.is_err() {
+        // Not left behind half written, or written and not put in place.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    replaced
 }
 
 /// The job in `dir` ended as `end`: unless another said first, recorded as
@@ -255,5 +262,52 @@ mod tests {
         reporter.finish(End::Done("second".into()));
         assert!(start.elapsed() < Duration::from_secs(1));
         assert_eq!(read_end(dir.path()), None);
+    }
+
+    #[test]
+    fn replacing_one_file_from_two_threads_at_once_never_loses_or_corrupts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let words: Vec<Vec<u8>> = (0..2u8).map(|t| vec![b'a' + t; 64 * 1024]).collect();
+        let start = std::sync::Barrier::new(words.len());
+        let failed: usize = std::thread::scope(|s| {
+            let threads: Vec<_> = words
+                .iter()
+                .map(|word| {
+                    s.spawn(|| {
+                        start.wait();
+                        (0..200)
+                            .map(|_| replace(dir.path(), "end.json", word))
+                            .filter(Result::is_err)
+                            .count()
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).sum()
+        });
+        assert_eq!(failed, 0, "replacements that failed");
+        let left = std::fs::read(dir.path().join("end.json")).unwrap();
+        assert!(
+            words.contains(&left),
+            "the file is not one of the words, whole"
+        );
+        // No temporary file is left behind.
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["end.json"]);
+    }
+
+    #[test]
+    fn a_replace_that_fails_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A folder with something in it is not replaced by a file.
+        std::fs::create_dir_all(dir.path().join("end.json").join("in")).unwrap();
+        assert!(replace(dir.path(), "end.json", b"{}").is_err());
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["end.json"]);
     }
 }

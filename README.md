@@ -10,8 +10,8 @@ implements `Handler` (its tools and how each is called) and hands it to
   prompts.
 - A tool's failure is a result with `isError` and the error chain as text.
 - `Call::progress` sends progress notifications when the client asks for them;
-  `Call::run` runs a child process, passes its stderr on as progress, and kills
-  it when the client cancels.
+  `Call::run` runs a child process, passes its stderr on as progress, and stops
+  it with what it started (its process group) when the client cancels.
 - stdout carries the protocol: tools must log to stderr and run anything that
   prints as a child.
 - Only serde_json, anyhow, base64 and log; no async runtime. Each feature is
