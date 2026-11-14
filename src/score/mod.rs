@@ -373,7 +373,11 @@ fn run(spec: &Spec, out: &mut dyn Write) -> Result<()> {
 
     let mut table = format!("{COLUMNS}\n");
     for (s, values) in spec.score.iter().zip(&scored.values) {
-        let c = metric::counts(values, &truth.labels);
+        let metric::Metrics {
+            auroc,
+            average_precision,
+            counts: c,
+        } = metric::rank(values, &truth.labels);
         let scored_items = c.n_universe - c.unscored;
         if c.n_inf * 100 > scored_items {
             eprintln!(
@@ -382,10 +386,7 @@ fn run(spec: &Spec, out: &mut dyn Write) -> Result<()> {
                 s.name, c.n_inf
             );
         }
-        for (metric, value) in [
-            ("auroc", metric::auroc(values, &truth.labels)),
-            ("auprc", metric::average_precision(values, &truth.labels)),
-        ] {
+        for (metric, value) in [("auroc", auroc), ("auprc", average_precision)] {
             table.push_str(&format!(
                 "{}\t{metric}\t{value}\tall\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 s.name,

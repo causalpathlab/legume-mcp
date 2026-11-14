@@ -89,7 +89,7 @@ pub fn rank(scores: &[Option<f64>], labels: &[bool]) -> Metrics {
 
 /// A score made ready to rank: `None` when unscored (missing, NaN or
 /// `-inf`), `+0.0` for `-0.0`, any other value as it is.
-fn clean(score: Option<f64>) -> Option<f64> {
+pub(crate) fn clean(score: Option<f64>) -> Option<f64> {
     match score {
         Some(x) if x.is_nan() || x == f64::NEG_INFINITY => None,
         // A float pattern matches by ==, and -0.0 == 0.0: both become +0.0.
