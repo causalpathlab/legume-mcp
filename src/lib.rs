@@ -39,7 +39,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{channel, RecvTimeoutError};
+use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -561,6 +561,28 @@ enum Piped {
     Failed(std::io::Error),
 }
 
+/// `from` read to its end, each chunk sent on `to` as it was read, no
+/// larger than what was read: chunks wait there while a group is stopped;
+/// a failure to read is sent last.
+fn send_chunks(mut from: impl Read, to: &Sender<Piped>) {
+    let mut buf = vec![0; 64 * 1024];
+    loop {
+        match from.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if to.send(Piped::Out(buf[..n].to_vec())).is_err() {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                let _ = to.send(Piped::Failed(e));
+                break;
+            }
+        }
+    }
+}
+
 /// Run `cmd` to its end and return its stdout; each stderr line goes to
 /// `progress`; `cancelled` is asked as it runs; a failure quotes its error
 /// ([`quote`]). The child leads its own process group, which is stopped
@@ -588,32 +610,13 @@ fn run_child(
             .stderr(Stdio::piped()),
     )
     .with_context(|| format!("starting {shown}"))?;
-    let mut stdout = group.take_stdout().context("child stdout")?;
+    let stdout = group.take_stdout().context("child stdout")?;
     let stderr = group.take_stderr().context("child stderr")?;
     // Both pipes through one channel, closed once both are; no thread of
     // this call is waited on, so a pipe held past the child's end is not.
     let (tx, rx) = channel();
     let out_tx = tx.clone();
-    std::thread::spawn(move || {
-        loop {
-            // Each chunk its own, sent as it was read.
-            let mut buf = vec![0; 64 * 1024];
-            match stdout.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    buf.truncate(n);
-                    if out_tx.send(Piped::Out(buf)).is_err() {
-                        break;
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => {
-                    let _ = out_tx.send(Piped::Failed(e));
-                    break;
-                }
-            }
-        }
-    });
+    std::thread::spawn(move || send_chunks(stdout, &out_tx));
     std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             if tx.send(Piped::Line(line)).is_err() {
@@ -1666,9 +1669,27 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_cancel_kills_what_ignores_term_once_the_grace_is_over() {
-        // Ready once TERM is ignored, so the TERM does not come first.
+        // Ready once TERM is ignored, so the TERM does not come first, and
+        // once its pid is written, so the TERM does not stop that.
         let (out, pid) = run_writing_a_pid(
-            r#"( trap '' TERM; echo ready >&2; exec sleep 30 ) >/dev/null & echo $! > "$PIDFILE"; wait"#,
+            r#"( trap '' TERM; while [ ! -s "$PIDFILE" ]; do sleep 0.01; done
+                 echo ready >&2; exec sleep 30 ) >/dev/null &
+               echo $! > "$PIDFILE"; wait"#,
+            true,
+            GRACE + Duration::from_secs(3),
+        );
+        assert_eq!(out.unwrap_err().to_string(), "cancelled");
+        assert!(gone_within(pid, Duration::from_secs(1)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_cancel_ends_though_the_child_has_left_its_group() {
+        // The child joins this process's group, out of reach of its own
+        // group's signals, and runs on.
+        let (out, pid) = run_writing_a_pid(
+            r#"echo $$ > "$PIDFILE"
+               exec perl -e 'setpgrp(0, getpgrp(getppid())); print STDERR "ready\n"; sleep 30'"#,
             true,
             GRACE + Duration::from_secs(3),
         );
@@ -1702,6 +1723,34 @@ mod tests {
             &|_| {},
         );
         assert_eq!(out.unwrap(), "a".repeat(200_000));
+    }
+
+    #[test]
+    fn a_chunk_of_stdout_holds_no_more_than_was_read() {
+        // A byte a time, as from a child writing in small pieces while its
+        // group is stopped and nothing takes the chunks yet.
+        struct Bytes(usize);
+        impl Read for Bytes {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Ok(0);
+                }
+                self.0 -= 1;
+                buf[0] = b'x';
+                Ok(1)
+            }
+        }
+        let (tx, rx) = channel();
+        send_chunks(Bytes(100), &tx);
+        drop(tx);
+        let held: usize = rx
+            .iter()
+            .map(|piped| match piped {
+                Piped::Out(bytes) => bytes.capacity(),
+                _ => panic!("not a chunk of stdout"),
+            })
+            .sum();
+        assert_eq!(held, 100);
     }
 
     #[test]

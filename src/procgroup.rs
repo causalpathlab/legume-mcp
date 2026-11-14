@@ -101,12 +101,12 @@ impl Group {
         Ok(status)
     }
 
-    /// KILL to every process left in the group, until [`Self::stop`] is
-    /// done with it.
+    /// KILL to every process left in the group, and to the leader, which
+    /// may have left it, until [`Self::stop`] is done with it.
     fn kill(&mut self) {
         #[cfg(unix)]
         self.signal(libc::SIGKILL);
-        #[cfg(not(unix))]
+        // Unreaped, the leader's pid is still its own.
         if !self.reaped {
             let _ = self.child.kill();
         }
