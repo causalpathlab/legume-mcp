@@ -52,7 +52,7 @@ pub struct Context<'a> {
     pub dir: PathBuf,
     /// Each tool word's (and [`LEGUME`]'s) tool.
     pub tools: &'a [Resolved],
-    /// Each declared input: its absolute path and content key.
+    /// Each declared input: its path, resolved, and content key.
     pub inputs: &'a HashMap<String, (PathBuf, String)>,
 }
 
@@ -750,11 +750,12 @@ pub fn cells(spec: &Spec, ctx: &Context) -> Result<Vec<Cell>> {
                 let mut inputs = p.inputs.clone();
                 for t in &argv[1..] {
                     let path = named_path(t);
+                    if !path.is_absolute() {
+                        continue;
+                    }
+                    let real = path.canonicalize().ok();
                     for (n, (i, _)) in ctx.inputs {
-                        if path.is_absolute()
-                            && path.starts_with(i)
-                            && !inputs.contains(&n.as_str())
-                        {
+                        if is_under(path, real.as_deref(), i) && !inputs.contains(&n.as_str()) {
                             inputs.push(n);
                         }
                     }
@@ -833,7 +834,11 @@ pub fn warnings(spec: &Spec, cells: &[Cell], ctx: &Context) -> Vec<String> {
             if !p.is_absolute() || p.starts_with(dir) || !seen.insert(p) {
                 continue;
             }
-            let declared = ctx.inputs.values().any(|(i, _)| p.starts_with(i));
+            let real = p.canonicalize().ok();
+            let declared = ctx
+                .inputs
+                .values()
+                .any(|(i, _)| is_under(p, real.as_deref(), i));
             if !declared && p.is_file() {
                 let path = p.display();
                 out.push(format!(
@@ -845,6 +850,12 @@ pub fn warnings(spec: &Spec, cells: &[Cell], ctx: &Context) -> Vec<String> {
         }
     }
     out
+}
+
+/// Whether the path `p`, `real` once resolved, is at or under the input
+/// at `input` (a resolved path).
+fn is_under(p: &Path, real: Option<&Path>, input: &Path) -> bool {
+    p.starts_with(input) || real.is_some_and(|r| r.starts_with(input))
 }
 
 /// The path an argv word names: all of it, or what follows its last `=`

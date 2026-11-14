@@ -595,3 +595,82 @@ fn a_changed_machine_is_said_and_the_first_kept() {
     assert!(stdout(&o).contains(&line), "{}", stdout(&o));
     assert_eq!(std::fs::read_to_string(&file).unwrap(), first);
 }
+
+// A folder input that holds the benchmark's folder, or lies in it, would
+// list the plan's own files and every cell's output, and so rekey every
+// cell on every plan: refused, exit 3, nothing written. `..` is resolved
+// first.
+#[test]
+fn a_folder_input_holding_the_benchmark_is_refused() {
+    let p = Project::new();
+    p.tool("TOOL1", "true");
+    p.tool("TOOL2", "true");
+    std::fs::create_dir_all(p.bench("N1").join("cells")).unwrap();
+    for path in [".", "bin/..", "results/benchmarks/N1/cells"] {
+        let spec = TWO.replace(
+            "\"seeds\"",
+            &format!("\"inputs\": {{\"R\": {{\"path\": \"{path}\", \"dir\": true}}}}, \"seeds\""),
+        );
+        let o = p.legume(&["plan", p.spec("S1.json", &spec).to_str().unwrap()]);
+        assert_eq!(o.status.code(), Some(3), "{path}: {}", stderr(&o));
+        assert!(
+            stderr(&o).starts_with("legume benchmark: inputs.R.path: "),
+            "{path}: {}",
+            stderr(&o)
+        );
+        assert!(
+            stderr(&o).ends_with(
+                " overlaps the benchmark's folder, whose files change with every plan and \
+                 run; name a folder apart from it\n"
+            ),
+            "{path}: {}",
+            stderr(&o)
+        );
+        assert_eq!(
+            std::fs::read_dir(p.bench("N1")).unwrap().count(),
+            1,
+            "{path}: nothing written"
+        );
+    }
+}
+
+// An input whose path has `..` or a link is the file it resolves to: an
+// argv path to that file, however written, reads it, so its content enters the key, and no
+// warning calls it undeclared.
+#[test]
+fn an_input_is_matched_once_resolved() {
+    for (path, named) in [
+        ("d/../d/r.tsv", "d/r.tsv"),
+        ("link/r.tsv", "d/r.tsv"),
+        ("d/r.tsv", "link/r.tsv"),
+    ] {
+        let p = Project::new();
+        p.tool("TOOL1", "true");
+        p.tool("TOOL2", "true");
+        let r = p.root().join("d/r.tsv");
+        std::fs::create_dir_all(r.parent().unwrap()).unwrap();
+        std::fs::write(&r, "GENE1\n").unwrap();
+        std::os::unix::fs::symlink(p.root().join("d"), p.root().join("link")).unwrap();
+        let spec = TWO
+            .replace(
+                "\"seeds\"",
+                &format!("\"inputs\": {{\"R\": {{\"path\": \"{path}\"}}}}, \"seeds\""),
+            )
+            .replace(
+                "\"{A}\"",
+                &format!("\"{{A}}\", \"{}\"", p.root().join(named).display()),
+            );
+        let spec = p.spec("S1.json", &spec);
+        let o = p.legume(&["plan", spec.to_str().unwrap()]);
+        ok(&o);
+        assert!(
+            !stderr(&o).contains("is a file outside the benchmark"),
+            "{path}: {}",
+            stderr(&o)
+        );
+        let before = keys(&p.plan("N1"));
+        std::fs::write(&r, "GENE2\n").unwrap();
+        ok(&p.legume(&["plan", spec.to_str().unwrap()]));
+        assert_ne!(before[0], keys(&p.plan("N1"))[0], "{path}");
+    }
+}

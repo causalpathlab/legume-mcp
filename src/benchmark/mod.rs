@@ -118,6 +118,16 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
             .collect();
         return Err(refuse(format!("not found on PATH: {}", names.join(", "))));
     }
+    let dir = root.join("results").join("benchmarks").join(&spec.name);
+    // The benchmark's folder resolved, as each input is; it need not be
+    // there yet.
+    let real_dir = dir.canonicalize().unwrap_or_else(|_| {
+        let real_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        real_root
+            .join("results")
+            .join("benchmarks")
+            .join(&spec.name)
+    });
     let mut inputs: HashMap<String, (PathBuf, String)> = HashMap::new();
     for i in &spec.inputs {
         let p = crate::absolute(&root.join(&i.path));
@@ -130,6 +140,19 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
                 p.display()
             )));
         }
+        // An input is the file it names, its `..` and links resolved, so an
+        // argv path to it is found however it is written.
+        let p = p
+            .canonicalize()
+            .with_context(|| format!("resolving {}", p.display()))?;
+        if i.dir && (real_dir.starts_with(&p) || p.starts_with(&real_dir)) {
+            return Err(refuse(format!(
+                "inputs.{}.path: {} overlaps the benchmark's folder, whose files change with \
+                 every plan and run; name a folder apart from it",
+                i.name,
+                p.display()
+            )));
+        }
         let k = if i.dir {
             key::dir_key(&p)?
         } else {
@@ -137,7 +160,6 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
         };
         inputs.insert(i.name.clone(), (p, k));
     }
-    let dir = root.join("results").join("benchmarks").join(&spec.name);
     // The last refusal, before any tool is snapshot: what a refusal stops
     // writes nothing but this spec, named by its content.
     let spec_file = dir.join("specs").join(format!("{spec_key}.json"));
