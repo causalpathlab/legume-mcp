@@ -19,6 +19,11 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
+/// The definition levels of an OPTIONAL column: 0 for a null.
+fn levels<T>(v: &[Option<T>]) -> Vec<i16> {
+    v.iter().map(|x| i16::from(x.is_some())).collect()
+}
+
 /// One column of a parquet fixture.
 enum Col {
     Str(Vec<String>),
@@ -26,27 +31,28 @@ enum Col {
     I64(Vec<i64>),
     F32(Vec<f32>),
     F64(Vec<f64>),
+    /// OPTIONAL, `None` a null.
+    OptStr(Vec<Option<String>>),
+    OptF64(Vec<Option<f64>>),
 }
 
-/// A parquet file of REQUIRED columns in one row group, as the tools'
-/// writers make them.
+/// A parquet file of the columns `columns` in one row group, REQUIRED as
+/// the tools' writers make them unless optional.
 fn parquet(path: &Path, columns: &[(&str, Col)], compression: Compression) {
     let fields: Vec<String> = columns
         .iter()
         .map(|(name, c)| {
-            let ty = match c {
-                Col::Str(_) => "BYTE_ARRAY",
-                Col::I32(_) => "INT32",
-                Col::I64(_) => "INT64",
-                Col::F32(_) => "FLOAT",
-                Col::F64(_) => "DOUBLE",
+            let (ty, how) = match c {
+                Col::Str(_) => ("BYTE_ARRAY", "REQUIRED"),
+                Col::I32(_) => ("INT32", "REQUIRED"),
+                Col::I64(_) => ("INT64", "REQUIRED"),
+                Col::F32(_) => ("FLOAT", "REQUIRED"),
+                Col::F64(_) => ("DOUBLE", "REQUIRED"),
+                Col::OptStr(_) => ("BYTE_ARRAY", "OPTIONAL"),
+                Col::OptF64(_) => ("DOUBLE", "OPTIONAL"),
             };
-            let utf8 = if matches!(c, Col::Str(_)) {
-                " (UTF8)"
-            } else {
-                ""
-            };
-            format!("REQUIRED {ty} {name}{utf8};")
+            let utf8 = if ty == "BYTE_ARRAY" { " (UTF8)" } else { "" };
+            format!("{how} {ty} {name}{utf8};")
         })
         .collect();
     let message = format!("message table {{ {} }}", fields.join(" "));
@@ -80,6 +86,20 @@ fn parquet(path: &Path, columns: &[(&str, Col)], compression: Compression) {
             Col::F64(v) => {
                 col.typed::<DoubleType>()
                     .write_batch(v, None, None)
+                    .unwrap();
+            }
+            Col::OptStr(v) => {
+                let def = levels(v);
+                let v: Vec<ByteArray> = v.iter().flatten().map(|s| s.as_str().into()).collect();
+                col.typed::<ByteArrayType>()
+                    .write_batch(&v, Some(&def), None)
+                    .unwrap();
+            }
+            Col::OptF64(v) => {
+                let def = levels(v);
+                let v: Vec<f64> = v.iter().flatten().copied().collect();
+                col.typed::<DoubleType>()
+                    .write_batch(&v, Some(&def), None)
                     .unwrap();
             }
         }
@@ -264,10 +284,11 @@ fn universe_same_needs_the_truth_and_the_scores_in_one_file() {
 #[test]
 fn truth_outside_the_universe_exits_3_with_a_count_or_is_dropped_and_counted() {
     let c = few_links();
-    // Two more truth pairs, outside the universe.
+    // Two more truth pairs, outside the universe, one listed twice.
     let mut pos: Vec<String> = (0..10).map(|k| pair(k * 100 + 7)).collect();
     pos.push("GENE1000\tPEAK10000".into());
     pos.push("GENE1001\tPEAK10010".into());
+    pos.push("GENE1000\tPEAK10000".into());
     tsv(&c.truth, "gene\tpeak", &pos);
     let o = legume(c.args(&c.universe_args()));
     assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
@@ -278,6 +299,9 @@ fn truth_outside_the_universe_exits_3_with_a_count_or_is_dropped_and_counted() {
     a.extend(["--truth-outside", "drop"]);
     let o = legume(&a);
     assert!(o.status.success(), "{}", stderr(&o));
+    let said = String::from_utf8_lossy(&o.stdout);
+    let truth = "truth: 13 rows, 12 keys, 10 positive in the universe, 2 outside it";
+    assert!(said.contains(truth), "{said}");
     let rows = rows(&c.out);
     let ap = row(&rows, "M1", "auprc");
     assert_eq!(ap.get("outside_pos"), "2");
@@ -397,6 +421,9 @@ fn above_is_strict() {
     a.extend(["--label", "w", "--above", "1"].map(String::from));
     let o = legume(&a);
     assert!(o.status.success(), "{}", stderr(&o));
+    let said = String::from_utf8_lossy(&o.stdout);
+    let truth = "truth: 4 rows, 4 keys, 1 positive in the universe, 0 outside it";
+    assert!(said.contains(truth), "{said}");
     let rows = rows(&d.join("out.score.tsv"));
     let roc = row(&rows, "M1", "auroc");
     assert_eq!(roc.get("n_pos"), "1");
@@ -596,6 +623,57 @@ fn universe_same_reads_its_one_file_once_so_a_pipe_works() {
         assert_eq!(roc.get("n_pos"), "2", "piped {piped}");
         assert_eq!(roc.get("unscored_pos"), "1", "piped {piped}");
     }
+}
+
+// --universe same, K1 listed twice: one item, positive from its second
+// row and scored its higher 3, above K2's 2: AUROC 1. Its rows each find
+// K1, so the truth has two keys and the scores one duplicate.
+#[test]
+fn universe_same_finds_a_key_listed_twice_as_one_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let one = dir.path().join("one.tsv");
+    let out = dir.path().join("out.score.tsv");
+    tsv(
+        &one,
+        "key\tplanted\tv",
+        &["K1\t0\t1", "K2\t0\t2", "K1\t1\t3"],
+    );
+    let o = legume([
+        "score",
+        "--scores",
+        s(&one),
+        "--key",
+        "key",
+        "--score",
+        "M1=v",
+        "--truth",
+        s(&one),
+        "--truth-key",
+        "key",
+        "--label",
+        "planted",
+        "--above",
+        "0.5",
+        "--universe",
+        "same",
+        "--dup",
+        "max",
+        "-o",
+        s(&out),
+    ]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let said = String::from_utf8_lossy(&o.stdout);
+    for line in [
+        "universe: 2 items (1 duplicate rows)",
+        "truth: 3 rows, 2 keys, 1 positive in the universe, 0 outside it",
+        "scores: 3 rows, 0 outside the universe, 1 duplicate keys",
+    ] {
+        assert!(said.contains(line), "{said}");
+    }
+    let rows = rows(&out);
+    let roc = row(&rows, "M1", "auroc");
+    near(roc.num("value"), 1.0);
+    assert_eq!(roc.get("n_universe"), "2");
 }
 
 // Parquet is read by seeking, which a pipe cannot do: refused, and why.
@@ -828,6 +906,54 @@ fn a_chickpea_links_parquet_is_scored_over_the_cis_universe() {
     assert_eq!(m1.get("unscored_pos"), "1");
     // 0.0 and -0.0 are one tie: two of the three scored.
     near(m1.num("tied_share"), 2.0 / 3.0);
+}
+
+// A null score is no score: K1 (true) ranks last, unscored, below K2 and
+// K3, AUROC 0. Read as the next row's score it would rank first. A null
+// key names no item: refused.
+#[test]
+fn a_null_parquet_score_is_unscored_and_a_null_key_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    tsv(&d.join("universe.tsv"), "key", &["K1", "K2", "K3"]);
+    tsv(&d.join("truth.tsv"), "key", &["K1"]);
+    let scores = d.join("scores.parquet");
+    let mut a = keyed_args(d, &["M1=v"]);
+    let at = a.iter().position(|x| x.ends_with("scores.tsv")).unwrap();
+    a[at] = s(&scores).to_string();
+    let some = |k: &[&str]| k.iter().map(|k| Some(k.to_string())).collect();
+    parquet(
+        &scores,
+        &[
+            ("key", Col::OptStr(some(&["K1", "K2", "K3"]))),
+            ("v", Col::OptF64(vec![None, Some(0.5), Some(0.2)])),
+        ],
+        Compression::SNAPPY,
+    );
+    let o = legume(&a);
+    assert!(o.status.success(), "{}", stderr(&o));
+    let rows = rows(&d.join("out.score.tsv"));
+    let roc = row(&rows, "M1", "auroc");
+    near(roc.num("value"), 0.0);
+    assert_eq!(roc.get("unscored"), "1");
+    assert_eq!(roc.get("unscored_pos"), "1");
+
+    std::fs::remove_file(d.join("out.score.tsv")).unwrap();
+    let mut keys: Vec<Option<String>> = some(&["K1", "K2", "K3"]);
+    keys[1] = None;
+    parquet(
+        &scores,
+        &[
+            ("key", Col::OptStr(keys)),
+            ("v", Col::OptF64(vec![Some(0.1), Some(0.5), Some(0.2)])),
+        ],
+        Compression::SNAPPY,
+    );
+    let o = legume(&a);
+    assert!(!o.status.success());
+    let e = stderr(&o);
+    assert!(e.contains("row 2 of key"), "{e}");
+    assert!(!d.join("out.score.tsv").exists());
 }
 
 #[test]

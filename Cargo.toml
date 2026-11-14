@@ -45,8 +45,10 @@ typst-pdf = { version = "0.15.1", optional = true }
 
 # The tables the tools write, read by `legume score` and written by `legume
 # universe` (`benchmark`): parquet, compressed as chickpea and pinto write
-# it (ZSTD, Snappy), and TSV, gzipped or not.
+# it (ZSTD, Snappy), and TSV, gzipped or not; `half` for a FLOAT16 column,
+# as parquet's own rows read it.
 parquet = { version = "60.1", default-features = false, features = ["zstd", "snap"], optional = true }
+half = { version = "2.1", default-features = false, optional = true }
 flate2 = { version = "1.1", optional = true }
 
 [features]
@@ -59,7 +61,7 @@ clap = ["dep:clap"]
 sessions = ["dep:legume-tui"]
 # `legume score` and `legume universe`: a method's scores against a truth
 # over a universe, and the universe of cis pairs.
-benchmark = ["dep:parquet", "dep:flate2"]
+benchmark = ["dep:parquet", "dep:half", "dep:flate2"]
 
 [target.'cfg(unix)'.dependencies]
 # geteuid and O_NOFOLLOW, to leave alone record files this user does not own.
