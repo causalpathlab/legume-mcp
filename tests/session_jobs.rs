@@ -17,13 +17,19 @@ use std::time::{Duration, Instant};
 
 const TOOL: legume_tui::Tool = legume_tui::Tool::new("sj");
 
-/// The stand-in TUI, built alongside the tests.
+/// The stand-in TUI, built alongside the tests (a plain `cargo test` builds
+/// the examples; `--test session_jobs` alone does not): in `examples/` of
+/// the profile's folder, the nearest folder above this test that has one
+/// (`target/debug/deps/<test>` once, deeper in a build folder of its own
+/// since Cargo 1.100). A `build-dir` set apart from the target folder puts
+/// it out of reach.
 fn stand_in() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
-    let debug = exe.parent().unwrap().parent().unwrap();
-    let it = debug.join("examples").join("session_job");
-    assert!(it.exists(), "build the example first: {}", it.display());
-    it
+    let it = exe
+        .ancestors()
+        .map(|dir| dir.join("examples").join("session_job"))
+        .find(|it| it.is_file());
+    it.unwrap_or_else(|| panic!("build the example first: none above {}", exe.display()))
 }
 
 struct Tools;

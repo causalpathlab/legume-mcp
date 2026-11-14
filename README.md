@@ -115,7 +115,7 @@ the instructions they all read:
 
 | Agent | Settings | Instructions |
 |---|---|---|
-| Claude Code (`claude`) | `.mcp.json` | `CLAUDE.md`, which imports `AGENTS.md` |
+| Claude Code (`claude`) | `.mcp.json`, approved in `.claude/settings.local.json` | `CLAUDE.md`, which imports `AGENTS.md` |
 | Codex (`codex`) | `.codex/config.toml`, read once you trust the project | `AGENTS.md` |
 | Cursor (`agent`, the editor) | `.cursor/mcp.json` | `AGENTS.md` |
 | VS Code, Copilot Chat in Agent mode | `.vscode/mcp.json` | `AGENTS.md` |
@@ -125,7 +125,13 @@ the instructions they all read:
 
 It writes all of them, or only those named (`--claude`, `--codex`,
 `--cursor`, `--vscode`, `--gemini`, `--antigravity`, `--opencode`). Servers
-already listed are kept as they are. The instructions are one section of
+already listed are kept as they are. For Claude Code the servers listed as
+init writes them are also approved in `.claude/settings.local.json`
+(`enabledMcpjsonServers`, named in `.claude/.gitignore`), so it asks only
+to trust the folder; one `.mcp.json` lists otherwise is left for Claude
+Code to ask about, and one in `disabledMcpjsonServers` stays off. Claude
+Code applies these approvals only while git does not track that file. The
+instructions are one section of
 `AGENTS.md` (and of `CLAUDE.md`), between two marked lines: init rewrites
 that section and leaves the rest of the file to you. They are how to work
 with the person and the tools: the rule (the person thinks; the agent runs
@@ -139,6 +145,7 @@ Project: /Users/me/work/project
 Servers: legume, data-beans, senna, lupin, pinto, cocoa, chickpea, faba
   not included (not on the PATH, or no MCP server): mung
 Wrote .mcp.json for Claude Code
+Approved them for Claude Code in .claude/settings.local.json (it will not ask each time)
 Wrote .codex/config.toml for Codex
 Wrote .cursor/mcp.json for Cursor
 Wrote .vscode/mcp.json for VS Code
@@ -148,7 +155,7 @@ Wrote opencode.json for opencode
 Wrote AGENTS.md
 Wrote CLAUDE.md
 
-Claude Code: start `claude` in this folder and approve the project's servers when it asks; /mcp__legume__explore starts the guided work.
+Claude Code: start `claude` in this folder and trust it when it asks; /mcp__legume__explore starts the guided work.
 Codex: start `codex` in this folder and trust it when it asks: Codex reads a project's servers only in a project you trust.
 Also ready for Cursor, VS Code, Gemini CLI, Antigravity, opencode (not on this PATH; `legume init --help` says where each looks).
 Then ask it to look at your data: AGENTS.md tells it how to work with you.
