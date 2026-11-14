@@ -565,7 +565,8 @@ enum Piped {
 /// what it started when it says so (TERM, then KILL after [`GRACE`]); a
 /// failure quotes its error ([`quote`]). Its pipes are read for at most
 /// [`DRAIN`] after it exits, then what it left holding them is killed and
-/// they are read for at most [`LAST_READ`] more. A Rust child prints no
+/// they are read for at most [`LAST_READ`] more. Whatever of its process
+/// group is still running when it ends is killed. A Rust child prints no
 /// backtrace unless the tool asks for one: the agent reads the error.
 fn run_child(
     mut cmd: Command,
@@ -670,6 +671,9 @@ fn run_child(
             _ => {}
         }
     }
+    // What the child left running goes with it. Its leader is not reaped
+    // yet, so the group's id is still its own.
+    group.kill();
     let status = group.wait()?;
     if let Some(e) = unread {
         return Err(e.into());
@@ -1542,6 +1546,24 @@ mod tests {
             pid.display()
         );
         let out = within(DRAIN + Duration::from_secs(3), move || {
+            run_child(sh(&script), &|| false, &|_| {})
+        });
+        assert_eq!(out.unwrap(), "made");
+        assert!(gone_within(pid_in(&pid), Duration::from_secs(1)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn what_a_child_left_running_goes_when_it_ends() {
+        // The grandchild holds no pipe, so the call ends as soon as the
+        // child does; it must not live on past it.
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = tmp.path().join("pid");
+        let script = format!(
+            "sleep 30 >/dev/null 2>&1 & echo $! > '{}'; printf made",
+            pid.display()
+        );
+        let out = within(Duration::from_secs(2), move || {
             run_child(sh(&script), &|| false, &|_| {})
         });
         assert_eq!(out.unwrap(), "made");
