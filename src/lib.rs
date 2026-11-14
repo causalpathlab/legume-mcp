@@ -91,6 +91,8 @@ const GRACE: Duration = Duration::from_secs(3);
 /// How long a child's pipes are read after it exits: a process it left
 /// behind that holds one is killed then, and what was read is returned.
 const DRAIN: Duration = Duration::from_secs(2);
+/// How long the pipes are read after that KILL, for what is still in them.
+const LAST_READ: Duration = Duration::from_millis(500);
 
 /// What `initialize` reports: the server's name and version, and the
 /// instructions an agent reads before its first call (what the tools are
@@ -562,9 +564,9 @@ enum Piped {
 /// `progress`; `cancelled` is asked as it runs, and stops the child and
 /// what it started when it says so (TERM, then KILL after [`GRACE`]); a
 /// failure quotes its error ([`quote`]). Its pipes are read for at most
-/// [`DRAIN`] after it exits, then what it left holding them is killed. A
-/// Rust child prints no backtrace unless the tool asks for one: the agent
-/// reads the error.
+/// [`DRAIN`] after it exits, then what it left holding them is killed and
+/// they are read for at most [`LAST_READ`] more. A Rust child prints no
+/// backtrace unless the tool asks for one: the agent reads the error.
 fn run_child(
     mut cmd: Command,
     cancelled: &dyn Fn() -> bool,
@@ -649,11 +651,17 @@ fn run_child(
         match ended {
             Some(_) if closed => break,
             // What the child left holds a pipe: it is killed with the
-            // group, and what is still in the pipes read.
+            // group, and what is still in the pipes read for a little
+            // while. A process that left the group, out of reach of its
+            // KILL, may write for as long as it lives: it is not waited for.
             Some(at) if at.elapsed() >= DRAIN => {
                 group.kill();
-                while let Ok(piped) = rx.recv_timeout(POLL) {
-                    take(piped);
+                let until = std::time::Instant::now() + LAST_READ;
+                while let Some(left) = until.checked_duration_since(std::time::Instant::now()) {
+                    match rx.recv_timeout(left) {
+                        Ok(piped) => take(piped),
+                        Err(_) => break,
+                    }
                 }
                 break;
             }
@@ -1578,7 +1586,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let marker = tmp.path().join("termed");
         let script = format!(
-            "trap \"echo termed > '{}'; exit 0\" TERM; echo ready >&2; sleep 30 & wait",
+            "trap \"echo termed > '{}'; exit 0\" TERM; sleep 30 & echo ready >&2; wait",
             marker.display()
         );
         let out = within(GRACE + Duration::from_secs(3), move || {
@@ -1587,5 +1595,71 @@ mod tests {
         assert_eq!(out.unwrap_err().to_string(), "cancelled");
         let said = std::fs::read_to_string(&marker).unwrap_or_default();
         assert_eq!(said, "termed\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_cancel_gives_the_group_its_grace_after_the_child_has_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("cleaned");
+        let inner = tmp.path().join("inner.sh");
+        std::fs::write(
+            &inner,
+            format!(
+                "trap \"sleep 0.5; echo cleaned > '{}'; exit 0\" TERM\n\
+                 echo ready >&2\nwhile :; do sleep 0.1; done\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        // The child, a wrapper, dies on TERM at once; what it started
+        // cleans up first.
+        let script = format!("sh '{}'; true", inner.display());
+        let start = std::time::Instant::now();
+        let out = within(GRACE + Duration::from_secs(3), move || {
+            cancelled_once_ready(script)
+        });
+        assert_eq!(out.unwrap_err().to_string(), "cancelled");
+        let said = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert_eq!(said, "cleaned\n");
+        // Ended when the group did, not when the grace was over.
+        assert!(start.elapsed() < GRACE, "{:?}", start.elapsed());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_cancel_kills_what_ignores_term_once_the_grace_is_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = tmp.path().join("pid");
+        // Ready once TERM is ignored, so the TERM does not come first.
+        let script = format!(
+            "( trap '' TERM; echo ready >&2; exec sleep 30 ) >/dev/null & echo $! > '{}'; wait",
+            pid.display()
+        );
+        let out = within(GRACE + Duration::from_secs(3), move || {
+            cancelled_once_ready(script)
+        });
+        assert_eq!(out.unwrap_err().to_string(), "cancelled");
+        assert!(gone_within(pid_in(&pid), Duration::from_secs(1)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_job_ends_though_a_process_outside_its_group_keeps_writing_to_its_pipes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = tmp.path().join("pid");
+        // `setpgrp` takes the holder out of the child's group, out of reach
+        // of the group's KILL.
+        let script = format!(
+            "perl -e 'setpgrp; exec @ARGV' sh -c 'while :; do echo x >&2; sleep 0.05; done' & \
+             echo $! > '{}'; printf made",
+            pid.display()
+        );
+        let out = within(DRAIN + Duration::from_secs(3), move || {
+            run_child(sh(&script), &|| false, &|_| {})
+        });
+        // SAFETY: a plain kill of the process the test started.
+        unsafe { libc::kill(pid_in(&pid), libc::SIGKILL) };
+        assert_eq!(out.unwrap(), "made");
     }
 }
