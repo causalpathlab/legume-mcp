@@ -263,7 +263,8 @@ fn write_spec(file: &Path, canonical: &str) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             if std::fs::read(file)? != canonical.as_bytes() {
                 return Err(refuse(format!(
-                    "{}: is there with other bytes than its name's key",
+                    "{}: is there with other bytes than this spec's canonical JSON; a spec \
+                     under specs/ is not edited in place",
                     file.display()
                 )));
             }

@@ -472,8 +472,8 @@ fn an_empty_grid_is_refused_with_nothing_written() {
     assert!(!p.root().join("results").exists());
 }
 
-// A canonical spec found with other bytes than its name's key is refused
-// before any tool is snapshot.
+// A file under specs/ with other bytes than the spec's canonical JSON is
+// refused before any tool is snapshot.
 #[test]
 fn a_spec_file_of_other_bytes_is_refused_before_the_tools() {
     let p = Project::new();
@@ -485,13 +485,21 @@ fn a_spec_file_of_other_bytes_is_refused_before_the_tools() {
     let bench = p.bench("N1");
     std::fs::write(bench.join(format!("specs/{key}.json")), "{}\n").unwrap();
     std::fs::remove_dir_all(bench.join("tools")).unwrap();
+    let other = "is there with other bytes than this spec's canonical JSON; a spec under \
+                 specs/ is not edited in place\n";
     let o = p.legume(&["plan", spec.to_str().unwrap()]);
     assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
-    assert!(
-        stderr(&o).ends_with("is there with other bytes than its name's key\n"),
-        "{}",
-        stderr(&o)
-    );
+    assert!(stderr(&o).ends_with(other), "{}", stderr(&o));
+    assert!(!bench.join("tools").exists());
+
+    // The same spec laid out another way in its place keeps its key, so
+    // its name passes; its bytes are refused.
+    let file = bench.join(format!("specs/{key}.json"));
+    let same: Value = serde_json::from_str(TWO).unwrap();
+    std::fs::write(&file, serde_json::to_string_pretty(&same).unwrap()).unwrap();
+    let o = p.legume(&["plan", file.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    assert!(stderr(&o).ends_with(other), "{}", stderr(&o));
     assert!(!bench.join("tools").exists());
 }
 
