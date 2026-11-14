@@ -202,6 +202,18 @@ pub fn main(args: &[String], out: &mut dyn Write) -> Result<()> {
         .filter(|a| named.is_empty() || named.contains(&a.name))
         .collect();
     let (servers, left) = servers();
+    connect(&project, &agents, &servers, &left, out)
+}
+
+/// The project connected to `agents`, with `servers` (and the tools `left`
+/// out, to say): their settings, the instructions, and how to start each.
+fn connect(
+    project: &Path,
+    agents: &[&Agent],
+    servers: &[(String, String)],
+    left: &[&str],
+    out: &mut dyn Write,
+) -> Result<()> {
     writeln!(out, "Project: {}", project.display())?;
     let names: Vec<&str> = servers.iter().map(|s| s.0.as_str()).collect();
     writeln!(out, "Servers: {}", names.join(", "))?;
@@ -212,10 +224,10 @@ pub fn main(args: &[String], out: &mut dyn Write) -> Result<()> {
             left.join(", ")
         )?;
     }
-    mark(&project)?;
+    mark(project)?;
     let mut failed = Vec::new();
-    for a in &agents {
-        let saved = match save(&project, a.file, a.format, &servers) {
+    for a in agents {
+        let saved = match save(project, a.file, a.format, servers) {
             Ok(saved) => saved,
             Err(e) => {
                 writeln!(out, "Not written for {}: {e:#}", a.name)?;
@@ -223,7 +235,7 @@ pub fn main(args: &[String], out: &mut dyn Write) -> Result<()> {
                 continue;
             }
         };
-        let at = rel(&project, &saved.path);
+        let at = rel(project, &saved.path);
         if !saved.changed {
             writeln!(out, "{at} for {} lists them all already", a.name)?;
         } else {
@@ -237,7 +249,7 @@ pub fn main(args: &[String], out: &mut dyn Write) -> Result<()> {
             }
         }
         if a.flag == "--claude" {
-            approved(&project, &servers, &saved.ours, out, &mut failed)?;
+            approved(project, servers, &saved.ours, out, &mut failed)?;
         }
     }
     let claude = agents.iter().any(|a| a.flag == "--claude");
@@ -256,15 +268,12 @@ pub fn main(args: &[String], out: &mut dyn Write) -> Result<()> {
         }
     }
     writeln!(out)?;
-    let here: Vec<&&Agent> = agents
+    let here: Vec<&Agent> = agents
         .iter()
         .filter(|a| a.programs.iter().any(|p| crate::on_path(p).is_some()))
+        .copied()
         .collect();
-    for a in if here.is_empty() {
-        agents.iter().collect()
-    } else {
-        here.clone()
-    } {
+    for a in if here.is_empty() { agents } else { &here } {
         writeln!(out, "{}", a.start)?;
     }
     let elsewhere: Vec<&str> = agents
@@ -343,8 +352,8 @@ struct Saved {
     path: PathBuf,
     /// The servers listed there already, kept as they are.
     kept: Vec<String>,
-    /// The servers listed as `legume init` writes them ([`entry`]), new or
-    /// kept.
+    /// The servers listed as `legume init` writes them: in JSON settings,
+    /// new or kept ([`entry`]); in Codex's TOML, the new ones only.
     ours: Vec<String>,
     /// Whether the file changed (it is not written when it would not).
     changed: bool,
@@ -481,11 +490,18 @@ fn object(old: Option<&[u8]>, path: &Path) -> Result<serde_json::Map<String, Val
 
 /// The folder the file at `path` goes in, made if it is not there.
 fn folder_for(path: &Path) -> Result<&Path> {
+    let dir = parent_folder(path)?;
+    std::fs::create_dir_all(dir).with_context(|| format!("making {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// The folder the file at `path` goes in (not made), unless something
+/// other than a folder is there.
+fn parent_folder(path: &Path) -> Result<&Path> {
     let dir = path.parent().context("a file in the project")?;
     if std::fs::symlink_metadata(dir).is_ok_and(|m| !m.is_dir()) {
         anyhow::bail!("{} is not a folder", dir.display());
     }
-    std::fs::create_dir_all(dir).with_context(|| format!("making {}", dir.display()))?;
     Ok(dir)
 }
 
@@ -493,10 +509,16 @@ fn folder_for(path: &Path) -> Result<&Path> {
 const CLAUDE_LOCAL: &str = ".claude/settings.local.json";
 
 /// What [`approve`] did.
-struct Approval {
-    changed: bool,
-    /// Git tracks the file, so Claude Code does not use it.
-    tracked: bool,
+enum Approval {
+    /// The project approves all its servers already.
+    All,
+    /// The servers approved one by one.
+    Listed {
+        /// Whether any was added.
+        changed: bool,
+        /// Those left off, as the user turned them off.
+        off: Vec<String>,
+    },
 }
 
 /// The servers listed as `legume init` writes them (`ours`, of `servers`)
@@ -509,8 +531,15 @@ fn approved(
     out: &mut dyn Write,
     failed: &mut Vec<&str>,
 ) -> Result<()> {
-    let done = match approve(project, ours) {
-        Ok(done) => done,
+    let (changed, off) = match approve(project, ours) {
+        Ok(Approval::All) => {
+            writeln!(
+                out,
+                "{CLAUDE_LOCAL} approves all the project's servers for Claude Code already"
+            )?;
+            return Ok(());
+        }
+        Ok(Approval::Listed { changed, off }) => (changed, off),
         Err(e) => {
             writeln!(
                 out,
@@ -520,13 +549,21 @@ fn approved(
             return Ok(());
         }
     };
-    if done.changed {
+    let on_already = !changed && ours.iter().any(|n| !off.contains(n));
+    if changed {
         writeln!(
             out,
             "Approved them for Claude Code in {CLAUDE_LOCAL} (it will not ask each time)"
         )?;
-    } else if !ours.is_empty() {
+    } else if on_already {
         writeln!(out, "{CLAUDE_LOCAL} approves them for Claude Code already")?;
+    }
+    if !off.is_empty() {
+        writeln!(
+            out,
+            "  left off, as you turned them off there: {}",
+            off.join(", ")
+        )?;
     }
     let asked: Vec<&str> = servers
         .iter()
@@ -536,16 +573,9 @@ fn approved(
     if !asked.is_empty() {
         writeln!(
             out,
-            "  not approved, as .mcp.json lists them its own way (Claude Code asks about \
-             these): {}",
+            "  not approved, as .mcp.json lists them otherwise than legume init writes them \
+             (Claude Code asks about these): {}",
             asked.join(", ")
-        )?;
-    }
-    if done.tracked {
-        writeln!(
-            out,
-            "  git tracks {CLAUDE_LOCAL}, so Claude Code does not use it: \
-             `git rm --cached {CLAUDE_LOCAL}` keeps it yours alone"
         )?;
     }
     Ok(())
@@ -553,58 +583,52 @@ fn approved(
 
 /// The servers listed as `legume init` writes them (`ours`, from [`save`])
 /// approved for Claude Code in the project ([`CLAUDE_LOCAL`]'s
-/// `enabledMcpjsonServers`), so it does not ask each time it starts; an
-/// entry the project lists its own way is left for Claude Code to ask
-/// about. The user's own entries are kept, a server they turned off
-/// (`disabledMcpjsonServers`) stays off, and a project that approves all
-/// its servers is left as it is. Claude Code applies the approvals only
-/// while git does not track the file, so it is ignored ([`ignore_local`]).
+/// `enabledMcpjsonServers`), so it does not ask each time it starts; one
+/// `.mcp.json` lists otherwise is left for Claude Code to ask about. The
+/// user's own entries are kept, a server in its `disabledMcpjsonServers`
+/// stays off, and a project that approves all its servers is left as it
+/// is. Claude Code applies the approvals only while git does not track the
+/// file, so it is ignored ([`ignore_local`]). No git is run: the project
+/// is not yet trusted, and its git settings could run a program.
 fn approve(project: &Path, ours: &[String]) -> Result<Approval> {
     let path = project.join(CLAUDE_LOCAL);
+    let dir = parent_folder(&path)?;
     let old = read_own(&path)?;
     let mut root = object(old.as_deref(), &path)?;
-    let mut changed = false;
-    if root.get("enableAllProjectMcpServers") != Some(&json!(true)) {
-        let off = root
-            .get("disabledMcpjsonServers")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let on = root
-            .entry("enabledMcpjsonServers")
-            .or_insert_with(|| json!([]))
-            .as_array_mut()
-            .with_context(|| format!("{}'s enabledMcpjsonServers is not a list", path.display()))?;
-        for name in ours.iter().map(|n| json!(n)) {
-            if !on.contains(&name) && !off.contains(&name) {
-                on.push(name);
-                changed = true;
-            }
+    if root.get("enableAllProjectMcpServers") == Some(&json!(true)) {
+        return Ok(Approval::All);
+    }
+    let off = root
+        .get("disabledMcpjsonServers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let on = root
+        .entry("enabledMcpjsonServers")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .with_context(|| format!("{}'s enabledMcpjsonServers is not a list", path.display()))?;
+    let (mut changed, mut left_off) = (false, Vec::new());
+    for name in ours {
+        let n = json!(name);
+        if off.contains(&n) {
+            left_off.push(name.clone());
+        } else if !on.contains(&n) {
+            on.push(n);
+            changed = true;
         }
     }
     if changed {
-        ignore_local(folder_for(&path)?)?;
+        std::fs::create_dir_all(dir).with_context(|| format!("making {}", dir.display()))?;
+        ignore_local(dir)?;
         replace(
             &path,
             (serde_json::to_string_pretty(&root)? + "\n").as_bytes(),
         )?;
     }
-    Ok(Approval {
+    Ok(Approval::Listed {
         changed,
-        tracked: (old.is_some() || changed)
-            && git(project, &["ls-files", "--error-unmatch", CLAUDE_LOCAL]),
-    })
-}
-
-/// Whether `git` in `dir` with `args` succeeds (false when there is no git).
-fn git(dir: &Path, args: &[&str]) -> bool {
-    crate::on_path("git").is_some_and(|git| {
-        quiet(
-            std::process::Command::new(git)
-                .arg("-C")
-                .arg(dir)
-                .args(args),
-        )
+        off: left_off,
     })
 }
 
@@ -619,14 +643,10 @@ fn quiet(cmd: &mut std::process::Command) -> bool {
 }
 
 /// `settings.local.json` named in the `.gitignore` of Claude Code's folder
-/// `dir`, beside whatever the user keeps there, unless git ignores it
-/// already: Claude Code ignores the file for git only when it writes the
-/// file itself.
+/// `dir`, beside whatever the user keeps there: Claude Code ignores the
+/// file for git only when it writes the file itself.
 fn ignore_local(dir: &Path) -> Result<()> {
     let name = CLAUDE_LOCAL.rsplit('/').next().unwrap_or(CLAUDE_LOCAL);
-    if git(dir, &["check-ignore", "-q", name]) {
-        return Ok(());
-    }
     let path = dir.join(".gitignore");
     let mut text = read_own_text(&path)?.unwrap_or_default();
     if text.lines().any(|l| l.trim() == name) {
@@ -869,11 +889,7 @@ mod tests {
     #[test]
     fn each_agent_gets_the_servers_in_its_own_form() {
         let dir = tempfile::tempdir().unwrap();
-        let write = |f: &str, text: &str| {
-            let p = dir.path().join(f);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(p, text).unwrap();
-        };
+        let write = |f: &str, text: &str| write(dir.path(), f, text);
         write(
             ".codex/config.toml",
             "model = \"o4\"\n\n[mcp_servers.senna]\ncommand = \"/opt/senna\"\nargs = [\"mcp\"]\n",
@@ -953,19 +969,31 @@ mod tests {
             .collect()
     }
 
+    /// `text` written to `f` in `dir`, its folders made.
+    fn write(dir: &Path, f: &str, text: &str) {
+        let p = dir.join(f);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+
+    /// What [`approve`] did, for a project that approves servers one by one.
+    fn listed(a: Approval) -> (bool, Vec<String>) {
+        match a {
+            Approval::Listed { changed, off } => (changed, off),
+            Approval::All => panic!("all approved"),
+        }
+    }
+
     fn read_json(path: &Path) -> Value {
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
     }
 
-    /// `legume init --claude` in `dir`: whether it went, and what it said.
+    /// `legume init --claude` in `dir`, with two servers whatever is on
+    /// the PATH: whether it went, and what it said.
     fn init_claude(dir: &Path) -> (Result<()>, String) {
+        let claude: Vec<&Agent> = AGENTS.iter().filter(|a| a.flag == "--claude").collect();
         let mut out = Vec::new();
-        let args = [
-            "--project".into(),
-            dir.display().to_string(),
-            "--claude".into(),
-        ];
-        let r = main(&args, &mut out);
+        let r = connect(dir, &claude, &named(&["legume", "senna"]), &[], &mut out);
         (r, String::from_utf8(out).unwrap())
     }
 
@@ -994,7 +1022,9 @@ mod tests {
             ["legume", "senna", "cocoa"],
             "not pinto: its own"
         );
-        assert!(approve(dir.path(), &saved.ours).unwrap().changed);
+        let (changed, off) = listed(approve(dir.path(), &saved.ours).unwrap());
+        assert!(changed);
+        assert_eq!(off, ["senna"], "said to be left off");
         let v = read_json(&path);
         assert_eq!(
             v["enabledMcpjsonServers"],
@@ -1008,7 +1038,7 @@ mod tests {
         );
         assert_eq!(v["disabledMcpjsonServers"], json!(["senna"]));
         assert!(
-            !approve(dir.path(), &saved.ours).unwrap().changed,
+            !listed(approve(dir.path(), &saved.ours).unwrap()).0,
             "nothing new the second time"
         );
         assert_eq!(
@@ -1018,7 +1048,10 @@ mod tests {
         );
 
         std::fs::write(&path, r#"{"enableAllProjectMcpServers":true}"#).unwrap();
-        assert!(!approve(dir.path(), &saved.ours).unwrap().changed);
+        assert!(matches!(
+            approve(dir.path(), &saved.ours).unwrap(),
+            Approval::All
+        ));
         assert_eq!(
             read_json(&path),
             json!({ "enableAllProjectMcpServers": true })
@@ -1030,7 +1063,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let servers = named(&["legume", "senna"]);
         let saved = save(dir.path(), ".mcp.json", Format::McpServers, &servers).unwrap();
-        assert!(approve(dir.path(), &saved.ours).unwrap().changed);
+        assert!(listed(approve(dir.path(), &saved.ours).unwrap()).0);
         assert_eq!(
             read_json(&dir.path().join(CLAUDE_LOCAL)),
             json!({ "enabledMcpjsonServers": ["legume", "senna"] })
@@ -1042,20 +1075,8 @@ mod tests {
 
         // Nothing to approve: no folder made.
         let none = tempfile::tempdir().unwrap();
-        assert!(!approve(none.path(), &[]).unwrap().changed);
+        assert!(!listed(approve(none.path(), &[]).unwrap()).0);
         assert!(!none.path().join(".claude").exists());
-    }
-
-    #[test]
-    fn approvals_git_tracks_are_reported() {
-        let dir = tempfile::tempdir().unwrap();
-        if !git(dir.path(), &["init", "-q"]) {
-            return; // no git here
-        }
-        let ours = ["legume".to_string()];
-        assert!(!approve(dir.path(), &ours).unwrap().tracked);
-        assert!(git(dir.path(), &["add", "-f", CLAUDE_LOCAL]));
-        assert!(approve(dir.path(), &ours).unwrap().tracked);
     }
 
     #[test]
@@ -1090,9 +1111,46 @@ mod tests {
         let (r, out) = init_claude(third.path());
         assert!(r.is_err());
         assert!(
-            out.contains("Not approved for Claude Code (it asks"),
+            out.contains("Not approved for Claude Code (it asks")
+                && out.contains("is not a folder"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn init_says_what_claude_code_will_ask_about() {
+        // The project lists legume its own way; `settings` are Claude
+        // Code's local settings there.
+        let with = |settings: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            write(dir.path(), CLAUDE_LOCAL, settings);
+            write(
+                dir.path(),
+                ".mcp.json",
+                r#"{"mcpServers":{"legume":{"command":"sh"}}}"#,
+            );
+            let (r, out) = init_claude(dir.path());
+            assert!(r.is_ok(), "{out}");
+            out
+        };
+        let out = with(r#"{"disabledMcpjsonServers":["senna"]}"#);
+        assert!(
+            !out.contains("Approved them") && !out.contains("approves them"),
+            "{out}"
+        );
+        assert!(
+            out.contains("left off, as you turned them off there: senna"),
+            "{out}"
+        );
+        assert!(
+            out.contains("(Claude Code asks about these): legume"),
+            "{out}"
+        );
+
+        // All approved already: nothing to ask about.
+        let out = with(r#"{"enableAllProjectMcpServers":true}"#);
+        assert!(out.contains("approves all the project's servers"), "{out}");
+        assert!(!out.contains("asks about"), "{out}");
     }
 
     #[test]

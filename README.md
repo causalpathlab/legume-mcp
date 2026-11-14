@@ -127,9 +127,11 @@ It writes all of them, or only those named (`--claude`, `--codex`,
 `--cursor`, `--vscode`, `--gemini`, `--antigravity`, `--opencode`). Servers
 already listed are kept as they are. For Claude Code the servers listed as
 init writes them are also approved in `.claude/settings.local.json`
-(`enabledMcpjsonServers`, kept out of git), so it asks only to trust the
-folder; an entry the project came with is left for Claude Code to ask
-about, and a server you turned off stays off. The instructions are one section of
+(`enabledMcpjsonServers`, named in `.claude/.gitignore`), so it asks only
+to trust the folder; one `.mcp.json` lists otherwise is left for Claude
+Code to ask about, and one in `disabledMcpjsonServers` stays off. Claude
+Code applies these approvals only while git does not track that file. The
+instructions are one section of
 `AGENTS.md` (and of `CLAUDE.md`), between two marked lines: init rewrites
 that section and leaves the rest of the file to you. They are how to work
 with the person and the tools: the rule (the person thinks; the agent runs
