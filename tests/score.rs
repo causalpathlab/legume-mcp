@@ -11,7 +11,7 @@ use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::types::Type;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 
 /// `legume` with `args`, its output captured.
@@ -20,6 +20,33 @@ fn legume(args: &[&str]) -> Output {
         .args(args)
         .output()
         .unwrap()
+}
+
+/// `legume` with `args`, the argument `piped` replaced by `/dev/stdin` and
+/// `input` fed through it: a stream that cannot be opened twice, as
+/// `<(...)` is.
+fn legume_fed(args: &[String], piped: &Path, input: Vec<u8>) -> Output {
+    let piped = piped.to_str().unwrap();
+    assert!(args.iter().any(|a| a == piped), "{piped} is no argument");
+    let args = args
+        .iter()
+        .map(|a| if a == piped { "/dev/stdin" } else { a });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_legume"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    // A run that stops reading closes the pipe: that write error is the
+    // run's answer, not the test's.
+    let feed = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+    let o = child.wait_with_output().unwrap();
+    feed.join().unwrap();
+    o
 }
 
 fn stderr(o: &Output) -> String {
@@ -398,7 +425,8 @@ fn a_duplicate_score_key_fails_and_dup_max_keeps_the_max() {
     assert_eq!(roc.get("unscored"), "0");
 }
 
-// Weights 0.5, 1 and 1.5 above 1: only the last is a positive.
+// Weights 0.5, 1 and 1.5 above 1: only the last is a positive. K9, outside
+// the universe, is a labelled negative, so no truth is outside it.
 #[test]
 fn above_is_strict() {
     let dir = tempfile::tempdir().unwrap();
@@ -414,7 +442,7 @@ fn above_is_strict() {
     tsv(
         &truth,
         "key\tw",
-        &["K1\t0.5", "K2\t1", "K3\t1.5"].map(String::from),
+        &["K1\t0.5", "K2\t1", "K3\t1.5", "K9\t0.5"].map(String::from),
     );
     tsv(
         &scores,
@@ -449,6 +477,7 @@ fn above_is_strict() {
     let roc = row(&rows, "M1", "auroc");
     assert_eq!(roc.get("n_pos"), "1");
     assert_eq!(roc.get("n_neg"), "3");
+    assert_eq!(roc.get("outside_pos"), "0");
     // K3 at 3 beats K1 and K2, loses to K4.
     near(roc.num("value"), 2.0 / 3.0);
 }
@@ -512,6 +541,149 @@ fn a_p_of_0_is_inf_and_warned_of() {
     assert_eq!(ap.get("n_inf"), "1");
     assert_eq!(ap.get("unscored"), "1");
     near(ap.num("value"), 1.0);
+}
+
+// The warning is for more than 1% of the scored items at +inf: 2 of 200 is
+// 1% and quiet, 3 of 200 warns, none is quiet.
+#[test]
+fn inf_is_warned_of_only_above_1_percent_of_the_scored() {
+    for (zeros, warned) in [(0, false), (2, false), (3, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let p: Vec<&str> = (0..200)
+            .map(|i| if i < zeros { "0" } else { "0.5" })
+            .collect();
+        let o = neglog10(dir.path(), &p);
+        assert!(o.status.success(), "{}", stderr(&o));
+        assert_eq!(
+            stderr(&o).contains("warning:"),
+            warned,
+            "{zeros} of 200 at p = 0: {}",
+            stderr(&o)
+        );
+        let rows = rows(&dir.path().join("out.score.tsv"));
+        assert_eq!(row(&rows, "M1", "auroc").get("n_inf"), zeros.to_string());
+    }
+}
+
+/// The arguments of a run over the files in `dir`, keyed `key`, scoring
+/// each of `score` (`NAME=COLUMN`).
+fn keyed_args<'a>(dir: &'a Path, score: &[&'a str]) -> Vec<String> {
+    let at = |f: &str| dir.join(f).to_str().unwrap().to_string();
+    let mut a: Vec<String> = ["score", "--scores", &at("scores.tsv"), "--key", "key"]
+        .map(String::from)
+        .to_vec();
+    for sc in score {
+        a.extend(["--score".to_string(), sc.to_string()]);
+    }
+    a.extend(
+        [
+            "--truth",
+            &at("truth.tsv"),
+            "--truth-key",
+            "key",
+            "--universe",
+            &at("universe.tsv"),
+            "--universe-key",
+            "key",
+            "-o",
+            &at("out.score.tsv"),
+        ]
+        .map(String::from),
+    );
+    a
+}
+
+// K1 (true) at -5, K2 at -3, K3 at 6. As written K1 is last, AUROC 0;
+// negated it is first, 1; by magnitude it falls between K3 and K2, 1/2.
+#[test]
+fn abs_ranks_by_magnitude() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    tsv(
+        &d.join("universe.tsv"),
+        "key",
+        &["K1", "K2", "K3"].map(String::from),
+    );
+    tsv(&d.join("truth.tsv"), "key", &["K1".into()]);
+    tsv(
+        &d.join("scores.tsv"),
+        "key\tv",
+        &["K1\t-5", "K2\t-3", "K3\t6"].map(String::from),
+    );
+    let a = keyed_args(d, &["M1=v", "M2=neg:v", "M3=abs:v"]);
+    let o = legume(&a.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(o.status.success(), "{}", stderr(&o));
+    let rows = rows(&d.join("out.score.tsv"));
+    near(row(&rows, "M1", "auroc").num("value"), 0.0);
+    near(row(&rows, "M2", "auroc").num("value"), 1.0);
+    near(row(&rows, "M3", "auroc").num("value"), 0.5);
+}
+
+/// Universe K1, K2, K3; truth K1; scores K1 3, K2 2, K3 1 (AUROC 1). The
+/// truth gzipped as well, as `truth.tsv.gz`.
+fn ranked_in_order(d: &Path) {
+    tsv(
+        &d.join("universe.tsv"),
+        "key",
+        &["K1", "K2", "K3"].map(String::from),
+    );
+    tsv(&d.join("truth.tsv"), "key", &["K1".into()]);
+    tsv(&d.join("truth.tsv.gz"), "key", &["K1".into()]);
+    let scores = ["K1\t3", "K2\t2", "K3\t1"].map(String::from);
+    tsv(&d.join("scores.tsv"), "key\tv", &scores);
+}
+
+// A truth or scores file given as a pipe (`<(...)`, `/dev/stdin`) is read
+// from its first byte: the bytes looked at to tell the format are not lost,
+// gzipped or not.
+#[test]
+fn a_piped_truth_or_scores_file_is_read_whole() {
+    for (arg, fed) in [
+        ("truth.tsv", "truth.tsv"),
+        ("scores.tsv", "scores.tsv"),
+        ("truth.tsv", "truth.tsv.gz"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        ranked_in_order(d);
+        let a = keyed_args(d, &["M1=v"]);
+        let o = legume_fed(&a, &d.join(arg), std::fs::read(d.join(fed)).unwrap());
+        assert!(o.status.success(), "{fed} piped: {}", stderr(&o));
+        let rows = rows(&d.join("out.score.tsv"));
+        let roc = row(&rows, "M1", "auroc");
+        assert_eq!(roc.get("n_pos"), "1", "{fed} piped");
+        assert_eq!(roc.get("unscored"), "0", "{fed} piped");
+        near(roc.num("value"), 1.0);
+    }
+}
+
+// Parquet is read by seeking, which a pipe cannot do: refused, and why.
+#[test]
+fn a_piped_parquet_is_refused_with_the_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    ranked_in_order(d);
+    let one = d.join("scores.parquet");
+    parquet(
+        &one,
+        &[
+            (
+                "key",
+                Col::Str(["K1", "K2", "K3"].map(String::from).to_vec()),
+            ),
+            ("v", Col::F64(vec![3.0, 2.0, 1.0])),
+        ],
+        Compression::SNAPPY,
+    );
+    let a = keyed_args(d, &["M1=v"]);
+    let o = legume_fed(&a, &d.join("scores.tsv"), std::fs::read(&one).unwrap());
+    assert!(!o.status.success());
+    let e = stderr(&o);
+    assert!(
+        e.contains("parquet") && e.contains("not a regular file"),
+        "{e}"
+    );
+    assert!(!d.join("out.score.tsv").exists());
 }
 
 // pinto `lra-simulate --one`: one parquet holds the pairs, the planted

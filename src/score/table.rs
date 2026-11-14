@@ -8,7 +8,7 @@ use flate2::write::GzEncoder;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::Field;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 
 /// One cell, as the file holds it.
@@ -57,28 +57,43 @@ impl Value {
 /// The columns `want` of the table at `path`, in that order, each a value
 /// per row.
 pub fn read(path: &Path, want: &[&str]) -> Result<Vec<Vec<Value>>> {
-    let mut magic = [0u8; 4];
-    let n = File::open(path)
-        .with_context(|| format!("cannot open {}", path.display()))?
-        .read(&mut magic)?;
-    let columns = if n == 4 && &magic == b"PAR1" {
-        read_parquet(path, want)
+    let (head, file) = open_peeked(path)?;
+    let columns = if head == b"PAR1" {
+        read_parquet(file, want)
     } else {
-        read_tsv(open_text(path)?, want)
+        read_tsv(text(head, file), want)
     };
     columns.with_context(|| format!("reading {}", path.display()))
 }
 
 /// A text file's lines, gunzipped when it is gzip.
 pub fn open_text(path: &Path) -> Result<Box<dyn BufRead>> {
-    let open = || File::open(path).with_context(|| format!("cannot open {}", path.display()));
-    let mut magic = [0u8; 2];
-    let n = open()?.read(&mut magic)?;
-    Ok(if n == 2 && magic == [0x1f, 0x8b] {
-        Box::new(BufReader::new(MultiGzDecoder::new(open()?)))
+    let (head, file) = open_peeked(path)?;
+    Ok(text(head, file))
+}
+
+/// The file at `path`, opened once, and its first four bytes (fewer when
+/// it is shorter), read to tell the format. Once only: a pipe, as `<(...)`
+/// gives, opened again would go on from where the last read stopped.
+fn open_peeked(path: &Path) -> Result<(Vec<u8>, File)> {
+    let mut file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let mut head = Vec::with_capacity(4);
+    (&mut file)
+        .take(4)
+        .read_to_end(&mut head)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    Ok((head, file))
+}
+
+/// The lines of `head` then the rest of `file`, gunzipped when it is gzip.
+fn text(head: Vec<u8>, file: File) -> Box<dyn BufRead> {
+    let gzip = head.starts_with(&[0x1f, 0x8b]);
+    let whole = Cursor::new(head).chain(file);
+    if gzip {
+        Box::new(BufReader::new(MultiGzDecoder::new(whole)))
     } else {
-        Box::new(BufReader::new(open()?))
-    })
+        Box::new(BufReader::new(whole))
+    }
 }
 
 /// A text file being written, gzipped when its name ends in `.gz`.
@@ -170,8 +185,16 @@ fn read_tsv(text: Box<dyn BufRead>, want: &[&str]) -> Result<Vec<Vec<Value>>> {
     Ok(columns)
 }
 
-fn read_parquet(path: &Path, want: &[&str]) -> Result<Vec<Vec<Value>>> {
-    let reader = SerializedFileReader::new(File::open(path)?)?;
+/// The columns `want` of the parquet `file`, read by seeking, so a regular
+/// file only.
+fn read_parquet(file: File, want: &[&str]) -> Result<Vec<Vec<Value>>> {
+    if !file.metadata()?.is_file() {
+        bail!(
+            "parquet is read by seeking, and this is not a regular file (a pipe?); write it to \
+             a file first"
+        );
+    }
+    let reader = SerializedFileReader::new(file)?;
     let schema = reader.metadata().file_metadata().schema_descr_ptr();
     let names: Vec<String> = schema
         .root_schema()

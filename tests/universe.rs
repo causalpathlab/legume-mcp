@@ -6,7 +6,7 @@ use flate2::write::GzEncoder;
 use legume_mcp::universe::{chr_stripped, cis_pairs, parse_peak, Gene, Pair, Peak};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 fn legume(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_legume"))
@@ -189,6 +189,54 @@ fn universe_cis_writes_gene_peak_distance_and_says_how_many() {
     let said = String::from_utf8_lossy(&o.stdout);
     for line in ["rows\t3", "genes\t2", "max_per_gene\t2"] {
         assert!(said.lines().any(|l| l == line), "{line} not in\n{said}");
+    }
+}
+
+// A file given as a pipe (`<(...)`, `/dev/stdin`) is read from its first
+// byte. Losing the bytes looked at to tell gzip would leave the first peak
+// "r1:990-1010", still a name that parses, and one row of two.
+#[test]
+fn a_piped_gene_or_peak_file_is_read_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let genes = dir.path().join("sim.gene_coords.tsv.gz");
+    let peaks = dir.path().join("sim.peak_names.txt");
+    let out = dir.path().join("cis.tsv");
+    gzip(&genes, "gene\tchr\ttss\nGENE1\tchr1\t1000\n");
+    std::fs::write(&peaks, "chr1:990-1010\nchr1:995-1005\n").unwrap();
+    for piped in [&genes, &peaks] {
+        let arg = |p: &Path| {
+            if p == piped {
+                "/dev/stdin".to_string()
+            } else {
+                p.to_str().unwrap().to_string()
+            }
+        };
+        let mut child = Command::new(env!("CARGO_BIN_EXE_legume"))
+            .args(["universe", "cis", "--gene-coords", &arg(&genes)])
+            .args(["--peaks", &arg(&peaks), "--window", "100"])
+            .args(["-o", out.to_str().unwrap()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let input = std::fs::read(piped).unwrap();
+        // A run that stops reading closes the pipe: that write error is the
+        // run's answer, not the test's.
+        let feed = std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+        let o = child.wait_with_output().unwrap();
+        feed.join().unwrap();
+        let e = String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.success(), "{} piped: {e}", piped.display());
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "gene\tpeak\tdistance\nGENE1\tchr1:990-1010\t0\nGENE1\tchr1:995-1005\t0\n",
+            "{} piped",
+            piped.display()
+        );
     }
 }
 
