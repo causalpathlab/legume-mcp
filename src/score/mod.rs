@@ -162,20 +162,22 @@ struct Spec {
 }
 
 /// The universe's items, each once, in the order first seen.
-struct Items {
-    index: HashMap<String, usize>,
+struct Items<'a> {
+    index: HashMap<&'a str, usize>,
     rows: usize,
 }
 
-impl Items {
-    fn new(keys: Vec<String>) -> Self {
-        let rows = keys.len();
-        let mut index = HashMap::with_capacity(rows);
+impl<'a> Items<'a> {
+    fn new(keys: &'a [String]) -> Self {
+        let mut index = HashMap::with_capacity(keys.len());
         for k in keys {
             let next = index.len();
-            index.entry(k).or_insert(next);
+            index.entry(k.as_str()).or_insert(next);
         }
-        Items { index, rows }
+        Items {
+            index,
+            rows: keys.len(),
+        }
     }
 
     fn len(&self) -> usize {
@@ -202,10 +204,25 @@ fn keys(columns: &[Vec<Value>], names: &[String]) -> Result<Vec<String>> {
         .collect()
 }
 
-/// The keys of the table at `path`.
-fn read_keys(path: &Path, key: &[String]) -> Result<Vec<String>> {
-    let names: Vec<&str> = key.iter().map(String::as_str).collect();
-    keys(&table::read(path, &names)?, key).with_context(|| format!("keys of {}", path.display()))
+/// A table read for its keys: each row's key, and the other columns asked
+/// for, in the order asked.
+struct Keyed {
+    keys: Vec<String>,
+    columns: Vec<Vec<Value>>,
+}
+
+/// The table at `path`, read once: its keys by the columns `key`, and the
+/// columns `extra` beside them.
+fn read_keyed(path: &Path, key: &[String], extra: &[&str]) -> Result<Keyed> {
+    let mut want: Vec<&str> = key.iter().map(String::as_str).collect();
+    want.extend_from_slice(extra);
+    let mut columns = table::read(path, &want)?;
+    let extra = columns.split_off(key.len());
+    let keys = keys(&columns, key).with_context(|| format!("keys of {}", path.display()))?;
+    Ok(Keyed {
+        keys,
+        columns: extra,
+    })
 }
 
 /// The truth over the universe: which items are positive, and how many
@@ -217,29 +234,25 @@ struct Truth {
     outside_pos: usize,
 }
 
-fn read_truth(spec: &Spec, items: &Items) -> Result<Truth> {
-    let mut want: Vec<&str> = spec.truth_key.iter().map(String::as_str).collect();
-    if let Some((col, _)) = &spec.label {
-        want.push(col);
-    }
-    let mut columns = table::read(&spec.truth, &want)?;
-    let label = spec.label.as_ref().map(|(col, above)| {
-        let values = columns.pop().expect("the label column was read");
-        (col, *above, values)
-    });
-    let keys = keys(&columns, &spec.truth_key)
-        .with_context(|| format!("keys of {}", spec.truth.display()))?;
+/// The truth of the rows `keys`, each positive or, with `--label`, positive
+/// when its cell of `label` is above the value.
+fn truth_of(
+    spec: &Spec,
+    keys: &[String],
+    label: Option<&Vec<Value>>,
+    items: &Items,
+) -> Result<Truth> {
     let mut labels = vec![false; items.len()];
     let mut outside = HashSet::new();
     for (i, key) in keys.iter().enumerate() {
-        let positive = match &label {
-            None => true,
-            Some((col, above, values)) => values[i]
+        let positive = match (&spec.label, label) {
+            (Some((col, above)), Some(values)) => values[i]
                 .number()
                 .with_context(|| format!("row {} of {col} in {}", i + 1, spec.truth.display()))?
                 .is_some_and(|v| v > *above),
+            _ => true,
         };
-        match items.index.get(key) {
+        match items.index.get(key.as_str()) {
             Some(&at) => labels[at] |= positive,
             None if positive => {
                 outside.insert(key.as_str());
@@ -271,17 +284,9 @@ fn higher(a: Option<f64>, b: Option<f64>) -> Option<f64> {
     }
 }
 
-/// The scores file, read once: each row's key, and each `--score`'s column.
-fn read_score_table(spec: &Spec) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
-    let mut want: Vec<&str> = spec.key.iter().map(String::as_str).collect();
-    want.extend(spec.score.iter().map(|s| s.column.as_str()));
-    let mut columns = table::read(&spec.scores, &want)?;
-    let scores = columns.split_off(spec.key.len());
-    let keys =
-        keys(&columns, &spec.key).with_context(|| format!("keys of {}", spec.scores.display()))?;
-    Ok((keys, scores))
-}
-
+/// Each `--score` over the universe, from the rows `keys` and the score
+/// columns `columns`. A row outside the universe is counted and its scores
+/// never read, so a cell it holds cannot fail the run.
 fn read_scores(
     spec: &Spec,
     items: &Items,
@@ -292,31 +297,22 @@ fn read_scores(
     let mut seen = vec![false; items.len()];
     let (mut outside, mut duplicates, mut first_dup) = (0, 0, None);
     for (i, key) in keys.iter().enumerate() {
-        let mut row = Vec::with_capacity(spec.score.len());
-        for (s, col) in spec.score.iter().zip(columns) {
-            let at = || format!("row {} of {} in {}", i + 1, s.column, spec.scores.display());
-            let x = col[i].number().with_context(at)?;
-            row.push(
-                x.map(|x| s.transform.apply(x))
-                    .transpose()
-                    .with_context(at)?,
-            );
-        }
-        let Some(&at) = items.index.get(key) else {
+        let Some(&at) = items.index.get(key.as_str()) else {
             outside += 1;
             continue;
         };
-        if seen[at] {
+        if std::mem::replace(&mut seen[at], true) {
             duplicates += 1;
             first_dup.get_or_insert(key);
-            for (v, x) in values.iter_mut().zip(row) {
-                v[at] = higher(v[at], x);
-            }
-        } else {
-            seen[at] = true;
-            for (v, x) in values.iter_mut().zip(row) {
-                v[at] = x;
-            }
+        }
+        for ((s, col), v) in spec.score.iter().zip(columns).zip(&mut values) {
+            let whence = || format!("row {} of {} in {}", i + 1, s.column, spec.scores.display());
+            let x = col[i].number().with_context(whence)?;
+            let x = x
+                .map(|x| s.transform.apply(x))
+                .transpose()
+                .with_context(whence)?;
+            v[at] = higher(v[at], x);
         }
     }
     if let (Dup::Fail, Some(key)) = (spec.dup, first_dup) {
@@ -345,16 +341,34 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// Score as `spec` says, write its table, and say what was counted on
 /// `out` and what to doubt on `err`.
 fn run(spec: &Spec, out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
-    if spec.universe == Universe::Same && !same_file(&spec.scores, &spec.truth) {
+    let same = spec.universe == Universe::Same;
+    if same && spec.scores != spec.truth && !same_file(&spec.scores, &spec.truth) {
         return Err(usage(
             "--universe same needs --truth and --scores to be one file; give the universe as a \
              file otherwise",
         ));
     }
-    let (score_keys, score_columns) = read_score_table(spec)?;
-    let items = match &spec.universe {
-        Universe::Same => Items::new(score_keys.clone()),
-        Universe::File { path, key } => Items::new(read_keys(path, key)?),
+    let label: Vec<&str> = spec.label.iter().map(|(col, _)| col.as_str()).collect();
+    let mut want: Vec<&str> = spec.score.iter().map(|s| s.column.as_str()).collect();
+    if same {
+        // The one file is read once, the label with the scores: a pipe
+        // cannot be read twice.
+        want.extend(&label);
+    }
+    let mut scores = read_keyed(&spec.scores, &spec.key, &want)?;
+    let same_label = scores.columns.split_off(spec.score.len());
+    let (universe_keys, truth_table);
+    let (items, truth_keys, truth_label) = match &spec.universe {
+        Universe::Same => (Items::new(&scores.keys), &scores.keys, same_label.first()),
+        Universe::File { path, key } => {
+            universe_keys = read_keyed(path, key, &[])?.keys;
+            truth_table = read_keyed(&spec.truth, &spec.truth_key, &label)?;
+            (
+                Items::new(&universe_keys),
+                &truth_table.keys,
+                truth_table.columns.first(),
+            )
+        }
     };
     writeln!(
         out,
@@ -363,7 +377,7 @@ fn run(spec: &Spec, out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
         items.rows - items.len()
     )?;
 
-    let truth = read_truth(spec, &items)?;
+    let truth = truth_of(spec, truth_keys, truth_label, &items)?;
     let positives = truth.labels.iter().filter(|&&p| p).count();
     writeln!(
         out,
@@ -382,7 +396,7 @@ fn run(spec: &Spec, out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
         .into());
     }
 
-    let scored = read_scores(spec, &items, &score_keys, &score_columns)?;
+    let scored = read_scores(spec, &items, &scores.keys, &scores.columns)?;
     writeln!(
         out,
         "scores: {} rows, {} outside the universe, {} duplicate keys",

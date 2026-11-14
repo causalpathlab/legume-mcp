@@ -351,13 +351,15 @@ fn scored_rows_outside_the_universe_are_dropped_and_counted() {
             "GENE2000\tPEAK1\t5".into(),
             "GENE2001\tPEAK2\t5".into(),
             "GENE2002\tPEAK3\tNaN".into(),
+            // Outside, so never read as a score.
+            "GENE2003\tPEAK4\tnot-a-score".into(),
         ],
     );
     let o = legume(&c.args(&c.universe_args()));
     assert!(o.status.success(), "{}", stderr(&o));
     let rows = rows(&c.out);
     let ap = row(&rows, "M1", "auprc");
-    assert_eq!(ap.get("outside_scored"), "3");
+    assert_eq!(ap.get("outside_scored"), "4");
     assert_eq!(ap.get("n_universe"), "1000");
     near(ap.num("value"), 0.208);
 
@@ -366,7 +368,7 @@ fn scored_rows_outside_the_universe_are_dropped_and_counted() {
     std::fs::remove_file(&c.out).unwrap();
     let o = legume(&a);
     assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
-    assert!(stderr(&o).contains('3'), "{}", stderr(&o));
+    assert!(stderr(&o).contains("4 scored rows"), "{}", stderr(&o));
     assert!(!c.out.exists());
 }
 
@@ -680,6 +682,60 @@ fn a_piped_truth_or_scores_file_is_read_whole() {
         assert_eq!(roc.get("n_pos"), "1", "{fed} piped");
         assert_eq!(roc.get("unscored"), "0", "{fed} piped");
         near(roc.num("value"), 1.0);
+    }
+}
+
+// One TSV holds the keys, the label and the scores. K1 (true) at 3, K2 at
+// 2, K4 at 1, then K3 (true) unscored: K1 beats both negatives, K3 loses
+// to both, AUROC 2/4. Given as a pipe it is read once, and whole.
+#[test]
+fn universe_same_reads_its_one_file_once_so_a_pipe_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let one = d.join("one.tsv");
+    let out = d.join("out.score.tsv");
+    tsv(
+        &one,
+        "key\tplanted\tv",
+        &["K1\t1\t3", "K2\t0\t2", "K3\t1\tNA", "K4\t0\t1"].map(String::from),
+    );
+    let a: Vec<String> = [
+        "score",
+        "--scores",
+        s(&one),
+        "--key",
+        "key",
+        "--score",
+        "M1=v",
+        "--truth",
+        s(&one),
+        "--truth-key",
+        "key",
+        "--label",
+        "planted",
+        "--above",
+        "0.5",
+        "--universe",
+        "same",
+        "-o",
+        s(&out),
+    ]
+    .map(String::from)
+    .to_vec();
+    for piped in [false, true] {
+        let o = if piped {
+            legume_fed(&a, &one, std::fs::read(&one).unwrap())
+        } else {
+            legume(&a.iter().map(String::as_str).collect::<Vec<_>>())
+        };
+        assert!(o.status.success(), "piped {piped}: {}", stderr(&o));
+        let said = String::from_utf8_lossy(&o.stdout);
+        assert!(said.contains("truth: 4 rows, 4 keys, 2 positive"), "{said}");
+        let rows = rows(&out);
+        let roc = row(&rows, "M1", "auroc");
+        near(roc.num("value"), 0.5);
+        assert_eq!(roc.get("n_pos"), "2", "piped {piped}");
+        assert_eq!(roc.get("unscored_pos"), "1", "piped {piped}");
     }
 }
 
