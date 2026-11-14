@@ -34,32 +34,33 @@ use super::key;
 use super::spec::{
     bad, is_plain_relative, AxisValue, Lane, Seeds, Spec, Stage, RESERVED, THREAD_VARS,
 };
+use super::tools::Resolved;
 use crate::command::refuse;
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// The tool word of `{legume}`, this program.
 pub const LEGUME: &str = "{legume}";
 
-/// A resolved tool: what runs, and its content key.
-#[derive(Clone, Debug)]
-pub struct Tool {
-    pub exec: PathBuf,
-    pub content_key: String,
-}
-
 /// What expanding a spec needs from outside it.
 pub struct Context<'a> {
     /// The benchmark's folder, absolute.
     pub dir: PathBuf,
-    /// Each tool word (and [`LEGUME`]).
-    pub tools: &'a HashMap<String, Tool>,
+    /// Each tool word's (and [`LEGUME`]'s) tool.
+    pub tools: &'a [Resolved],
     /// Each declared input: its absolute path and content key.
     pub inputs: &'a HashMap<String, (PathBuf, String)>,
+}
+
+impl Context<'_> {
+    /// The tool of `word`.
+    fn tool(&self, word: &str) -> Option<&Resolved> {
+        self.tools.iter().find(|t| t.word == word)
+    }
 }
 
 /// One cell, as `plan.json` lists it.
@@ -181,13 +182,21 @@ fn classify<'a>(name: &'a str, spec: &Spec) -> Option<Ph<'a>> {
         .then_some(Ph::Stage(name))
 }
 
-/// Each placeholder of `lane`'s argv, with where it is.
-fn placeholders<'a>(spec: &Spec, lane: &'a Lane) -> Result<Vec<(String, &'a str, Ph<'a>)>> {
+/// Each word of `lane`'s argv, with where it is, as its parts; refused
+/// when one does not parse or a placeholder names nothing.
+fn words<'a>(spec: &Spec, lane: &'a Lane) -> Result<Vec<(String, Vec<Part<'a>>)>> {
     let mut out = Vec::new();
     for (i, token) in lane.run.iter().enumerate() {
         let at = format!("{}.run[{i}]", lane.at);
+        let mut parts = Vec::new();
         for seg in segments(token).map_err(|e| bad(&at, e))? {
-            let Seg::Name(name) = seg else { continue };
+            let name = match seg {
+                Seg::Text(t) => {
+                    parts.push(Part::Text(t));
+                    continue;
+                }
+                Seg::Name(name) => name,
+            };
             let ph = classify(name, spec).ok_or_else(|| {
                 let own: Vec<&str> = RESERVED
                     .into_iter()
@@ -202,10 +211,36 @@ fn placeholders<'a>(spec: &Spec, lane: &'a Lane) -> Result<Vec<(String, &'a str,
                     ),
                 )
             })?;
-            out.push((at.clone(), name, ph));
+            parts.push(Part::Ph(name, ph));
         }
+        out.push((at, parts));
     }
     Ok(out)
+}
+
+// The tools whose quirks the plan knows, by their argv: what `check`
+// refuses and `warnings` warns of for them.
+
+/// A pinto `lra-*` run, which sizes itself to the memory it sees free.
+fn is_pinto_lra(lane: &Lane) -> bool {
+    base(lane.tool_word()).starts_with("pinto")
+        && lane.run.get(1).is_some_and(|s| s.starts_with("lra-"))
+}
+
+/// A data-beans run, whose per-cell streams are `rseed + offset + j`.
+fn is_data_beans(lane: &Lane) -> bool {
+    base(lane.tool_word()).starts_with("data-beans")
+}
+
+/// A data-beans multiome run with `--reference-atac`, whose pair truth no
+/// universe holds.
+fn is_reference_multiome(lane: &Lane) -> bool {
+    is_data_beans(lane)
+        && lane.run.iter().any(|t| t == "multiome")
+        && lane
+            .run
+            .iter()
+            .any(|t| t == "--reference-atac" || t.starts_with("--reference-atac="))
 }
 
 /// The basename of a tool word.
@@ -220,7 +255,13 @@ pub(super) fn base(word: &str) -> &str {
 pub fn check(spec: &Spec) -> Result<()> {
     for (si, stage) in spec.stages.iter().enumerate() {
         for lane in &stage.lanes {
-            for (at, name, ph) in placeholders(spec, lane)? {
+            let placeholders = words(spec, lane)?.into_iter().flat_map(|(at, parts)| {
+                parts.into_iter().filter_map(move |p| match p {
+                    Part::Ph(name, ph) => Some((at.clone(), name, ph)),
+                    Part::Text(_) => None,
+                })
+            });
+            for (at, name, ph) in placeholders {
                 match ph {
                     Ph::Method if lane.method.is_none() => {
                         return Err(bad(&at, "{method} is for a stage with methods"))
@@ -244,10 +285,7 @@ pub fn check(spec: &Spec) -> Result<()> {
                     _ => {}
                 }
             }
-            if base(lane.tool_word()).starts_with("pinto")
-                && lane.run.get(1).is_some_and(|s| s.starts_with("lra-"))
-                && lane.mem_gb <= 0.0
-            {
+            if is_pinto_lra(lane) && lane.mem_gb <= 0.0 {
                 return Err(bad(
                     &format!("{}.mem_gb", lane.at),
                     "is required for pinto lra-*: it sizes itself to the memory it sees free, \
@@ -387,14 +425,7 @@ fn scores(lane: &Lane) -> usize {
 /// those pairs, so no lane that makes a score may read it.
 fn reference_truth(spec: &Spec) -> Result<()> {
     for (si, stage) in spec.stages.iter().enumerate() {
-        let reference = stage.lanes.iter().any(|l| {
-            base(l.tool_word()).starts_with("data-beans")
-                && l.run.iter().any(|t| t == "multiome")
-                && l.run
-                    .iter()
-                    .any(|t| t == "--reference-atac" || t.starts_with("--reference-atac="))
-        });
-        if !reference {
+        if !stage.lanes.iter().any(is_reference_multiome) {
             continue;
         }
         for later in &spec.stages[si + 1..] {
@@ -523,61 +554,130 @@ pub fn tool_words(spec: &Spec) -> Result<Vec<(String, bool, String)>> {
     Ok(out)
 }
 
+/// A run of an argv word, its placeholder classified.
+#[derive(Clone, Copy)]
+enum Part<'a> {
+    Text(&'a str),
+    Ph(&'a str, Ph<'a>),
+}
+
+/// What a lane's cells share: its words parsed, what they read, its tool
+/// and its environment.
+struct Prepared<'a> {
+    stage: &'a Stage,
+    lane: &'a Lane,
+    /// `run[1..]`, each word's parts.
+    words: Vec<Vec<Part<'a>>>,
+    /// Each stage it reads, and whether that stage has methods.
+    upstream: Vec<(&'a str, bool)>,
+    inputs: Vec<&'a str>,
+    /// legume's content key, when another tool's argv embeds `{legume}`.
+    legume: Option<&'a str>,
+    tool: &'a Resolved,
+    env: BTreeMap<String, String>,
+}
+
+impl<'a> Prepared<'a> {
+    fn new(spec: &'a Spec, stage: &'a Stage, lane: &'a Lane, ctx: &'a Context) -> Result<Self> {
+        let word = lane.tool_word();
+        let tool = ctx.tool(word).ok_or_else(|| {
+            bad(
+                &format!("{}.run[0]", lane.at),
+                format!("{word} is not resolved"),
+            )
+        })?;
+        let words: Vec<Vec<Part>> = words(spec, lane)?
+            .into_iter()
+            .skip(1)
+            .map(|w| w.1)
+            .collect();
+        let (mut upstream, mut inputs, mut embeds) = (Vec::new(), Vec::new(), false);
+        for part in words.iter().flatten() {
+            match *part {
+                Part::Ph(_, Ph::Legume) => embeds = word != LEGUME,
+                Part::Ph(_, Ph::Stage(t) | Ph::Glob(t, _))
+                    if !upstream.iter().any(|u: &(&str, bool)| u.0 == t) =>
+                {
+                    let methods = spec.stages.iter().any(|s| s.name == t && s.methods);
+                    upstream.push((t, methods));
+                }
+                Part::Ph(_, Ph::Input(n)) if !inputs.contains(&n) => inputs.push(n),
+                _ => {}
+            }
+        }
+        let legume = embeds
+            .then(|| ctx.tool(LEGUME).map(|t| t.content_key.as_str()))
+            .flatten();
+        let env = THREAD_VARS
+            .iter()
+            .map(|v| (v.to_string(), lane.threads.to_string()))
+            .collect();
+        Ok(Self {
+            stage,
+            lane,
+            words,
+            upstream,
+            inputs,
+            legume,
+            tool,
+            env,
+        })
+    }
+}
+
 /// What fills one cell's placeholders.
 struct Fill<'a> {
-    values: HashMap<&'a str, String>,
+    values: &'a HashMap<&'a str, String>,
     method: Option<&'a str>,
     threads: u32,
     out: &'a Path,
-    stages: HashMap<&'a str, PathBuf>,
+    stages: &'a HashMap<&'a str, PathBuf>,
     ctx: &'a Context<'a>,
 }
 
 impl Fill<'_> {
-    /// `token` filled: with `template`, only the cell's values and method,
+    /// `word` filled: with `template`, only the cell's values and method,
     /// every path, `{threads}` and `{gpu}` left as written; else all but
     /// `{gpu}` (given at launch), a glob's stage made its folder.
-    fn token(&self, spec: &Spec, token: &str, template: bool) -> String {
+    fn word(&self, word: &[Part], template: bool) -> String {
         let mut s = String::new();
-        // Checked by `check`: each segment parses and names something.
-        for seg in segments(token).unwrap_or_default() {
-            let name = match seg {
+        for &part in word {
+            let (name, ph) = match part {
                 // The template writes a brace as the spec does, apart from
                 // a placeholder.
-                Seg::Text(t @ ("{" | "}")) if template => {
+                Part::Text(t @ ("{" | "}")) if template => {
                     s.push_str(t);
                     s.push_str(t);
                     continue;
                 }
-                Seg::Text(t) => {
+                Part::Text(t) => {
                     s.push_str(t);
                     continue;
                 }
-                Seg::Name(n) => n,
+                Part::Ph(name, ph) => (name, ph),
             };
             let keep = format!("{{{name}}}");
-            let filled = match classify(name, spec) {
-                Some(Ph::Value(v)) => self.values.get(v).cloned().unwrap_or(keep),
-                Some(Ph::Method) => self.method.map_or(keep, str::to_string),
+            let filled = match ph {
+                Ph::Value(v) => self.values.get(v).cloned().unwrap_or(keep),
+                Ph::Method => self.method.map_or(keep, str::to_string),
                 _ if template => keep,
-                Some(Ph::Threads) => self.threads.to_string(),
-                Some(Ph::Out) => self.out.display().to_string(),
-                Some(Ph::Legume) => self
+                Ph::Threads => self.threads.to_string(),
+                Ph::Out => self.out.display().to_string(),
+                Ph::Legume => self
                     .ctx
-                    .tools
-                    .get(LEGUME)
+                    .tool(LEGUME)
                     .map_or(keep, |t| t.exec.display().to_string()),
-                Some(Ph::Stage(t)) => self.stages.get(t).map_or(keep, |d| d.display().to_string()),
-                Some(Ph::Input(n)) => self
+                Ph::Stage(t) => self.stages.get(t).map_or(keep, |d| d.display().to_string()),
+                Ph::Input(n) => self
                     .ctx
                     .inputs
                     .get(n)
                     .map_or(keep, |(p, _)| p.display().to_string()),
-                Some(Ph::Glob(t, pattern)) => self
+                Ph::Glob(t, pattern) => self
                     .stages
                     .get(t)
                     .map_or(keep, |d| format!("{{glob:{}}}", d.join(pattern).display())),
-                Some(Ph::Gpu) | None => keep,
+                Ph::Gpu => keep,
             };
             s.push_str(&filled);
         }
@@ -593,124 +693,113 @@ pub fn cells(spec: &Spec, ctx: &Context) -> Result<Vec<Cell>> {
         .iter()
         .map(|v| (v.to_string(), "{threads}".to_string()))
         .collect();
+    let lanes: Vec<Prepared> = spec
+        .stages
+        .iter()
+        .flat_map(|stage| stage.lanes.iter().map(move |lane| (stage, lane)))
+        .map(|(stage, lane)| Prepared::new(spec, stage, lane, ctx))
+        .collect::<Result<_>>()?;
+    let cells_dir = ctx.dir.join("cells");
     let mut keys: HashMap<String, String> = HashMap::new();
     let mut cells = Vec::new();
     for (rep, rep_seed) in reps(&spec.seeds) {
         for point in &points {
             let labels = labels(point);
             let pid = point_id(&labels);
-            for stage in &spec.stages {
-                for lane in &stage.lanes {
-                    let method = lane.method.as_deref();
-                    let id = cell_id(&pid, rep, &stage.name, method);
-                    let seed = stage_seed(rep_seed, &stage.name, method.unwrap_or(""));
-                    let mut values: HashMap<&str, String> = HashMap::new();
-                    for (axis, v) in point {
-                        values.insert(axis, v.label.clone());
-                        for (b, x) in &v.bindings {
-                            values.insert(b, x.clone());
-                        }
-                    }
-                    values.insert("rep", rep.to_string());
-                    values.insert("rep_seed", rep_seed.to_string());
-                    values.insert("seed", seed.to_string());
-                    let word = lane.tool_word();
-                    let mut upstream: Vec<String> = Vec::new();
-                    let mut stages: HashMap<&str, PathBuf> = HashMap::new();
-                    let mut inputs: Vec<&str> = Vec::new();
-                    let mut embeds_legume = false;
-                    for (_, _, ph) in placeholders(spec, lane)? {
-                        match ph {
-                            Ph::Legume => embeds_legume = word != LEGUME,
-                            Ph::Stage(t) | Ph::Glob(t, _) => {
-                                let up = spec.stages.iter().find(|s| s.name == t);
-                                let m = up.filter(|s| s.methods).and(method);
-                                let uid = cell_id(&pid, rep, t, m);
-                                stages.insert(t, ctx.dir.join("cells").join(&uid));
-                                if !upstream.contains(&uid) {
-                                    upstream.push(uid);
-                                }
-                            }
-                            Ph::Input(n) if !inputs.contains(&n) => inputs.push(n),
-                            _ => {}
-                        }
-                    }
-                    let dir = ctx.dir.join("cells").join(&id);
-                    let fill = Fill {
-                        values,
-                        method,
-                        threads: lane.threads,
-                        out: &dir,
-                        stages,
-                        ctx,
-                    };
-                    let tool = ctx.tools.get(word).ok_or_else(|| {
-                        bad(
-                            &format!("{}.run[0]", lane.at),
-                            format!("{word} is not resolved"),
-                        )
-                    })?;
-                    let mut template = vec![lane.run[0].clone()];
-                    let mut argv = vec![tool.exec.display().to_string()];
-                    for t in &lane.run[1..] {
-                        template.push(fill.token(spec, t, true));
-                        argv.push(fill.token(spec, t, false));
-                    }
-                    // A declared input named by its path is read as well.
-                    for t in &argv[1..] {
-                        let p = named_path(t);
-                        for (n, (i, _)) in ctx.inputs {
-                            if p.is_absolute() && p.starts_with(i) && !inputs.contains(&n.as_str())
-                            {
-                                inputs.push(n);
-                            }
-                        }
-                    }
-                    inputs.sort_unstable();
-                    let input_keys: Vec<Value> = inputs
-                        .iter()
-                        .map(|n| json!({"name": n, "hash": ctx.inputs.get(*n).map(|i| &i.1)}))
-                        .collect();
-                    let upstream_keys: Vec<&String> =
-                        upstream.iter().filter_map(|u| keys.get(u)).collect();
-                    let mut keyed = json!({
-                        "stage": stage.name,
-                        "method": method,
-                        "argv": template,
-                        "env": threads_env,
-                        "tool": tool.content_key,
-                        "inputs": input_keys,
-                        "upstream": upstream_keys,
-                    });
-                    if embeds_legume {
-                        keyed["legume"] = json!(ctx.tools.get(LEGUME).map(|t| &t.content_key));
-                    }
-                    let key = key::key_of(&keyed);
-                    keys.insert(id.clone(), key.clone());
-                    cells.push(Cell {
-                        id,
-                        point: labels.clone(),
-                        rep,
-                        rep_seed,
-                        seed,
-                        stage: stage.name.clone(),
-                        method: method.map(str::to_string),
-                        argv,
-                        env: THREAD_VARS
-                            .iter()
-                            .map(|v| (v.to_string(), lane.threads.to_string()))
-                            .collect(),
-                        threads: lane.threads,
-                        mem_gb: lane.mem_gb,
-                        gpus: lane.gpus,
-                        timeout_secs: lane.timeout_secs,
-                        max_running: lane.max_running,
-                        dir,
-                        makes: lane.makes.clone(),
-                        upstream,
-                        key,
-                    });
+            let mut shared: HashMap<&str, String> = HashMap::new();
+            for (axis, v) in point {
+                shared.insert(axis, v.label.clone());
+                for (b, x) in &v.bindings {
+                    shared.insert(b, x.clone());
                 }
+            }
+            shared.insert("rep", rep.to_string());
+            shared.insert("rep_seed", rep_seed.to_string());
+            for p in &lanes {
+                let (stage, lane) = (p.stage, p.lane);
+                let method = lane.method.as_deref();
+                let id = cell_id(&pid, rep, &stage.name, method);
+                let seed = stage_seed(rep_seed, &stage.name, method.unwrap_or(""));
+                let mut values = shared.clone();
+                values.insert("seed", seed.to_string());
+                let mut upstream: Vec<String> = Vec::new();
+                let mut stages: HashMap<&str, PathBuf> = HashMap::new();
+                for &(t, methods) in &p.upstream {
+                    let uid = cell_id(&pid, rep, t, method.filter(|_| methods));
+                    stages.insert(t, cells_dir.join(&uid));
+                    if !upstream.contains(&uid) {
+                        upstream.push(uid);
+                    }
+                }
+                let dir = cells_dir.join(&id);
+                let fill = Fill {
+                    values: &values,
+                    method,
+                    threads: lane.threads,
+                    out: &dir,
+                    stages: &stages,
+                    ctx,
+                };
+                let mut template = vec![lane.run[0].clone()];
+                let mut argv = vec![p.tool.exec.display().to_string()];
+                for w in &p.words {
+                    template.push(fill.word(w, true));
+                    argv.push(fill.word(w, false));
+                }
+                // A declared input named by its path is read as well.
+                let mut inputs = p.inputs.clone();
+                for t in &argv[1..] {
+                    let path = named_path(t);
+                    for (n, (i, _)) in ctx.inputs {
+                        if path.is_absolute()
+                            && path.starts_with(i)
+                            && !inputs.contains(&n.as_str())
+                        {
+                            inputs.push(n);
+                        }
+                    }
+                }
+                inputs.sort_unstable();
+                let input_keys: Vec<Value> = inputs
+                    .iter()
+                    .map(|n| json!({"name": n, "hash": ctx.inputs.get(*n).map(|i| &i.1)}))
+                    .collect();
+                let upstream_keys: Vec<&String> =
+                    upstream.iter().filter_map(|u| keys.get(u)).collect();
+                let mut keyed = json!({
+                    "stage": stage.name,
+                    "method": method,
+                    "argv": template,
+                    "env": threads_env,
+                    "tool": p.tool.content_key,
+                    "inputs": input_keys,
+                    "upstream": upstream_keys,
+                });
+                if let Some(k) = p.legume {
+                    keyed["legume"] = json!(k);
+                }
+                let key = key::key_of(&keyed);
+                keys.insert(id.clone(), key.clone());
+                cells.push(Cell {
+                    id,
+                    point: labels.clone(),
+                    rep,
+                    rep_seed,
+                    seed,
+                    stage: stage.name.clone(),
+                    method: method.map(str::to_string),
+                    argv,
+                    env: p.env.clone(),
+                    threads: lane.threads,
+                    mem_gb: lane.mem_gb,
+                    gpus: lane.gpus,
+                    timeout_secs: lane.timeout_secs,
+                    max_running: lane.max_running,
+                    dir,
+                    makes: lane.makes.clone(),
+                    upstream,
+                    key,
+                });
             }
         }
     }
@@ -726,11 +815,7 @@ pub fn warnings(spec: &Spec, cells: &[Cell], ctx: &Context) -> Vec<String> {
     let dir = ctx.dir.as_path();
     let mut out = Vec::new();
     if let Seeds::List(list) = &spec.seeds {
-        let data_beans = spec
-            .stages
-            .iter()
-            .flat_map(|s| &s.lanes)
-            .any(|l| base(l.tool_word()).starts_with("data-beans"));
+        let data_beans = spec.stages.iter().flat_map(|s| &s.lanes).any(is_data_beans);
         let mut sorted = list.clone();
         sorted.sort_unstable();
         let close = sorted.windows(2).any(|w| w[1] - w[0] < CLOSE_SEEDS);
@@ -741,19 +826,16 @@ pub fn warnings(spec: &Spec, cells: &[Cell], ctx: &Context) -> Vec<String> {
             ));
         }
     }
-    let mut seen: Vec<&str> = Vec::new();
+    let mut seen: HashSet<&Path> = HashSet::new();
     for cell in cells {
         for token in &cell.argv[1..] {
             let p = named_path(token);
-            let path = p.to_str().unwrap_or_default();
+            if !p.is_absolute() || p.starts_with(dir) || !seen.insert(p) {
+                continue;
+            }
             let declared = ctx.inputs.values().any(|(i, _)| p.starts_with(i));
-            if p.is_absolute()
-                && !p.starts_with(dir)
-                && !declared
-                && p.is_file()
-                && !seen.contains(&path)
-            {
-                seen.push(path);
+            if !declared && p.is_file() {
+                let path = p.display();
                 out.push(format!(
                     "cell {}: {path} is a file outside the benchmark; declare it in inputs, \
                      so its content enters the key",
@@ -887,18 +969,23 @@ mod tests {
     }
 
     /// Every tool word as itself, keyed by its name.
-    fn tools(spec: &Spec) -> HashMap<String, Tool> {
+    fn tools(spec: &Spec) -> Vec<Resolved> {
         tool_words(spec)
             .unwrap()
             .into_iter()
-            .map(|(w, _, _)| {
-                let t = Tool {
-                    exec: PathBuf::from(format!("/T/{w}")),
-                    content_key: format!("K-{w}"),
-                };
-                (w, t)
+            .map(|(w, _, _)| Resolved {
+                source: PathBuf::from(format!("/S/{w}")),
+                exec: PathBuf::from(format!("/T/{w}")),
+                content_key: format!("K-{w}"),
+                version: None,
+                word: w,
             })
             .collect()
+    }
+
+    /// The tool of `word` in `tools`, to change.
+    fn tool<'a>(tools: &'a mut [Resolved], word: &str) -> &'a mut Resolved {
+        tools.iter_mut().find(|t| t.word == word).unwrap()
     }
 
     fn expand(spec: &Spec) -> Vec<Cell> {
@@ -1126,9 +1213,7 @@ mod tests {
             (PathBuf::from("/I/R"), "H1".to_string()),
         )]
         .into();
-        let at = |dir: &str,
-                  tools: &HashMap<String, Tool>,
-                  inputs: &HashMap<String, (PathBuf, String)>| {
+        let at = |dir: &str, tools: &[Resolved], inputs: &HashMap<String, (PathBuf, String)>| {
             let ctx = Context {
                 dir: PathBuf::from(dir),
                 tools,
@@ -1167,14 +1252,14 @@ mod tests {
         assert_ne!(a[0].key, b[0].key, "an input's content");
         assert_ne!(a[1].key, b[1].key, "and so its downstream");
         let mut rebuilt = tools.clone();
-        rebuilt.get_mut("T2").unwrap().content_key = "K-T2b".into();
+        tool(&mut rebuilt, "T2").content_key = "K-T2b".into();
         let c = at("/B", &rebuilt, &inputs);
         assert_eq!(a[0].key, c[0].key);
         assert_ne!(a[1].key, c[1].key, "a tool's bytes");
     }
 
     /// Each cell's key, with `tools` and the input RUN1 at /I/R keyed `h`.
-    fn keys_with(s: &Spec, tools: &HashMap<String, Tool>, h: &str) -> Vec<String> {
+    fn keys_with(s: &Spec, tools: &[Resolved], h: &str) -> Vec<String> {
         let inputs: HashMap<String, (PathBuf, String)> =
             [("RUN1".to_string(), (PathBuf::from("/I/R"), h.to_string()))].into();
         let ctx = Context {
@@ -1215,7 +1300,7 @@ mod tests {
         );
         let tools = tools(&s);
         let mut rebuilt = tools.clone();
-        rebuilt.get_mut(LEGUME).unwrap().content_key = "K-legume-b".into();
+        tool(&mut rebuilt, LEGUME).content_key = "K-legume-b".into();
         assert_ne!(keys_with(&s, &tools, "H1"), keys_with(&s, &rebuilt, "H1"));
     }
 

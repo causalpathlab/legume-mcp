@@ -330,6 +330,12 @@ fn no_version_still_keys() {
     assert_eq!(keys.len(), 8);
     assert!(keys.iter().all(|(_, k)| k.len() == 32));
     assert_eq!(plan["tools"][0]["content_key"], k1.as_str());
+    // plan.json lists each tool's word, source, key and what runs; its
+    // version is versions.tsv's.
+    let mut fields: Vec<&String> = plan["tools"][0].as_object().unwrap().keys().collect();
+    fields.sort_unstable();
+    assert_eq!(fields, ["content_key", "exec", "source", "tool"]);
+    assert_eq!(plan["tools"][0]["tool"], "TOOL1");
 }
 
 // rebuild_mid_sweep_keeps_snapshot: a tool rebuilt after the plan leaves

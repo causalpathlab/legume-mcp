@@ -6,7 +6,6 @@
 
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
@@ -162,45 +161,6 @@ fn mtime_ns(meta: &std::fs::Metadata) -> u128 {
         .map_or(0, |d| d.as_nanos())
 }
 
-/// Declared inputs' content keys, each file read once per change: cached
-/// by (device, inode, size, mtime).
-#[derive(Default)]
-pub struct Inputs {
-    seen: HashMap<(u64, u64, u64, u128), String>,
-}
-
-impl Inputs {
-    /// The key of the input at `path`: its bytes, or with `dir` its
-    /// listing ([`dir_key`]).
-    pub fn key(&mut self, path: &Path, dir: bool) -> Result<String> {
-        if dir {
-            return dir_key(path);
-        }
-        let meta =
-            std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
-        let id = file_id(&meta);
-        if let Some(k) = id.and_then(|id| self.seen.get(&id)) {
-            return Ok(k.clone());
-        }
-        let k = file_key(path)?;
-        if let Some(id) = id {
-            self.seen.insert(id, k.clone());
-        }
-        Ok(k)
-    }
-}
-
-#[cfg(unix)]
-fn file_id(meta: &std::fs::Metadata) -> Option<(u64, u64, u64, u128)> {
-    use std::os::unix::fs::MetadataExt;
-    Some((meta.dev(), meta.ino(), meta.size(), mtime_ns(meta)))
-}
-
-#[cfg(not(unix))]
-fn file_id(_: &std::fs::Metadata) -> Option<(u64, u64, u64, u128)> {
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,11 +203,8 @@ mod tests {
         std::fs::write(&b, b"GENE1\n").unwrap();
         assert_eq!(file_key(&a).unwrap(), key(b"GENE1\n"));
         assert_eq!(file_key(&a).unwrap(), file_key(&b).unwrap());
-        let mut inputs = Inputs::default();
-        assert_eq!(inputs.key(&a, false).unwrap(), key(b"GENE1\n"));
-        // A rewrite (a new size) is seen, not served from the cache.
         std::fs::write(&a, b"GENE2 \n").unwrap();
-        assert_eq!(inputs.key(&a, false).unwrap(), key(b"GENE2 \n"));
+        assert_eq!(file_key(&a).unwrap(), key(b"GENE2 \n"));
 
         let sub = d.path().join("sub");
         std::fs::create_dir(&sub).unwrap();

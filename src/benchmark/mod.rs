@@ -118,7 +118,6 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
             .collect();
         return Err(refuse(format!("not found on PATH: {}", names.join(", "))));
     }
-    let mut hashed = key::Inputs::default();
     let mut inputs: HashMap<String, (PathBuf, String)> = HashMap::new();
     for i in &spec.inputs {
         let p = crate::absolute(&root.join(&i.path));
@@ -131,7 +130,11 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
                 p.display()
             )));
         }
-        let k = hashed.key(&p, i.dir)?;
+        let k = if i.dir {
+            key::dir_key(&p)?
+        } else {
+            key::file_key(&p)?
+        };
         inputs.insert(i.name.clone(), (p, k));
     }
     let dir = root.join("results").join("benchmarks").join(&spec.name);
@@ -140,19 +143,9 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
     let spec_file = dir.join("specs").join(format!("{spec_key}.json"));
     write_spec(&spec_file, &canonical)?;
     let (resolved, mut drift) = tools::settle(&dir, &found, retool, tools::VERSION_TIMEOUT)?;
-    let tool_map: HashMap<String, plan::Tool> = resolved
-        .iter()
-        .map(|t| {
-            let tool = plan::Tool {
-                exec: t.exec.clone(),
-                content_key: t.content_key.clone(),
-            };
-            (t.word.clone(), tool)
-        })
-        .collect();
     let ctx = plan::Context {
         dir: dir.clone(),
-        tools: &tool_map,
+        tools: &resolved,
         inputs: &inputs,
     };
     let cells = plan::cells(&spec, &ctx)?;
@@ -187,15 +180,7 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
         grace_secs: spec.grace_secs,
         max_hours: spec.max_hours,
         min_free_gb: spec.min_free_gb,
-        tools: resolved
-            .iter()
-            .map(|t| ToolEntry {
-                tool: &t.word,
-                source: &t.source,
-                content_key: &t.content_key,
-                exec: &t.exec,
-            })
-            .collect(),
+        tools: &resolved,
         cells: &cells,
     };
     crate::job::replace(&dir, "plan.json", crate::pretty(&plan_json)?.as_bytes())?;
@@ -236,17 +221,8 @@ struct PlanFile<'a> {
     grace_secs: u64,
     max_hours: Option<f64>,
     min_free_gb: f64,
-    tools: Vec<ToolEntry<'a>>,
+    tools: &'a [tools::Resolved],
     cells: &'a [plan::Cell],
-}
-
-/// A tool as `plan.json` lists it.
-#[derive(Serialize)]
-struct ToolEntry<'a> {
-    tool: &'a str,
-    source: &'a Path,
-    content_key: &'a str,
-    exec: &'a Path,
 }
 
 /// The canonical spec at `file`, made only when it is not there yet; one

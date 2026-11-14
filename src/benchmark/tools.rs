@@ -32,14 +32,17 @@ pub struct Found {
     pub snapshot: bool,
 }
 
-/// A tool as the plan runs it.
-#[derive(Clone, Debug)]
+/// A tool as the plan runs it, and as `plan.json` lists it.
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct Resolved {
+    #[serde(rename = "tool")]
     pub word: String,
     pub source: PathBuf,
     pub content_key: String,
     /// The snapshot, or the source with `snapshot: false`.
     pub exec: PathBuf,
+    /// In `versions.tsv`, not `plan.json`.
+    #[serde(skip)]
     pub version: Option<String>,
 }
 
