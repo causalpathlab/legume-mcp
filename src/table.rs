@@ -112,34 +112,55 @@ fn text(head: Vec<u8>, file: File) -> Box<dyn BufRead> {
 /// The text `body` writes, as the file `path`, gzipped when its name ends
 /// in `.gz`. Written beside it first and renamed over it once whole, so a
 /// run that fails or is stopped never leaves `path` cut short: it is the
-/// whole new text or what it was before.
+/// whole new text or what it was before. A link is written through, the
+/// file it names replaced; a path that is no file (a device such as
+/// `/dev/stdout`, or a pipe) is written straight to.
 pub fn write_text(path: &Path, body: impl FnOnce(&mut dyn Write) -> io::Result<()>) -> Result<()> {
     // Numbered too, so two threads of this process never share one.
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let name = path
+    let gz = path.extension().is_some_and(|e| e == "gz");
+    let fail = || format!("cannot write {}", path.display());
+    // The kind of what `path` names, through any links: a pipe's link
+    // names no path, so only the kernel follows it.
+    let real = match path.metadata() {
+        Ok(m) if !m.is_file() => {
+            return File::create(path)
+                .and_then(|file| encoded(file, gz, body))
+                .with_context(fail)
+        }
+        Ok(_) => std::fs::canonicalize(path).with_context(fail)?,
+        Err(_) => path.to_path_buf(),
+    };
+    let name = real
         .file_name()
         .with_context(|| format!("{} names no file", path.display()))?;
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     let mut tmp = OsString::from(".");
     tmp.push(name);
     tmp.push(format!(".{}.{n}", std::process::id()));
-    let tmp = path.with_file_name(tmp);
-    let gz = path.extension().is_some_and(|e| e == "gz");
+    let tmp = real.with_file_name(tmp);
     let written = File::create(&tmp)
-        .and_then(|file| {
-            if gz {
-                through(GzEncoder::new(file, Default::default()), body)?.finish()?;
-            } else {
-                through(file, body)?;
-            }
-            Ok(())
-        })
-        .and_then(|()| std::fs::rename(&tmp, path));
+        .and_then(|file| encoded(file, gz, body))
+        .and_then(|()| std::fs::rename(&tmp, &real));
     if written.is_err() {
         // Not left behind half written, or written and not put in place.
         let _ = std::fs::remove_file(&tmp);
     }
-    written.with_context(|| format!("cannot write {}", path.display()))
+    written.with_context(fail)
+}
+
+/// `body` written to `file`, through gzip when `gz`.
+fn encoded(
+    file: File,
+    gz: bool,
+    body: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+) -> io::Result<()> {
+    if gz {
+        through(GzEncoder::new(file, Default::default()), body)?.finish()?;
+    } else {
+        through(file, body)?;
+    }
+    Ok(())
 }
 
 /// `body` written to `w` through a buffer, so its small writes reach `w`
@@ -483,6 +504,43 @@ mod tests {
             assert_eq!(read_back(&path), "K1\nK2\nK3\n", "{name}");
         }
         assert_eq!(names(dir.path()), ["t.tsv", "t.tsv.gz"]);
+    }
+
+    // A link is written through: the file it names is replaced, and the
+    // link still names it.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_is_written_through_to_the_file_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (real, link) = (dir.path().join("real.tsv"), dir.path().join("link.tsv"));
+        std::fs::write(&real, "M1\n").unwrap();
+        std::os::unix::fs::symlink("real.tsv", &link).unwrap();
+        write_text(&link, |w| w.write_all(b"M2\n")).unwrap();
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(read_back(&real), "M2\n");
+        assert_eq!(names(dir.path()), ["link.tsv", "real.tsv"]);
+    }
+
+    // A device is no file to stand in for, so it is written straight to.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_is_no_file_is_written_straight_to() {
+        write_text(Path::new("/dev/null"), |w| w.write_all(b"M1\n")).unwrap();
+    }
+
+    // A pipe named by its descriptor, as `/dev/stdout` names one, is
+    // written straight to though its link names no path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pipe_named_by_its_descriptor_is_written_straight_to() {
+        use std::os::fd::AsRawFd;
+        let (mut r, w) = io::pipe().unwrap();
+        let path = std::path::PathBuf::from(format!("/proc/self/fd/{}", w.as_raw_fd()));
+        write_text(&path, |w| w.write_all(b"M1\n")).unwrap();
+        drop(w);
+        let mut text = String::new();
+        r.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "M1\n");
     }
 
     // A body that fails part way leaves the file as it was, and nothing
