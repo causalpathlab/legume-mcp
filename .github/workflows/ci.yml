@@ -31,8 +31,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
-      # The person's view, behind `tui`; the command-line helpers, behind `clap`.
-      - run: cargo clippy --all-targets --features tui,clap,sessions -- -D warnings
+      # The person's view, behind `tui`; the command-line helpers, behind `clap`;
+      # `legume score` and `legume universe`, behind `benchmark`.
+      - run: cargo clippy --all-targets --features tui,clap,sessions,benchmark -- -D warnings
       # The report's PDF, behind `pdf`.
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -49,7 +50,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --features tui,clap,sessions,pdf
+      - run: cargo test --features tui,clap,sessions,pdf,benchmark
+      # What `legume score` and `legume universe` say in a build without `benchmark`.
+      - run: cargo test --test legume
 
   # The library as the tools take it keeps 1.91; the report's PDF (`pdf`,
   # Typst 0.15) needs 1.92.

@@ -7,6 +7,7 @@
 //! in that folder then has them all. Servers already listed are kept, the
 //! rest of each file is the user's; nothing is installed.
 
+use crate::command::usage;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::io::Write;
@@ -156,7 +157,8 @@ records in results/ whichever subfolder an agent starts in. Not your home
 folder or /: every folder under them would be the project. Nothing is
 installed.";
 
-/// `legume init ...` on the command line.
+/// `legume init ...` on the command line. A command line it cannot run is
+/// refused with exit code 2 ([`crate::command::usage`]).
 pub fn main(args: &[String], out: &mut dyn Write) -> Result<()> {
     let mut project = None;
     let mut named: Vec<&str> = Vec::new();
@@ -164,9 +166,10 @@ pub fn main(args: &[String], out: &mut dyn Write) -> Result<()> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--project" => {
-                project = Some(PathBuf::from(
-                    it.next().context("--project needs a folder")?,
-                ))
+                let Some(dir) = it.next() else {
+                    return Err(usage("--project needs a folder"));
+                };
+                project = Some(PathBuf::from(dir));
             }
             "-h" | "--help" => {
                 writeln!(out, "{USAGE}")?;
@@ -174,7 +177,7 @@ pub fn main(args: &[String], out: &mut dyn Write) -> Result<()> {
             }
             flag => match AGENTS.iter().find(|a| a.flag == flag) {
                 Some(a) => named.push(a.name),
-                None => anyhow::bail!("unknown argument {flag}\n\n{USAGE}"),
+                None => return Err(usage(format!("unknown argument {flag}"))),
             },
         }
     }
@@ -182,14 +185,8 @@ pub fn main(args: &[String], out: &mut dyn Write) -> Result<()> {
         Some(p) => crate::absolute(&p),
         None => std::env::current_dir()?,
     };
-    let same = |a: &Path, b: &Path| {
-        a.canonicalize()
-            .ok()
-            .zip(b.canonicalize().ok())
-            .is_some_and(|(a, b)| a == b)
-    };
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    if project.parent().is_none() || home.is_some_and(|h| same(&project, &h)) {
+    if project.parent().is_none() || home.is_some_and(|h| crate::same_file(&project, &h)) {
         anyhow::bail!(
             "{} is not a project's folder: every folder under it would keep its records \
              there. Make a folder for the project, change into it and run `legume init` \

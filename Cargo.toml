@@ -1,6 +1,6 @@
 [package]
 name = "legume-mcp"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT"
@@ -43,6 +43,15 @@ typst-assets = { version = "0.15.1", features = ["fonts"], optional = true }
 typst-layout = { version = "0.15.1", optional = true }
 typst-pdf = { version = "0.15.1", optional = true }
 
+# The tables the tools write, read by `legume score` and written by `legume
+# universe` (`benchmark`): parquet, compressed as chickpea and pinto write
+# it (ZSTD, Snappy), and TSV, gzipped or not; `half` for a FLOAT16 column,
+# as parquet's own rows read it. gzip by zlib-rs, which writes it more than
+# twice as fast as the default backend.
+parquet = { version = "60.1", default-features = false, features = ["zstd", "snap"], optional = true }
+half = { version = "2.1", default-features = false, optional = true }
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"], optional = true }
+
 [features]
 pdf = ["dep:typst", "dep:typst-assets", "dep:typst-layout", "dep:typst-pdf"]
 tui = ["dep:legume-tui", "dep:ratatui"]
@@ -51,6 +60,9 @@ clap = ["dep:clap"]
 # (`Call::start_session_job`): a person attaches to watch them, and they
 # outlive the server.
 sessions = ["dep:legume-tui"]
+# `legume score` and `legume universe`: a method's scores against a truth
+# over a universe, and the universe of cis pairs.
+benchmark = ["dep:parquet", "dep:half", "dep:flate2"]
 
 [target.'cfg(unix)'.dependencies]
 # geteuid and O_NOFOLLOW, to leave alone record files this user does not own.
@@ -77,3 +89,11 @@ required-features = ["tui"]
 [[test]]
 name = "cli"
 required-features = ["clap"]
+
+[[test]]
+name = "score"
+required-features = ["benchmark"]
+
+[[test]]
+name = "universe"
+required-features = ["benchmark"]

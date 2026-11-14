@@ -46,6 +46,7 @@ use std::time::Duration;
 pub mod brain;
 #[cfg(feature = "clap")]
 pub mod cli;
+pub mod command;
 mod evidence;
 mod hints;
 pub mod init;
@@ -67,8 +68,14 @@ mod session;
 #[cfg(all(feature = "sessions", unix))]
 pub use session::{SessionJob, Started};
 pub mod project;
+#[cfg(feature = "benchmark")]
+pub mod score;
 mod step;
 pub use step::{inputs_of, Fact, Step};
+#[cfg(feature = "benchmark")]
+mod table;
+#[cfg(feature = "benchmark")]
+pub mod universe;
 pub mod watch;
 use jobs::{Jobs, State as JobState};
 use project::Project;
@@ -777,6 +784,14 @@ pub(crate) fn absolute(p: &Path) -> PathBuf {
     std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// Two paths that name one file: both there, and one once resolved.
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// `argv` as one line to paste into a shell, each word quoted as the driver
 /// script quotes it.
 pub fn command_line<S: AsRef<str>>(argv: &[S]) -> String {
@@ -1380,6 +1395,17 @@ fn call_result(result: Result<Vec<Content>>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_spellings_of_one_file_are_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.tsv"), dir.path().join("b.tsv"));
+        std::fs::write(&a, "").unwrap();
+        std::fs::write(&b, "").unwrap();
+        assert!(same_file(&a, &dir.path().join(".").join("a.tsv")));
+        assert!(!same_file(&a, &b));
+        assert!(!same_file(&a, &dir.path().join("c.tsv")));
+    }
 
     fn lines(text: &[&str]) -> VecDeque<String> {
         text.iter().map(|s| s.to_string()).collect()
