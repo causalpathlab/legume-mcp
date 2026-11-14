@@ -41,10 +41,11 @@ with a header (gzipped or not) or parquet.
                      auprc";
 
 /// `legume score` with `args` (those after `score`), saying what it counted
-/// on `out`. A refusal is a [`crate::command::Exit`] with its exit code.
-pub fn main(args: &[String], out: &mut dyn Write) -> Result<()> {
+/// on `out` and its warnings on `err`. A refusal is a
+/// [`crate::command::Exit`] with its exit code.
+pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
     match parse(args)? {
-        Some(spec) => run(&spec, out),
+        Some(spec) => run(&spec, out, err),
         None => Ok(writeln!(out, "{USAGE}")?),
     }
 }

@@ -10,21 +10,80 @@
 //! is dropped and counted.
 
 mod cli;
-pub(crate) mod table;
 
 pub use cli::{main, USAGE};
 
 use crate::command::{usage, Exit};
 use crate::metric;
+use crate::table::{self, Value};
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use table::Value;
 
-/// The output's columns, in order.
-pub const COLUMNS: &str = "score\tmetric\tvalue\tpart\tn_pos\tn_neg\tn_universe\tpos_rate\t\
-                           tied_share\tunscored\tunscored_pos\toutside_pos\toutside_scored\tn_inf";
+/// The output's columns, in order: the header, and the cells of each
+/// [`ScoreRow`].
+pub const COLUMNS: [&str; 14] = [
+    "score",
+    "metric",
+    "value",
+    "part",
+    "n_pos",
+    "n_neg",
+    "n_universe",
+    "pos_rate",
+    "tied_share",
+    "unscored",
+    "unscored_pos",
+    "outside_pos",
+    "outside_scored",
+    "n_inf",
+];
+
+/// One line of the output: a score's metric over a part of the universe,
+/// and the counts beside it.
+struct ScoreRow<'a> {
+    score: &'a str,
+    metric: &'a str,
+    value: f64,
+    part: &'a str,
+    counts: metric::Counts,
+    outside_pos: usize,
+    outside_scored: usize,
+}
+
+impl ScoreRow<'_> {
+    /// The header line, [`COLUMNS`].
+    fn header(out: &mut dyn Write) -> std::io::Result<()> {
+        writeln!(out, "{}", COLUMNS.join("\t"))
+    }
+
+    /// The row as one line, a cell for each of [`COLUMNS`] in its order.
+    fn write(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        let c = &self.counts;
+        let cells: [&dyn std::fmt::Display; COLUMNS.len()] = [
+            &self.score,
+            &self.metric,
+            &self.value,
+            &self.part,
+            &c.n_pos,
+            &c.n_neg,
+            &c.n_universe,
+            &c.pos_rate,
+            &c.tied_share,
+            &c.unscored,
+            &c.unscored_pos,
+            &self.outside_pos,
+            &self.outside_scored,
+            &c.n_inf,
+        ];
+        for (i, cell) in cells.iter().enumerate() {
+            let tab = if i == 0 { "" } else { "\t" };
+            write!(out, "{tab}{cell}")?;
+        }
+        writeln!(out)
+    }
+}
 
 /// How a column becomes a score, higher meaning more likely true.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -284,8 +343,8 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 /// Score as `spec` says, write its table, and say what was counted on
-/// `out`.
-fn run(spec: &Spec, out: &mut dyn Write) -> Result<()> {
+/// `out` and what to doubt on `err`.
+fn run(spec: &Spec, out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
     if spec.universe == Universe::Same && !same_file(&spec.scores, &spec.truth) {
         return Err(usage(
             "--universe same needs --truth and --scores to be one file; give the universe as a \
@@ -341,41 +400,93 @@ fn run(spec: &Spec, out: &mut dyn Write) -> Result<()> {
         .into());
     }
 
-    let mut table = format!("{COLUMNS}\n");
+    let mut rows = Vec::with_capacity(2 * spec.score.len());
     for (s, values) in spec.score.iter().zip(&scored.values) {
-        let metric::Metrics {
-            auroc,
-            average_precision,
-            counts: c,
-        } = metric::rank(values, &truth.labels);
+        let m = metric::rank(values, &truth.labels);
+        let c = m.counts;
         let scored_items = c.n_universe - c.unscored;
         if c.n_inf * 100 > scored_items {
-            eprintln!(
+            writeln!(
+                err,
                 "warning: {} scores {} of its {scored_items} scored items +inf, one tie at the top \
                  (a p value of 0 is +inf under neglog10)",
                 s.name, c.n_inf
-            );
+            )?;
         }
-        for (metric, value) in [("auroc", auroc), ("auprc", average_precision)] {
-            table.push_str(&format!(
-                "{}\t{metric}\t{value}\tall\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                s.name,
-                c.n_pos,
-                c.n_neg,
-                c.n_universe,
-                c.pos_rate,
-                c.tied_share,
-                c.unscored,
-                c.unscored_pos,
-                truth.outside_pos,
-                scored.outside,
-                c.n_inf
-            ));
+        for (metric, value) in [("auroc", m.auroc), ("auprc", m.average_precision)] {
+            rows.push(ScoreRow {
+                score: &s.name,
+                metric,
+                value,
+                part: "all",
+                counts: c,
+                outside_pos: truth.outside_pos,
+                outside_scored: scored.outside,
+            });
         }
     }
     let mut file = table::TextOut::create(&spec.out)?;
-    file.write_all(table.as_bytes())?;
+    ScoreRow::header(&mut file)?;
+    for r in &rows {
+        r.write(&mut file)?;
+    }
     file.finish()?;
     writeln!(out, "wrote {}", spec.out.display())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Every cell distinct, so a cell written under another column's name
+    // reads back wrong.
+    #[test]
+    fn a_row_writes_each_cell_under_its_column() {
+        let row = ScoreRow {
+            score: "M1",
+            metric: "auroc",
+            value: 0.25,
+            part: "all",
+            counts: metric::Counts {
+                n_pos: 1,
+                n_neg: 2,
+                n_universe: 3,
+                pos_rate: 0.5,
+                tied_share: 0.75,
+                unscored: 4,
+                unscored_pos: 5,
+                n_inf: 8,
+            },
+            outside_pos: 6,
+            outside_scored: 7,
+        };
+        let mut text = Vec::new();
+        ScoreRow::header(&mut text).unwrap();
+        row.write(&mut text).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let header: Vec<&str> = lines[0].split('\t').collect();
+        assert_eq!(header, COLUMNS);
+        let cells: HashMap<&str, &str> = header.into_iter().zip(lines[1].split('\t')).collect();
+        let want = [
+            ("score", "M1"),
+            ("metric", "auroc"),
+            ("value", "0.25"),
+            ("part", "all"),
+            ("n_pos", "1"),
+            ("n_neg", "2"),
+            ("n_universe", "3"),
+            ("pos_rate", "0.5"),
+            ("tied_share", "0.75"),
+            ("unscored", "4"),
+            ("unscored_pos", "5"),
+            ("outside_pos", "6"),
+            ("outside_scored", "7"),
+            ("n_inf", "8"),
+        ];
+        assert_eq!(cells, HashMap::from(want));
+        assert_eq!(lines[1].split('\t').count(), COLUMNS.len());
+    }
 }

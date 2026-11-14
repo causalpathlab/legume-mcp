@@ -43,11 +43,8 @@ const COMMANDS: &[(&str, Main, &str)] = &[
 mod benchmark {
     use super::Main;
 
-    pub const SCORE: (&str, Main, &str) = (
-        "score",
-        |args, out, _| legume_mcp::score::main(args, out),
-        legume_mcp::score::USAGE,
-    );
+    pub const SCORE: (&str, Main, &str) =
+        ("score", legume_mcp::score::main, legume_mcp::score::USAGE);
     pub const UNIVERSE: (&str, Main, &str) = (
         "universe",
         |args, out, _| legume_mcp::universe::main(args, out),

@@ -73,6 +73,8 @@ pub mod score;
 mod step;
 pub use step::{inputs_of, Fact, Step};
 #[cfg(feature = "benchmark")]
+mod table;
+#[cfg(feature = "benchmark")]
 pub mod universe;
 pub mod watch;
 use jobs::{Jobs, State as JobState};

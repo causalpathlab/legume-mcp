@@ -11,7 +11,7 @@
 //! K nearest by (distance, peak index), listed by peak index.
 
 use crate::command::{required, usage};
-use crate::score::table::{self, TextOut};
+use crate::table::{self, TextOut};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};

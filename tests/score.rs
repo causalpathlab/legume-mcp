@@ -482,12 +482,12 @@ fn above_is_strict() {
     near(roc.num("value"), 2.0 / 3.0);
 }
 
-/// A run scoring `p` of keys K1..K4 (K1 true) as `neglog10:p`.
-fn neglog10(dir: &Path, p: &[&str]) -> Output {
+/// The files of a run scoring `p` of keys K1, K2, ... (K1 true) as
+/// `neglog10:p`.
+fn neglog10_files(dir: &Path, p: &[&str]) {
     let universe = dir.join("universe.tsv");
     let truth = dir.join("truth.tsv");
     let scores = dir.join("scores.tsv");
-    let out = dir.join("out.score.tsv");
     let keys: Vec<String> = (1..=p.len()).map(|i| format!("K{i}")).collect();
     tsv(&universe, "key", &keys);
     tsv(&truth, "key", &keys[..1]);
@@ -497,6 +497,15 @@ fn neglog10(dir: &Path, p: &[&str]) -> Output {
         .map(|(k, p)| format!("{k}\t{p}"))
         .collect();
     tsv(&scores, "key\tp", &rows);
+}
+
+/// A run scoring `p` of keys K1, K2, ... (K1 true) as `neglog10:p`.
+fn neglog10(dir: &Path, p: &[&str]) -> Output {
+    neglog10_files(dir, p);
+    let universe = dir.join("universe.tsv");
+    let truth = dir.join("truth.tsv");
+    let scores = dir.join("scores.tsv");
+    let out = dir.join("out.score.tsv");
     legume(&[
         "score",
         "--scores",
@@ -541,6 +550,23 @@ fn a_p_of_0_is_inf_and_warned_of() {
     assert_eq!(ap.get("n_inf"), "1");
     assert_eq!(ap.get("unscored"), "1");
     near(ap.num("value"), 1.0);
+}
+
+// The warning goes to the writer the run is given for it, not to this
+// process's stderr: a caller running `score::main` reads it there.
+#[test]
+fn the_inf_warning_goes_to_the_err_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    neglog10_files(dir.path(), &["0", "0.5", "1", "NaN"]);
+    let a = keyed_args(dir.path(), &["M1=neglog10:p"]);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    legume_mcp::score::main(&a[1..], &mut out, &mut err).unwrap();
+    let err = String::from_utf8(err).unwrap();
+    assert!(
+        err.starts_with("warning: M1 scores 1 of its 3 scored items +inf"),
+        "{err}"
+    );
+    assert!(!String::from_utf8(out).unwrap().contains("warning"));
 }
 
 // The warning is for more than 1% of the scored items at +inf: 2 of 200 is
