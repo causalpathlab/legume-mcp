@@ -142,12 +142,21 @@ pub fn snapshot(dir: &Path, source: &Path, content_key: &str, name: &str) -> Res
 }
 
 /// The first line `exec --version` prints, when it exits 0 within
-/// `timeout`; its process group is killed either way.
+/// `timeout`; its process group is killed either way. A tool still open
+/// for writing (just copied, its file held a moment by a child another
+/// thread forked) is started again until it can be, within `timeout`.
 pub fn version(exec: &Path, timeout: Duration) -> Option<String> {
-    let mut cmd = Command::new(exec);
-    cmd.arg("--version");
     let deadline = Instant::now() + timeout;
-    let out = crate::run_child(cmd, &|| Instant::now() >= deadline, &|_| {}).ok()?;
+    let out = loop {
+        let mut cmd = Command::new(exec);
+        cmd.arg("--version");
+        match crate::run_child(cmd, &|| Instant::now() >= deadline, &|_| {}) {
+            Err(e) if is_busy(&e) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            ran => break ran.ok()?,
+        }
+    };
     let line = out.lines().find(|l| !l.trim().is_empty())?;
     Some(
         line.trim()
@@ -156,6 +165,14 @@ pub fn version(exec: &Path, timeout: Duration) -> Option<String> {
             .take(200)
             .collect(),
     )
+}
+
+/// Whether `e` is a program that could not start while open for writing.
+fn is_busy(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::ExecutableFileBusy)
+    })
 }
 
 /// A row of a `versions.tsv`.
@@ -346,6 +363,22 @@ mod tests {
         // SAFETY: signal 0 only asks whether the process is there.
         let alive = unsafe { libc::kill(child, 0) } == 0;
         assert!(!alive, "the hung tool's child {child} was left running");
+    }
+
+    // A tool still open for writing somewhere (a copy just made, its file
+    // held by a child another thread forked) cannot start yet: it is
+    // asked again until it can, within the timeout.
+    #[test]
+    fn a_tool_busy_being_written_is_asked_again() {
+        let d = tempfile::tempdir().unwrap();
+        let t = script(d.path(), "TOOL1", "echo 'TOOL1 1.2.3'");
+        let held = std::fs::OpenOptions::new().append(true).open(&t).unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        assert_eq!(version(&t, VERSION_TIMEOUT).as_deref(), Some("TOOL1 1.2.3"));
+        closer.join().unwrap();
     }
 
     // same_bytes_same_key, rebuild_mid_sweep_keeps_snapshot (the tool
