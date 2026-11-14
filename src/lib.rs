@@ -12,7 +12,8 @@
 //!   faults (unknown method or tool, unreadable message).
 //! - Calls run one at a time, in order. `ping` is answered and
 //!   `notifications/cancelled` is taken while a call runs: the call sees it
-//!   through [`Call::is_cancelled`], [`Call::run`] kills its child, and a
+//!   through [`Call::is_cancelled`], [`Call::run`] stops its child and what
+//!   the child started, and a
 //!   cancelled call gets no response, as the protocol asks.
 //! - [`Call::progress`] sends `notifications/progress` when the client
 //!   asked for them (a `progressToken`), and does nothing otherwise.
@@ -53,6 +54,7 @@ mod graph;
 pub mod job;
 mod jobs;
 mod notebook;
+mod procgroup;
 mod records;
 mod report;
 pub use report::{FigureBox, FIGURE_BOX};
@@ -84,6 +86,11 @@ const STDERR_TAIL: usize = 20;
 const STDERR_KEPT: usize = 400;
 /// How often a waiting child run looks for a cancellation.
 const POLL: Duration = Duration::from_millis(100);
+/// How long a cancelled child's group has between TERM and KILL.
+const GRACE: Duration = Duration::from_secs(3);
+/// How long a child's pipes are read after it exits: a process it left
+/// behind that holds one is killed then, and what was read is returned.
+const DRAIN: Duration = Duration::from_secs(2);
 
 /// What `initialize` reports: the server's name and version, and the
 /// instructions an agent reads before its first call (what the tools are
@@ -305,7 +312,8 @@ impl Call {
     }
 
     /// Run `cmd` to its end and return its stdout. Each stderr line is
-    /// passed on as progress; a cancellation kills the child; a failure
+    /// passed on as progress; a cancellation stops the child and what it
+    /// started (TERM to its process group, then KILL); a failure
     /// quotes the last lines of its stderr. The driver script gets its
     /// command line, or a comment when it did not succeed.
     pub fn run(&self, cmd: Command) -> Result<String> {
@@ -540,10 +548,23 @@ fn quote(lines: &VecDeque<String>) -> String {
     picked.join("\n")
 }
 
+/// What a child's pipes carry to [`run_child`].
+enum Piped {
+    /// A line of its stderr.
+    Line(String),
+    /// Bytes of its stdout.
+    Out(Vec<u8>),
+    /// Its stdout could not be read.
+    Failed(std::io::Error),
+}
+
 /// Run `cmd` to its end and return its stdout; each stderr line goes to
-/// `progress`; `cancelled` is asked as it runs, and kills the child when
-/// it says so; a failure quotes its error ([`quote`]). A Rust child prints
-/// no backtrace unless the tool asks for one: the agent reads the error.
+/// `progress`; `cancelled` is asked as it runs, and stops the child and
+/// what it started when it says so (TERM, then KILL after [`GRACE`]); a
+/// failure quotes its error ([`quote`]). Its pipes are read for at most
+/// [`DRAIN`] after it exits, then what it left holding them is killed. A
+/// Rust child prints no backtrace unless the tool asks for one: the agent
+/// reads the error.
 fn run_child(
     mut cmd: Command,
     cancelled: &dyn Fn() -> bool,
@@ -557,52 +578,100 @@ fn run_child(
         }
     }
     let shown = format!("{cmd:?}");
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("starting {shown}"))?;
-    let mut stdout = child.stdout.take().context("child stdout")?;
-    let stderr = child.stderr.take().context("child stderr")?;
-    let reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        stdout.read_to_string(&mut s).map(|_| s)
-    });
+    let mut group = procgroup::Group::spawn(
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .with_context(|| format!("starting {shown}"))?;
+    let mut stdout = group.0.stdout.take().context("child stdout")?;
+    let stderr = group.0.stderr.take().context("child stderr")?;
+    // Both pipes through one channel, closed once both are; no thread of
+    // this call is waited on, so a pipe held past the child's end is not.
     let (tx, rx) = channel();
+    let out_tx = tx.clone();
+    std::thread::spawn(move || {
+        let mut buf = vec![0; 64 * 1024];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if out_tx.send(Piped::Out(buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    let _ = out_tx.send(Piped::Failed(e));
+                    break;
+                }
+            }
+        }
+    });
     std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            if tx.send(line).is_err() {
+            if tx.send(Piped::Line(line)).is_err() {
                 break;
             }
         }
     });
+    let (mut out, mut unread) = (Vec::new(), None);
     let mut tail = VecDeque::with_capacity(STDERR_KEPT);
-    let status = loop {
+    let mut take = |piped| match piped {
+        Piped::Line(line) => {
+            progress(&line);
+            if tail.len() == STDERR_KEPT {
+                tail.pop_front();
+            }
+            tail.push_back(line);
+        }
+        Piped::Out(bytes) => out.extend(bytes),
+        Piped::Failed(e) => unread = Some(e),
+    };
+    // When the child was seen to exit.
+    let mut ended = None;
+    loop {
         if cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
+            group.stop(GRACE);
             anyhow::bail!("cancelled");
         }
-        match rx.recv_timeout(POLL) {
-            Ok(line) => {
-                progress(&line);
-                if tail.len() == STDERR_KEPT {
-                    tail.pop_front();
-                }
-                tail.push_back(line);
+        let closed = match rx.recv_timeout(POLL) {
+            Ok(piped) => {
+                take(piped);
+                false
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            // stderr is closed: the child is ending, or ended.
-            Err(RecvTimeoutError::Disconnected) => match child.try_wait()? {
-                Some(status) => break status,
-                None => std::thread::sleep(POLL),
-            },
+            Err(RecvTimeoutError::Timeout) => false,
+            Err(RecvTimeoutError::Disconnected) => true,
+        };
+        if ended.is_none() && group.exited()? {
+            ended = Some(std::time::Instant::now());
         }
-    };
-    let out = reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("reading the child's stdout"))??;
+        match ended {
+            Some(_) if closed => break,
+            // What the child left holds a pipe: it is killed with the
+            // group, and what is still in the pipes read.
+            Some(at) if at.elapsed() >= DRAIN => {
+                group.kill();
+                while let Ok(piped) = rx.recv_timeout(POLL) {
+                    take(piped);
+                }
+                break;
+            }
+            // The pipes are closed: the child is ending.
+            None if closed => std::thread::sleep(POLL),
+            _ => {}
+        }
+    }
+    let status = group.wait()?;
+    if let Some(e) = unread {
+        return Err(e.into());
+    }
+    let out = String::from_utf8(out).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+    })?;
     if !status.success() {
         anyhow::bail!("{shown} failed ({status}):\n{}", quote(&tail));
     }
@@ -1374,5 +1443,149 @@ mod tests {
         let q = quote(&lines(&l));
         assert!(!q.contains("retrying"), "{q}");
         assert!(q.ends_with("  0: frame"), "{q}");
+    }
+
+    /// A child run by `sh -c script`.
+    #[cfg(unix)]
+    fn sh(script: &str) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    /// `run` on its own thread, failed when it takes longer than `limit`:
+    /// a regression that hangs fails instead.
+    #[cfg(unix)]
+    fn within<T: Send + 'static>(limit: Duration, run: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run());
+        });
+        match rx.recv_timeout(limit) {
+            Ok(v) => v,
+            Err(RecvTimeoutError::Timeout) => panic!("did not end within {limit:?}"),
+            Err(RecvTimeoutError::Disconnected) => panic!("panicked"),
+        }
+    }
+
+    /// `script` run as a child, cancelled once it says `ready` on stderr.
+    #[cfg(unix)]
+    fn cancelled_once_ready(script: String) -> Result<String> {
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = ready.clone();
+        run_child(sh(&script), &|| ready.load(Ordering::SeqCst), &|line| {
+            if line == "ready" {
+                seen.store(true, Ordering::SeqCst);
+            }
+        })
+    }
+
+    /// Whether process `pid` is gone (a zombie no one has reaped yet is),
+    /// waiting up to `limit` for it to go.
+    #[cfg(unix)]
+    fn gone_within(pid: libc::pid_t, limit: Duration) -> bool {
+        let gone = || {
+            // SAFETY: signal 0 only checks the process exists.
+            let r = unsafe { libc::kill(pid, 0) };
+            if r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return true;
+            }
+            let ps = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output();
+            ps.is_ok_and(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim_start()
+                    .starts_with('Z')
+            })
+        };
+        let start = std::time::Instant::now();
+        while start.elapsed() < limit {
+            if gone() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let left = gone();
+        if !left {
+            // Not left running past a failed test.
+            // SAFETY: a plain kill of the process the test started.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        left
+    }
+
+    #[cfg(unix)]
+    fn pid_in(file: &Path) -> libc::pid_t {
+        std::fs::read_to_string(file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_job_ends_when_its_child_does_though_a_grandchild_holds_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = tmp.path().join("pid");
+        let script = format!(
+            "sleep 30 >/dev/null & echo $! > '{}'; printf made",
+            pid.display()
+        );
+        let out = within(DRAIN + Duration::from_secs(3), move || {
+            run_child(sh(&script), &|| false, &|_| {})
+        });
+        assert_eq!(out.unwrap(), "made");
+        assert!(gone_within(pid_in(&pid), Duration::from_secs(1)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_job_ends_when_its_child_does_though_a_grandchild_holds_stdout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = tmp.path().join("pid");
+        let script = format!(
+            "printf made; sleep 30 2>/dev/null & echo $! > '{}'",
+            pid.display()
+        );
+        let out = within(DRAIN + Duration::from_secs(3), move || {
+            run_child(sh(&script), &|| false, &|_| {})
+        });
+        assert_eq!(out.unwrap(), "made");
+        assert!(gone_within(pid_in(&pid), Duration::from_secs(1)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_cancelled_job_leaves_no_grandchild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = tmp.path().join("pid");
+        let script = format!(
+            "sleep 30 >/dev/null 2>&1 & echo $! > '{}'; echo ready >&2; wait",
+            pid.display()
+        );
+        let out = within(GRACE + Duration::from_secs(3), move || {
+            cancelled_once_ready(script)
+        });
+        assert_eq!(out.unwrap_err().to_string(), "cancelled");
+        assert!(gone_within(pid_in(&pid), GRACE + Duration::from_secs(1)));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_cancel_asks_with_term_before_it_kills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("termed");
+        let script = format!(
+            "trap \"echo termed > '{}'; exit 0\" TERM; echo ready >&2; sleep 30 & wait",
+            marker.display()
+        );
+        let out = within(GRACE + Duration::from_secs(3), move || {
+            cancelled_once_ready(script)
+        });
+        assert_eq!(out.unwrap_err().to_string(), "cancelled");
+        let said = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert_eq!(said, "termed\n");
     }
 }
