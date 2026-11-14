@@ -464,6 +464,42 @@ fn neglog10_of_a_p_outside_0_1_is_an_error() {
     }
 }
 
+// K9, outside the universe, holds a p of 7: it is dropped before it is
+// turned into a score, so it cannot fail the run.
+#[test]
+fn neglog10_never_turns_a_row_outside_the_universe() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    neglog10_files(d, &["0.01", "0.5", "1"]);
+    let mut scores = std::fs::read_to_string(d.join("scores.tsv")).unwrap();
+    scores.push_str("K9\t7\n");
+    std::fs::write(d.join("scores.tsv"), scores).unwrap();
+    let o = legume(keyed_args(d, &["M1=neglog10:p"]));
+    assert!(o.status.success(), "{}", stderr(&o));
+    let rows = rows(&d.join("out.score.tsv"));
+    let roc = row(&rows, "M1", "auroc");
+    assert_eq!(roc.get("outside_scored"), "1");
+    near(roc.num("value"), 1.0);
+}
+
+// A label cell that is no number is refused, its row named, not taken as
+// a negative.
+#[test]
+fn a_label_that_is_not_a_number_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    tsv(&d.join("universe.tsv"), "key", &["K1", "K2"]);
+    tsv(&d.join("truth.tsv"), "key\tw", &["K1\t2", "K2\tyes"]);
+    tsv(&d.join("scores.tsv"), "key\tv", &["K1\t1", "K2\t2"]);
+    let mut a = keyed_args(d, &["M1=v"]);
+    a.extend(["--label", "w", "--above", "1"].map(String::from));
+    let o = legume(&a);
+    assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
+    assert!(stderr(&o).contains("row 2 of w"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("\"yes\""), "{}", stderr(&o));
+    assert!(!d.join("out.score.tsv").exists());
+}
+
 // p = 0 is +inf: K1 alone at the top, one of four (over 1%), so a warning.
 #[test]
 fn a_p_of_0_is_inf_and_warned_of() {
