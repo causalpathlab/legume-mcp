@@ -83,20 +83,16 @@ fn check_name(path: &Path, spec_key: &str) -> Result<()> {
         .parent()
         .and_then(Path::file_name)
         .is_some_and(|d| d == "specs");
-    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
-    match stem {
-        Some(s) if in_specs && s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()) => {
-            if s != spec_key {
-                return Err(refuse(format!(
-                    "{}: its content's key is {spec_key}, not its name; a spec under specs/ \
-                     is not edited in place",
-                    path.display()
-                )));
-            }
-            Ok(())
-        }
-        _ => Ok(()),
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let is_key = stem.len() == 32 && stem.bytes().all(|b| b.is_ascii_hexdigit());
+    if in_specs && is_key && stem != spec_key {
+        return Err(refuse(format!(
+            "{}: its content's key is {spec_key}, not its name; a spec under specs/ is not \
+             edited in place",
+            path.display()
+        )));
     }
+    Ok(())
 }
 
 /// `legume benchmark plan`.
@@ -172,9 +168,7 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
             )),
         },
         Err(_) => {
-            let mut json = serde_json::to_string_pretty(&here)?;
-            json.push('\n');
-            crate::job::replace(&dir, "machine.json", json.as_bytes())?;
+            crate::job::replace(&dir, "machine.json", crate::pretty(&here)?.as_bytes())?;
         }
     }
     crate::job::replace(
@@ -204,9 +198,7 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
             .collect(),
         cells: &cells,
     };
-    let mut plan_text = serde_json::to_string_pretty(&plan_json)?;
-    plan_text.push('\n');
-    crate::job::replace(&dir, "plan.json", plan_text.as_bytes())?;
+    crate::job::replace(&dir, "plan.json", crate::pretty(&plan_json)?.as_bytes())?;
 
     let shown = |p: &Path| {
         p.strip_prefix(&root)

@@ -31,7 +31,9 @@
 //!   the folder made absolute.
 
 use super::key;
-use super::spec::{AxisValue, Lane, Seeds, Spec, Stage, THREAD_VARS};
+use super::spec::{
+    bad, is_plain_relative, AxisValue, Lane, Seeds, Spec, Stage, RESERVED, THREAD_VARS,
+};
 use crate::command::refuse;
 use anyhow::Result;
 use serde::Serialize;
@@ -179,11 +181,6 @@ fn classify<'a>(name: &'a str, spec: &Spec) -> Option<Ph<'a>> {
         .then_some(Ph::Stage(name))
 }
 
-/// A refusal of what is at `at`.
-fn bad(at: &str, what: impl std::fmt::Display) -> anyhow::Error {
-    refuse(format!("{at}: {what}"))
-}
-
 /// Each placeholder of `lane`'s argv, with where it is.
 fn placeholders<'a>(spec: &Spec, lane: &'a Lane) -> Result<Vec<(String, &'a str, Ph<'a>)>> {
     let mut out = Vec::new();
@@ -192,12 +189,16 @@ fn placeholders<'a>(spec: &Spec, lane: &'a Lane) -> Result<Vec<(String, &'a str,
         for seg in segments(token).map_err(|e| bad(&at, e))? {
             let Seg::Name(name) = seg else { continue };
             let ph = classify(name, spec).ok_or_else(|| {
+                let own: Vec<&str> = RESERVED
+                    .into_iter()
+                    .filter(|r| !matches!(*r, "inputs" | "glob"))
+                    .collect();
                 bad(
                     &at,
                     format!(
                         "{{{name}}} is no placeholder: not an axis, a binding, a stage, \
-                         inputs.NAME, glob:STAGE/PATTERN, or one of rep, rep_seed, seed, \
-                         method, threads, gpu, out, legume"
+                         inputs.NAME, glob:STAGE/PATTERN, or one of {}",
+                        own.join(", ")
                     ),
                 )
             })?;
@@ -208,7 +209,7 @@ fn placeholders<'a>(spec: &Spec, lane: &'a Lane) -> Result<Vec<(String, &'a str,
 }
 
 /// The basename of a tool word.
-fn base(word: &str) -> &str {
+pub(super) fn base(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
 }
 
@@ -232,11 +233,7 @@ pub fn check(spec: &Spec) -> Result<()> {
                     }
                     Ph::Stage(t) => upstream(spec, si, lane, t, &at, name)?,
                     Ph::Glob(t, pattern) => {
-                        let p = Path::new(pattern);
-                        if pattern.is_empty()
-                            || p.components()
-                                .any(|c| !matches!(c, std::path::Component::Normal(_)))
-                        {
+                        if !is_plain_relative(pattern) {
                             return Err(bad(
                                 &at,
                                 format!("{{{name}}}: a glob is {{glob:STAGE/PATTERN}}, the pattern inside the stage's folder"),

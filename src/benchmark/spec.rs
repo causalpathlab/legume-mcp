@@ -144,15 +144,32 @@ pub fn parse(text: &str) -> Result<(Spec, Value)> {
 }
 
 /// A refusal of what is at `at`.
-fn bad(at: &str, what: impl std::fmt::Display) -> anyhow::Error {
+pub(super) fn bad(at: &str, what: impl std::fmt::Display) -> anyhow::Error {
     refuse(format!("{at}: {what}"))
 }
 
-/// A name: one to 40 of `[A-Za-z0-9._-]`, as an axis value or a label.
-fn is_value(s: &str) -> bool {
-    (1..=40).contains(&s.len())
+/// `s`, a name: one to 40 of `[A-Za-z0-9._-]`, as an axis value or a
+/// label; refused at `at` when not.
+fn value(at: &str, s: &str) -> Result<String> {
+    let ok = (1..=40).contains(&s.len())
         && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if !ok {
+        return Err(bad(
+            at,
+            format!("{s:?} is not 1 to 40 of A-Z a-z 0-9 . _ -"),
+        ));
+    }
+    Ok(s.to_string())
+}
+
+/// `p` is a plain path inside a folder: not empty, and each part a name
+/// (no root, `.` or `..`).
+pub(super) fn is_plain_relative(p: &str) -> bool {
+    !p.is_empty()
+        && std::path::Path::new(p)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
 /// A placeholder name: a letter or `_`, then letters, digits and `_`.
@@ -415,13 +432,7 @@ fn lane(o: &mut Obj, method: Option<String>, needs: Needs) -> Result<Lane> {
         ));
     }
     for (i, m) in makes.iter().enumerate() {
-        let p = std::path::Path::new(m);
-        if m.is_empty()
-            || p.is_absolute()
-            || m.contains('{')
-            || p.components()
-                .any(|c| !matches!(c, std::path::Component::Normal(_)))
-        {
+        if m.contains('{') || !is_plain_relative(m) {
             return Err(bad(
                 &o.at(&format!("makes[{i}]")),
                 format!("{m:?} is not a plain path inside the cell's folder"),
@@ -511,18 +522,10 @@ fn axis(at: String, name: &str, v: &Value) -> Result<Axis> {
         let first_at = format!("{at}[0]");
         let at = format!("{at}[{i}]");
         let value = match x {
-            Value::String(s) if !tuple => {
-                if !is_value(s) {
-                    return Err(bad(
-                        &at,
-                        format!("{s:?} is not 1 to 40 of A-Z a-z 0-9 . _ -"),
-                    ));
-                }
-                AxisValue {
-                    label: s.clone(),
-                    bindings: Vec::new(),
-                }
-            }
+            Value::String(s) if !tuple => AxisValue {
+                label: value(&at, s)?,
+                bindings: Vec::new(),
+            },
             Value::Object(map) if tuple => tuple_value(&at, map)?,
             Value::Number(n) if !tuple => {
                 return Err(bad(
@@ -563,13 +566,7 @@ fn axis(at: String, name: &str, v: &Value) -> Result<Axis> {
 
 fn tuple_value(at: &str, map: &Map<String, Value>) -> Result<AxisValue> {
     let label = match map.get("label") {
-        Some(Value::String(s)) if is_value(s) => s.clone(),
-        Some(Value::String(s)) => {
-            return Err(bad(
-                &format!("{at}.label"),
-                format!("{s:?} is not 1 to 40 of A-Z a-z 0-9 . _ -"),
-            ))
-        }
+        Some(Value::String(s)) => value(&format!("{at}.label"), s)?,
         _ => return Err(bad(at, "needs a label, a string")),
     };
     let mut bindings = Vec::new();
@@ -579,13 +576,7 @@ fn tuple_value(at: &str, map: &Map<String, Value>) -> Result<AxisValue> {
             return Err(bad(&at, format!("{k:?} cannot name a binding")));
         }
         match v {
-            Value::String(s) if is_value(s) => bindings.push((k.clone(), s.clone())),
-            Value::String(s) => {
-                return Err(bad(
-                    &at,
-                    format!("{s:?} is not 1 to 40 of A-Z a-z 0-9 . _ -"),
-                ))
-            }
+            Value::String(s) => bindings.push((k.clone(), value(&at, s)?)),
             _ => return Err(bad(&at, format!("is {}, not a string", kind(v)))),
         }
     }
@@ -648,10 +639,11 @@ fn from_value(v: &Value) -> Result<Spec> {
     let name = o
         .string("name")?
         .ok_or_else(|| bad("name", "is required: the benchmark's folder name"))?;
-    if !is_value(&name) || name.starts_with('.') {
+    let name = value("name", &name)?;
+    if name.starts_with('.') {
         return Err(bad(
             "name",
-            format!("{name:?} is not 1 to 40 of A-Z a-z 0-9 . _ -"),
+            format!("{name:?} starts with a dot; a benchmark's folder is not hidden"),
         ));
     }
     let cores = o.u32("cores")?;
@@ -1027,6 +1019,18 @@ mod tests {
         for (extra, want) in cases {
             assert_eq!(refused(&with(extra)), *want, "{extra}");
         }
+        assert_eq!(
+            refused(
+                r#"{"name": ".N1", "seeds": {"n": 1}, "stages": [{"name": "s", "run": ["T"], "makes": ["m"]}]}"#
+            ),
+            "name: \".N1\" starts with a dot; a benchmark's folder is not hidden"
+        );
+        assert_eq!(
+            refused(
+                r#"{"name": "N 1", "seeds": {"n": 1}, "stages": [{"name": "s", "run": ["T"], "makes": ["m"]}]}"#
+            ),
+            "name: \"N 1\" is not 1 to 40 of A-Z a-z 0-9 . _ -"
+        );
         let stages: &[(&str, &str)] = &[
             (r#"{"name": "a-b", "run": ["T"], "makes": ["m"]}"#,
              "stages[0].name: \"a-b\" is no stage name (a letter, then letters, digits and _)"),

@@ -790,6 +790,11 @@ pub(crate) fn on_path_in(
         .find(|p| accept(p))
 }
 
+/// `v` as pretty JSON, ending in a newline, as a file holds it.
+pub(crate) fn pretty<T: serde::Serialize + ?Sized>(v: &T) -> Result<String> {
+    Ok(serde_json::to_string_pretty(v)? + "\n")
+}
+
 /// `p` absolute, against the working directory, without touching the disk.
 pub(crate) fn absolute(p: &Path) -> PathBuf {
     std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())

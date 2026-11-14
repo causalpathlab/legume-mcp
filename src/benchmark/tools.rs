@@ -11,14 +11,11 @@
 //! cells. `snapshot: false` runs the installed binary itself.
 
 use super::key;
-use super::plan::LEGUME;
-use crate::procgroup::Group;
+use super::plan::{base, LEGUME};
 use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::mpsc::{channel, RecvTimeoutError};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// How long `--version` may take.
@@ -101,11 +98,12 @@ pub fn find(
 }
 
 /// The name a tool's snapshot takes: its word's last part, or `legume`.
-fn basename(f: &Found) -> String {
+fn basename(f: &Found) -> &str {
     if f.word == LEGUME {
-        return "legume".into();
+        "legume"
+    } else {
+        base(&f.word)
     }
-    f.word.rsplit('/').next().unwrap_or(&f.word).to_string()
 }
 
 /// `source`, whose bytes have `content_key`, copied to
@@ -144,46 +142,17 @@ pub fn snapshot(dir: &Path, source: &Path, content_key: &str, name: &str) -> Res
 /// `timeout`; its process group is killed either way.
 pub fn version(exec: &Path, timeout: Duration) -> Option<String> {
     let mut cmd = Command::new(exec);
-    cmd.arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut group = Group::spawn(&mut cmd).ok()?;
-    let stdout = group.take_stdout()?;
-    let (tx, rx) = channel();
-    // Not joined: a descendant that keeps stdout open keeps it reading.
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if tx.send(line).is_err() {
-                return;
-            }
-        }
-    });
-    let start = Instant::now();
-    let mut exited = false;
-    while start.elapsed() < timeout {
-        if group.exited().unwrap_or(true) {
-            exited = true;
-            break;
-        }
-        std::thread::sleep(crate::procgroup::LOOK);
-    }
-    let status = group.stop(Duration::from_millis(200)).ok()?;
-    if !exited || !status.success() {
-        return None;
-    }
-    let mut first = None;
-    loop {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(line) if first.is_none() && !line.trim().is_empty() => first = Some(line),
-            Ok(_) => {}
-            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    first.map(|l| {
-        let one: String = l.trim().replace(['\t', '\r'], " ");
-        one.chars().take(200).collect()
-    })
+    cmd.arg("--version");
+    let deadline = Instant::now() + timeout;
+    let out = crate::run_child(cmd, &|| Instant::now() >= deadline, &|_| {}).ok()?;
+    let line = out.lines().find(|l| !l.trim().is_empty())?;
+    Some(
+        line.trim()
+            .replace(['\t', '\r'], " ")
+            .chars()
+            .take(200)
+            .collect(),
+    )
 }
 
 /// A row of a `versions.tsv`.
@@ -282,7 +251,7 @@ pub fn settle(
         let (content_key, exec) = match kept {
             Some(o) => (o.content_key.clone(), PathBuf::from(&o.exec)),
             None if f.snapshot => {
-                let exec = snapshot(dir, &f.source, &now, &basename(f))?;
+                let exec = snapshot(dir, &f.source, &now, basename(f))?;
                 (now, exec)
             }
             None => (now, f.source.clone()),
