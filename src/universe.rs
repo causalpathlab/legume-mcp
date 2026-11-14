@@ -10,8 +10,8 @@
 //! of the TSS, bounds included. With `--max-per-gene K`, a gene keeps its
 //! K nearest by (distance, peak index), listed by peak index.
 
-use crate::command::{required, usage};
-use crate::table::{self, TextOut};
+use crate::command::{flag_pairs, required, usage};
+use crate::table;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -209,15 +209,11 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
     }
     let (mut genes, mut peaks, mut window, mut max_per_gene, mut out) =
         (None, None, None, None, None);
-    let mut it = args[1..].iter();
-    while let Some(flag) = it.next() {
-        if matches!(flag.as_str(), "-h" | "--help") {
-            return Ok(None);
-        }
-        let Some(v) = it.next() else {
-            return Err(usage(format!("{flag} needs a value, or is unknown")));
-        };
-        match flag.as_str() {
+    let Some(pairs) = flag_pairs(&args[1..])? else {
+        return Ok(None);
+    };
+    for (flag, v) in pairs {
+        match flag {
             "--gene-coords" => genes = Some(PathBuf::from(v)),
             "--peaks" => peaks = Some(PathBuf::from(v)),
             "--window" => match v.parse::<i64>() {
@@ -253,17 +249,17 @@ pub fn main(args: &[String], out: &mut dyn Write) -> Result<()> {
     let peaks: Vec<Option<Peak>> = names.iter().map(|n| parse_peak(n)).collect();
     let pairs = cis_pairs(&genes, &peaks, spec.window, spec.max_per_gene);
 
-    let mut file = TextOut::create(&spec.out)?;
-    writeln!(file, "gene\tpeak\tdistance")?;
-    for p in &pairs {
-        writeln!(
-            file,
-            "{}\t{}\t{}",
-            genes[p.gene].name, names[p.peak], p.distance
-        )?;
-    }
-    file.finish()
-        .with_context(|| format!("cannot write {}", spec.out.display()))?;
+    table::write_text(&spec.out, |w| {
+        writeln!(w, "gene\tpeak\tdistance")?;
+        for p in &pairs {
+            writeln!(
+                w,
+                "{}\t{}\t{}",
+                genes[p.gene].name, names[p.peak], p.distance
+            )?;
+        }
+        Ok(())
+    })?;
 
     let mut per_gene = vec![0usize; genes.len()];
     for p in &pairs {

@@ -185,14 +185,8 @@ pub fn main(args: &[String], out: &mut dyn Write) -> Result<()> {
         Some(p) => crate::absolute(&p),
         None => std::env::current_dir()?,
     };
-    let same = |a: &Path, b: &Path| {
-        a.canonicalize()
-            .ok()
-            .zip(b.canonicalize().ok())
-            .is_some_and(|(a, b)| a == b)
-    };
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    if project.parent().is_none() || home.is_some_and(|h| same(&project, &h)) {
+    if project.parent().is_none() || home.is_some_and(|h| crate::same_file(&project, &h)) {
         anyhow::bail!(
             "{} is not a project's folder: every folder under it would keep its records \
              there. Make a folder for the project, change into it and run `legume init` \

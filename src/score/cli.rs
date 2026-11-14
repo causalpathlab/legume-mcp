@@ -1,7 +1,7 @@
 //! `legume score`'s command line.
 
 use super::{run, Dup, Outside, Score, Spec, Transform, Universe};
-use crate::command::{required, usage};
+use crate::command::{flag_pairs, one_of, required, usage};
 use anyhow::Result;
 use std::io::Write;
 use std::path::PathBuf;
@@ -50,6 +50,9 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
     }
 }
 
+/// What `--truth-outside` and `--scored-outside` take.
+const OUTSIDE: &[(&str, Outside)] = &[("fail", Outside::Fail), ("drop", Outside::Drop)];
+
 /// A comma-separated list of column names.
 fn columns(flag: &str, s: &str) -> Result<Vec<String>> {
     let cols: Vec<String> = s.split(',').map(str::to_string).collect();
@@ -89,16 +92,11 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
     let (mut truth_outside, mut scored_outside, mut dup) =
         (Outside::Fail, Outside::Drop, Dup::Fail);
     let (mut list, mut out) = (Vec::new(), None);
-    let mut it = args.iter();
-    while let Some(flag) = it.next() {
-        if matches!(flag.as_str(), "-h" | "--help") {
-            return Ok(None);
-        }
-        let Some(value) = it.next() else {
-            return Err(usage(format!("{flag} needs a value, or is unknown")));
-        };
-        let v = value.as_str();
-        match flag.as_str() {
+    let Some(pairs) = flag_pairs(args)? else {
+        return Ok(None);
+    };
+    for (flag, v) in pairs {
+        match flag {
             "--scores" => scores = Some(PathBuf::from(v)),
             "--key" => key = Some(columns(flag, v)?),
             "--score" => list.push(score(v)?),
@@ -111,25 +109,9 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
             },
             "--universe" => universe = Some(v.to_string()),
             "--universe-key" => universe_key = Some(columns(flag, v)?),
-            "--truth-outside" | "--scored-outside" => {
-                let o = match v {
-                    "fail" => Outside::Fail,
-                    "drop" => Outside::Drop,
-                    _ => return Err(usage(format!("{flag} is fail or drop, not {v:?}"))),
-                };
-                if flag == "--truth-outside" {
-                    truth_outside = o;
-                } else {
-                    scored_outside = o;
-                }
-            }
-            "--dup" => {
-                dup = match v {
-                    "fail" => Dup::Fail,
-                    "max" => Dup::Max,
-                    _ => return Err(usage(format!("--dup is fail or max, not {v:?}"))),
-                }
-            }
+            "--truth-outside" => truth_outside = one_of(flag, v, OUTSIDE)?,
+            "--scored-outside" => scored_outside = one_of(flag, v, OUTSIDE)?,
+            "--dup" => dup = one_of(flag, v, &[("fail", Dup::Fail), ("max", Dup::Max)])?,
             "-o" | "--out" => out = Some(PathBuf::from(v)),
             _ => return Err(usage(format!("unknown argument {flag}"))),
         }

@@ -330,19 +330,27 @@ fn read_scores(
     })
 }
 
-/// Two paths that name one file.
-fn same_file(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
+/// The refusal of `count` `what` outside the universe under `policy`
+/// fail (`flag` drop leaves them out, counted as `column`): exit 3.
+fn outside(count: usize, policy: Outside, what: &str, flag: &str, column: &str) -> Result<()> {
+    if count > 0 && policy == Outside::Fail {
+        return Err(Exit {
+            code: 3,
+            message: format!(
+                "{count} {what} are outside the universe; {flag} drop leaves them out, counted \
+                 as {column}"
+            ),
+        }
+        .into());
     }
+    Ok(())
 }
 
 /// Score as `spec` says, write its table, and say what was counted on
 /// `out` and what to doubt on `err`.
 fn run(spec: &Spec, out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
     let same = spec.universe == Universe::Same;
-    if same && spec.scores != spec.truth && !same_file(&spec.scores, &spec.truth) {
+    if same && spec.scores != spec.truth && !crate::same_file(&spec.scores, &spec.truth) {
         return Err(usage(
             "--universe same needs --truth and --scores to be one file; give the universe as a \
              file otherwise",
@@ -384,17 +392,13 @@ fn run(spec: &Spec, out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
         "truth: {} rows, {} keys, {positives} positive in the universe, {} outside it",
         truth.rows, truth.keys, truth.outside_pos
     )?;
-    if truth.outside_pos > 0 && spec.truth_outside == Outside::Fail {
-        return Err(Exit {
-            code: 3,
-            message: format!(
-                "{} truth positives are outside the universe; --truth-outside drop leaves them \
-                 out, counted as outside_pos",
-                truth.outside_pos
-            ),
-        }
-        .into());
-    }
+    outside(
+        truth.outside_pos,
+        spec.truth_outside,
+        "truth positives",
+        "--truth-outside",
+        "outside_pos",
+    )?;
 
     let scored = read_scores(spec, &items, &scores.keys, &scores.columns)?;
     writeln!(
@@ -402,17 +406,13 @@ fn run(spec: &Spec, out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
         "scores: {} rows, {} outside the universe, {} duplicate keys",
         scored.rows, scored.outside, scored.duplicates
     )?;
-    if scored.outside > 0 && spec.scored_outside == Outside::Fail {
-        return Err(Exit {
-            code: 3,
-            message: format!(
-                "{} scored rows are outside the universe; --scored-outside drop leaves them out, \
-                 counted as outside_scored",
-                scored.outside
-            ),
-        }
-        .into());
-    }
+    outside(
+        scored.outside,
+        spec.scored_outside,
+        "scored rows",
+        "--scored-outside",
+        "outside_scored",
+    )?;
 
     let mut rows = Vec::with_capacity(2 * spec.score.len());
     for (s, values) in spec.score.iter().zip(&scored.values) {
@@ -439,12 +439,10 @@ fn run(spec: &Spec, out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
             });
         }
     }
-    let mut file = table::TextOut::create(&spec.out)?;
-    ScoreRow::header(&mut file)?;
-    for r in &rows {
-        r.write(&mut file)?;
-    }
-    file.finish()?;
+    table::write_text(&spec.out, |w| {
+        ScoreRow::header(w)?;
+        rows.iter().try_for_each(|r| r.write(w))
+    })?;
     writeln!(out, "wrote {}", spec.out.display())?;
     Ok(())
 }
@@ -452,6 +450,26 @@ fn run(spec: &Spec, out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_item_outside_the_universe_is_refused_under_fail_only() {
+        assert!(outside(0, Outside::Fail, "M1", "--m1", "m1").is_ok());
+        assert!(outside(5, Outside::Drop, "M1", "--m1", "m1").is_ok());
+        let e = outside(
+            1,
+            Outside::Fail,
+            "scored rows",
+            "--scored-outside",
+            "outside_scored",
+        )
+        .unwrap_err();
+        assert_eq!(crate::command::code(&e), 3);
+        assert_eq!(
+            e.to_string(),
+            "1 scored rows are outside the universe; --scored-outside drop leaves them out, \
+             counted as outside_scored"
+        );
+    }
 
     // Every cell distinct, so a cell written under another column's name
     // reads back wrong.
