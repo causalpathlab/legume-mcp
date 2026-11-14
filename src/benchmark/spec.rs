@@ -140,7 +140,22 @@ pub fn parse(text: &str) -> Result<(Spec, Value)> {
     let v: Value =
         serde_json::from_str(text).map_err(|e| refuse(format!("the spec is not JSON: {e}")))?;
     let spec = from_value(&v)?;
-    Ok((spec, v))
+    Ok((spec, without_nulls(v)))
+}
+
+/// `v` without the fields set to null, at every depth: the spec reads one
+/// as left out, so its key does too.
+fn without_nulls(v: Value) -> Value {
+    match v {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter(|(_, x)| !x.is_null())
+                .map(|(k, x)| (k, without_nulls(x)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(without_nulls).collect()),
+        other => other,
+    }
 }
 
 /// A refusal of what is at `at`.
@@ -922,6 +937,21 @@ mod tests {
         );
         assert_eq!(l.tool_word(), "TOOL1");
         assert_eq!((s.gpu_slots, s.grace_secs, s.min_free_gb), (1, 10, 10.0));
+    }
+
+    // A field set to null is the field left out: the same spec, so the
+    // same JSON to key. A null where a name maps to a value is no field,
+    // and is refused.
+    #[test]
+    fn a_null_field_is_left_out() {
+        let (_, plain) = parse(&format!("{ONE}}}")).unwrap();
+        let nulls = ONE.replace(r#""run""#, r#""threads": null, "run""#);
+        let (_, v) = parse(&format!("{nulls}, \"mem_gb\": null, \"plot\": null}}")).unwrap();
+        assert_eq!(v, plain);
+        assert_eq!(
+            refused(&with(r#""inputs": {"RUN1": null}"#)),
+            "inputs.RUN1: is null, not an object"
+        );
     }
 
     #[test]
