@@ -1,19 +1,13 @@
 //! `legume universe cis`: every gene's cis candidate peaks, by chickpea's
 //! rule, so a metric counts the pairs a pruned links table leaves out.
 
-use flate2::read::MultiGzDecoder;
-use flate2::write::GzEncoder;
-use legume_mcp::universe::{chr_stripped, cis_pairs, parse_peak, Gene, Pair, Peak};
-use std::io::{Read, Write};
-use std::path::Path;
-use std::process::{Command, Output, Stdio};
+mod common;
 
-fn legume(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_legume"))
-        .args(args)
-        .output()
-        .unwrap()
-}
+use common::{legume, legume_fed, tsv};
+use flate2::read::MultiGzDecoder;
+use legume_mcp::universe::{chr_stripped, cis_pairs, parse_peak, Gene, Pair, Peak};
+use std::io::Read;
+use std::path::Path;
 
 fn gene(name: &str, chr: &str, tss: i64) -> Gene {
     Gene {
@@ -127,12 +121,6 @@ fn the_nearest_k_break_a_distance_tie_by_peak_index() {
     assert_eq!(cis_pairs(&genes, &peaks, 100, None).len(), 4);
 }
 
-fn gzip(path: &Path, text: &str) {
-    let mut gz = GzEncoder::new(std::fs::File::create(path).unwrap(), Default::default());
-    gz.write_all(text.as_bytes()).unwrap();
-    gz.finish().unwrap();
-}
-
 fn gunzip(path: &Path) -> String {
     let mut text = String::new();
     MultiGzDecoder::new(std::fs::File::open(path).unwrap())
@@ -150,9 +138,15 @@ fn universe_cis_writes_gene_peak_distance_and_says_how_many() {
     let genes = dir.path().join("sim.gene_coords.tsv.gz");
     let peaks = dir.path().join("sim.peak_names.txt");
     let out = dir.path().join("cis.tsv.gz");
-    gzip(
+    tsv(
         &genes,
-        "gene\tchr\ttss\nGENE1\tchr1\t9000\nGENE2\tchr2\nGENE3\tchr2\t1000\nGENE1\tchr1\t1000\n",
+        "gene\tchr\ttss",
+        &[
+            "GENE1\tchr1\t9000",
+            "GENE2\tchr2",
+            "GENE3\tchr2\t1000",
+            "GENE1\tchr1\t1000",
+        ],
     );
     let names = [
         "chr1:1040-1060",
@@ -162,7 +156,7 @@ fn universe_cis_writes_gene_peak_distance_and_says_how_many() {
         "chr1:9000-9010",
     ];
     std::fs::write(&peaks, names.join("\n") + "\n").unwrap();
-    let o = legume(&[
+    let o = legume([
         "universe",
         "cis",
         "--gene-coords",
@@ -201,34 +195,22 @@ fn a_piped_gene_or_peak_file_is_read_whole() {
     let genes = dir.path().join("sim.gene_coords.tsv.gz");
     let peaks = dir.path().join("sim.peak_names.txt");
     let out = dir.path().join("cis.tsv");
-    gzip(&genes, "gene\tchr\ttss\nGENE1\tchr1\t1000\n");
+    tsv(&genes, "gene\tchr\ttss", &["GENE1\tchr1\t1000"]);
     std::fs::write(&peaks, "chr1:990-1010\nchr1:995-1005\n").unwrap();
+    let args = [
+        "universe",
+        "cis",
+        "--gene-coords",
+        genes.to_str().unwrap(),
+        "--peaks",
+        peaks.to_str().unwrap(),
+        "--window",
+        "100",
+        "-o",
+        out.to_str().unwrap(),
+    ];
     for piped in [&genes, &peaks] {
-        let arg = |p: &Path| {
-            if p == piped {
-                "/dev/stdin".to_string()
-            } else {
-                p.to_str().unwrap().to_string()
-            }
-        };
-        let mut child = Command::new(env!("CARGO_BIN_EXE_legume"))
-            .args(["universe", "cis", "--gene-coords", &arg(&genes)])
-            .args(["--peaks", &arg(&peaks), "--window", "100"])
-            .args(["-o", out.to_str().unwrap()])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdin = child.stdin.take().unwrap();
-        let input = std::fs::read(piped).unwrap();
-        // A run that stops reading closes the pipe: that write error is the
-        // run's answer, not the test's.
-        let feed = std::thread::spawn(move || {
-            let _ = stdin.write_all(&input);
-        });
-        let o = child.wait_with_output().unwrap();
-        feed.join().unwrap();
+        let o = legume_fed(args, piped, std::fs::read(piped).unwrap());
         let e = String::from_utf8_lossy(&o.stderr);
         assert!(o.status.success(), "{} piped: {e}", piped.display());
         assert_eq!(
@@ -245,10 +227,10 @@ fn universe_cis_needs_a_window() {
     let dir = tempfile::tempdir().unwrap();
     let genes = dir.path().join("g.tsv");
     let peaks = dir.path().join("p.txt");
-    std::fs::write(&genes, "gene\tchr\ttss\nGENE1\tchr1\t1000\n").unwrap();
+    tsv(&genes, "gene\tchr\ttss", &["GENE1\tchr1\t1000"]);
     std::fs::write(&peaks, "chr1:990-1010\n").unwrap();
     let out = dir.path().join("cis.tsv.gz");
-    let o = legume(&[
+    let o = legume([
         "universe",
         "cis",
         "--gene-coords",
@@ -265,7 +247,7 @@ fn universe_cis_needs_a_window() {
 
 #[test]
 fn universe_help_names_every_flag() {
-    let o = legume(&["universe", "--help"]);
+    let o = legume(["universe", "--help"]);
     assert!(o.status.success());
     let help = String::from_utf8_lossy(&o.stdout);
     for flag in [
