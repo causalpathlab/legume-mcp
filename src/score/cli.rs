@@ -27,7 +27,8 @@ with a header (gzipped or not) or parquet.
                      strictly above X
   --universe F       every item the method could have scored, keyed by
                      --universe-key; `same` when the scores file is also the
-                     truth and lists every item. Required: an item the
+                     truth, keyed by --key as --truth-key, and lists every
+                     item. Required: an item the
                      method left unscored ranks last, it is never dropped
   --truth-outside    a true item outside the universe: fail (exit 3, the
                      default) or drop (counted as outside_pos)
@@ -155,6 +156,11 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
         dup,
         out: required(out, "-o")?,
     };
+    if spec.universe == Universe::Same && spec.truth_key != spec.key {
+        return Err(usage(
+            "--universe same takes --truth-key as --key: the one file is read by its keys once",
+        ));
+    }
     let arity = spec.key.len();
     let other = match &spec.universe {
         Universe::File { key, .. } => key.len(),
@@ -215,6 +221,9 @@ mod tests {
             format!("{BASE} --score M1=v --universe u.tsv --universe-key K,L"),
             format!("{BASE} --score M1=v --universe same --bogus 1"),
             format!("{BASE} --score M1=v --universe same --key"),
+            // The one file is read by --key alone, so --truth-key must be it.
+            format!("{BASE} --score M1=v --universe same --truth-key L"),
+            format!("{BASE} --key K,L --truth-key L,K --score M1=v --universe same"),
         ] {
             assert_eq!(code(parse(&args(&bad)).unwrap_err()), 2, "{bad}");
         }
