@@ -43,6 +43,8 @@ use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(feature = "benchmark")]
+pub mod benchmark;
 pub mod brain;
 #[cfg(feature = "clap")]
 pub mod cli;
