@@ -417,6 +417,49 @@ fn reference_atac_pair_truth_refused() {
     assert!(!p.root().join("results").exists());
 }
 
+// A grid that exclude empties is refused, exit 3, before any tool is
+// snapshot or asked its version: nothing written.
+#[test]
+fn an_empty_grid_is_refused_with_nothing_written() {
+    let p = Project::new();
+    p.tool("TOOL1", "true");
+    p.tool("TOOL2", "true");
+    let spec = TWO.replace(
+        "\"seeds\"",
+        "\"exclude\": [{\"A\": \"1\"}, {\"A\": \"2\"}], \"seeds\"",
+    );
+    let o = p.legume(&["plan", p.spec("S1.json", &spec).to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    assert_eq!(
+        stderr(&o),
+        "legume benchmark: exclude: drops every point of the grid\n"
+    );
+    assert!(!p.root().join("results").exists());
+}
+
+// A canonical spec found with other bytes than its name's key is refused
+// before any tool is snapshot.
+#[test]
+fn a_spec_file_of_other_bytes_is_refused_before_the_tools() {
+    let p = Project::new();
+    p.tool("TOOL1", "true");
+    p.tool("TOOL2", "true");
+    let spec = p.spec("S1.json", TWO);
+    ok(&p.legume(&["plan", spec.to_str().unwrap()]));
+    let key = p.plan("N1")["spec_key"].as_str().unwrap().to_string();
+    let bench = p.bench("N1");
+    std::fs::write(bench.join(format!("specs/{key}.json")), "{}\n").unwrap();
+    std::fs::remove_dir_all(bench.join("tools")).unwrap();
+    let o = p.legume(&["plan", spec.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    assert!(
+        stderr(&o).ends_with("is there with other bytes than its name's key\n"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!bench.join("tools").exists());
+}
+
 // Every unresolved tool is named, exit 3, nothing written.
 #[test]
 fn unresolved_tools_are_listed() {

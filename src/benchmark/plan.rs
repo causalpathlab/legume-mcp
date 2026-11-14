@@ -16,8 +16,10 @@
 //!   one with.
 //! - **Key.** FNV-1a 128 over the canonical JSON of the stage, the method,
 //!   the argv template, the thread variables as templates, the tool's
-//!   content key, the declared inputs it reads (by content) and the keys of
-//!   the cells it reads. The template keeps every path placeholder
+//!   content key (and legume's, when another tool's argv embeds
+//!   `{legume}`), the declared inputs it reads (by content, named by
+//!   `{inputs.NAME}` or by a path under one) and the keys of the cells it
+//!   reads. The template keeps every path placeholder
 //!   (`{out}`, `{<stage>}`, `{glob:...}`, `{inputs.NAME}`, `{legume}`) and
 //!   `{threads}` and `{gpu}` as written: what they name is keyed by
 //!   content, so a key survives moving the project.
@@ -243,7 +245,35 @@ pub fn check(spec: &Spec) -> Result<()> {
         }
     }
     scores_made(spec)?;
-    reference_truth(spec)
+    reference_truth(spec)?;
+    grid(spec)
+}
+
+/// The grid has a point, and each point an id of its own (two of one id
+/// would share their cells' folders).
+fn grid(spec: &Spec) -> Result<()> {
+    let points = points(spec);
+    if points.is_empty() {
+        return Err(refuse("exclude: drops every point of the grid"));
+    }
+    let shown = |l: &BTreeMap<String, String>| {
+        let pairs: Vec<String> = l.iter().map(|(a, v)| format!("{a}={v}")).collect();
+        pairs.join(",")
+    };
+    let mut ids: HashMap<String, BTreeMap<String, String>> = HashMap::new();
+    for point in &points {
+        let l = labels(point);
+        let id = point_id(&l);
+        if let Some(first) = ids.get(&id) {
+            return Err(refuse(format!(
+                "axes: the points {} and {} share the id {id}; relabel one",
+                shown(first),
+                shown(&l)
+            )));
+        }
+        ids.insert(id, l);
+    }
+    Ok(())
 }
 
 /// `{<t>}` (or a glob in `t`) used at `at`, by `lane` of stage `si`: `t` is
@@ -313,11 +343,7 @@ fn scores_made(spec: &Spec) -> Result<()> {
             if !ends {
                 continue;
             }
-            let n = lane
-                .makes
-                .iter()
-                .filter(|m| m.ends_with(".score.tsv"))
-                .count();
+            let n = scores(lane);
             if n != 1 {
                 let what = lane
                     .method
@@ -336,9 +362,17 @@ fn scores_made(spec: &Spec) -> Result<()> {
     Ok(())
 }
 
+/// How many `*.score.tsv` `lane` makes.
+fn scores(lane: &Lane) -> usize {
+    lane.makes
+        .iter()
+        .filter(|m| m.ends_with(".score.tsv"))
+        .count()
+}
+
 /// A data-beans multiome run with `--reference-atac` writes its pair truth
 /// in synthetic index space against real peak names: no universe holds
-/// those pairs, so nothing may score against it.
+/// those pairs, so no lane that makes a score may read it.
 fn reference_truth(spec: &Spec) -> Result<()> {
     for (si, stage) in spec.stages.iter().enumerate() {
         let reference = stage.lanes.iter().any(|l| {
@@ -352,10 +386,12 @@ fn reference_truth(spec: &Spec) -> Result<()> {
             continue;
         }
         for later in &spec.stages[si + 1..] {
-            for lane in &later.lanes {
+            for lane in later.lanes.iter().filter(|l| scores(l) > 0) {
                 for (i, token) in lane.run.iter().enumerate() {
-                    let reads = token.contains(&format!("{{{}}}", stage.name))
-                        || token.contains(&format!("{{glob:{}/", stage.name));
+                    let reads = segments(token).unwrap_or_default().iter().any(|seg| {
+                        let Seg::Name(n) = seg else { return false };
+                        matches!(classify(n, spec), Some(Ph::Stage(t) | Ph::Glob(t, _)) if t == stage.name)
+                    });
                     if reads && token.contains("ground_truth") {
                         return Err(bad(
                             &format!("{}.run[{i}]", lane.at),
@@ -444,27 +480,33 @@ pub fn cell_id(point: &str, rep: u32, stage: &str, method: Option<&str>) -> Stri
 }
 
 /// Each tool word the spec runs, with whether it is snapshot, and the
-/// first lane that names it; [`LEGUME`] when any argv uses `{legume}`. A
-/// tool snapshot in one lane and not in another is refused.
+/// first lane that names it; [`LEGUME`] also when an argv word uses
+/// `{legume}`, snapshot as the lanes that run it are, and when none does,
+/// snapshot. A tool snapshot in one lane and not in another is refused.
 pub fn tool_words(spec: &Spec) -> Result<Vec<(String, bool, String)>> {
     let mut out: Vec<(String, bool, String)> = Vec::new();
+    let mut embeds: Option<&str> = None;
     for lane in spec.stages.iter().flat_map(|s| &s.lanes) {
-        let mut words = vec![(lane.tool_word().to_string(), lane.snapshot)];
-        if lane.tool_word() != LEGUME && lane.run.iter().any(|t| t.contains(LEGUME)) {
-            words.push((LEGUME.to_string(), true));
+        let word = lane.tool_word();
+        if word != LEGUME && embeds.is_none() && lane.run.iter().any(|t| t.contains(LEGUME)) {
+            embeds = Some(&lane.at);
         }
-        for (word, snapshot) in words {
-            match out.iter().find(|(w, _, _)| *w == word) {
-                Some((_, s, first)) if *s != snapshot => {
-                    return Err(bad(
-                        &format!("{}.snapshot", lane.at),
-                        format!("is {snapshot}, but {first} runs {word} with snapshot {s}"),
-                    ))
-                }
-                Some(_) => {}
-                None => out.push((word, snapshot, lane.at.clone())),
+        match out.iter().find(|(w, _, _)| w == word) {
+            Some((_, s, first)) if *s != lane.snapshot => {
+                return Err(bad(
+                    &format!("{}.snapshot", lane.at),
+                    format!(
+                        "is {}, but {first} runs {word} with snapshot {s}",
+                        lane.snapshot
+                    ),
+                ))
             }
+            Some(_) => {}
+            None => out.push((word.to_string(), lane.snapshot, lane.at.clone())),
         }
+    }
+    if let Some(at) = embeds.filter(|_| !out.iter().any(|(w, _, _)| w == LEGUME)) {
+        out.push((LEGUME.to_string(), true, at.to_string()));
     }
     Ok(out)
 }
@@ -524,14 +566,10 @@ impl Fill<'_> {
     }
 }
 
-/// Every cell of `spec`, replicate by replicate, point by point, stage by
-/// stage; the spec checked first ([`check`]).
+/// Every cell of `spec`, a spec [`check`] passed, replicate by replicate,
+/// point by point, stage by stage.
 pub fn cells(spec: &Spec, ctx: &Context) -> Result<Vec<Cell>> {
-    check(spec)?;
     let points = points(spec);
-    if points.is_empty() {
-        return Err(refuse("exclude: drops every point of the grid"));
-    }
     let threads_env: BTreeMap<String, String> = THREAD_VARS
         .iter()
         .map(|v| (v.to_string(), "{threads}".to_string()))
@@ -557,11 +595,14 @@ pub fn cells(spec: &Spec, ctx: &Context) -> Result<Vec<Cell>> {
                     values.insert("rep", rep.to_string());
                     values.insert("rep_seed", rep_seed.to_string());
                     values.insert("seed", seed.to_string());
+                    let word = lane.tool_word();
                     let mut upstream: Vec<String> = Vec::new();
                     let mut stages: HashMap<&str, PathBuf> = HashMap::new();
                     let mut inputs: Vec<&str> = Vec::new();
+                    let mut embeds_legume = false;
                     for (_, _, ph) in placeholders(spec, lane)? {
                         match ph {
+                            Ph::Legume => embeds_legume = word != LEGUME,
                             Ph::Stage(t) | Ph::Glob(t, _) => {
                                 let up = spec.stages.iter().find(|s| s.name == t);
                                 let m = up.filter(|s| s.methods).and(method);
@@ -575,7 +616,6 @@ pub fn cells(spec: &Spec, ctx: &Context) -> Result<Vec<Cell>> {
                             _ => {}
                         }
                     }
-                    inputs.sort_unstable();
                     let dir = ctx.dir.join("cells").join(&id);
                     let fill = Fill {
                         values,
@@ -585,7 +625,6 @@ pub fn cells(spec: &Spec, ctx: &Context) -> Result<Vec<Cell>> {
                         stages,
                         ctx,
                     };
-                    let word = lane.tool_word();
                     let tool = ctx.tools.get(word).ok_or_else(|| {
                         bad(
                             &format!("{}.run[0]", lane.at),
@@ -598,13 +637,24 @@ pub fn cells(spec: &Spec, ctx: &Context) -> Result<Vec<Cell>> {
                         template.push(fill.token(spec, t, true));
                         argv.push(fill.token(spec, t, false));
                     }
+                    // A declared input named by its path is read as well.
+                    for t in &argv[1..] {
+                        let p = named_path(t);
+                        for (n, (i, _)) in ctx.inputs {
+                            if p.is_absolute() && p.starts_with(i) && !inputs.contains(&n.as_str())
+                            {
+                                inputs.push(n);
+                            }
+                        }
+                    }
+                    inputs.sort_unstable();
                     let input_keys: Vec<Value> = inputs
                         .iter()
                         .map(|n| json!({"name": n, "hash": ctx.inputs.get(*n).map(|i| &i.1)}))
                         .collect();
                     let upstream_keys: Vec<&String> =
                         upstream.iter().filter_map(|u| keys.get(u)).collect();
-                    let key = key::key_of(&json!({
+                    let mut keyed = json!({
                         "stage": stage.name,
                         "method": method,
                         "argv": template,
@@ -612,7 +662,11 @@ pub fn cells(spec: &Spec, ctx: &Context) -> Result<Vec<Cell>> {
                         "tool": tool.content_key,
                         "inputs": input_keys,
                         "upstream": upstream_keys,
-                    }));
+                    });
+                    if embeds_legume {
+                        keyed["legume"] = json!(ctx.tools.get(LEGUME).map(|t| &t.content_key));
+                    }
+                    let key = key::key_of(&keyed);
                     keys.insert(id.clone(), key.clone());
                     cells.push(Cell {
                         id,
@@ -671,8 +725,8 @@ pub fn warnings(spec: &Spec, cells: &[Cell], ctx: &Context) -> Vec<String> {
     let mut seen: Vec<&str> = Vec::new();
     for cell in cells {
         for token in &cell.argv[1..] {
-            let path = token.rsplit_once('=').map_or(token.as_str(), |p| p.1);
-            let p = Path::new(path);
+            let p = named_path(token);
+            let path = p.to_str().unwrap_or_default();
             let declared = ctx.inputs.values().any(|(i, _)| p.starts_with(i));
             if p.is_absolute()
                 && !p.starts_with(dir)
@@ -690,6 +744,12 @@ pub fn warnings(spec: &Spec, cells: &[Cell], ctx: &Context) -> Vec<String> {
         }
     }
     out
+}
+
+/// The path an argv word names: all of it, or what follows its last `=`
+/// (`--from=PATH`).
+fn named_path(token: &str) -> &Path {
+    Path::new(token.rsplit_once('=').map_or(token, |p| p.1))
 }
 
 /// Listed seeds nearer than this overlap in data-beans' streams.
@@ -819,6 +879,7 @@ mod tests {
     }
 
     fn expand(spec: &Spec) -> Vec<Cell> {
+        check(spec).unwrap();
         let tools = tools(spec);
         let inputs: HashMap<String, (PathBuf, String)> = spec
             .inputs
@@ -1088,6 +1149,77 @@ mod tests {
         assert_ne!(a[1].key, c[1].key, "a tool's bytes");
     }
 
+    /// Each cell's key, with `tools` and the input RUN1 at /I/R keyed `h`.
+    fn keys_with(s: &Spec, tools: &HashMap<String, Tool>, h: &str) -> Vec<String> {
+        let inputs: HashMap<String, (PathBuf, String)> =
+            [("RUN1".to_string(), (PathBuf::from("/I/R"), h.to_string()))].into();
+        let ctx = Context {
+            dir: PathBuf::from("/B"),
+            tools,
+            inputs: &inputs,
+        };
+        cells(s, &ctx).unwrap().into_iter().map(|c| c.key).collect()
+    }
+
+    // A declared input named by its path, not by {inputs.NAME}, is read
+    // all the same: its content enters the key. A path beside it is not
+    // under it.
+    #[test]
+    fn a_declared_input_named_by_its_path_is_keyed() {
+        for (token, keyed) in [
+            ("/I/R/m.json", true),
+            ("--from=/I/R", true),
+            ("/I/R2/m.json", false),
+        ] {
+            let s = spec(&format!(
+                r#"{{"name": "N1", "seeds": {{"n": 1}}, "inputs": {{"RUN1": {{"path": "R"}}}},
+                "stages": [{{"name": "sim", "run": ["T1", "{token}"], "makes": ["m.score.tsv"]}}]}}"#
+            ));
+            let tools = tools(&s);
+            let (a, b) = (keys_with(&s, &tools, "H1"), keys_with(&s, &tools, "H2"));
+            assert_eq!(a != b, keyed, "{token}");
+        }
+    }
+
+    // {legume} inside a word of another tool's argv runs legume: its bytes
+    // enter the key, as a run[0] tool's do.
+    #[test]
+    fn an_embedded_legume_is_keyed() {
+        let s = spec(
+            r#"{"name": "N1", "seeds": {"n": 1}, "stages": [
+            {"name": "sim", "run": ["T1", "-c", "{legume} score --x {out}/x"], "makes": ["m.score.tsv"]}]}"#,
+        );
+        let tools = tools(&s);
+        let mut rebuilt = tools.clone();
+        rebuilt.get_mut(LEGUME).unwrap().content_key = "K-legume-b".into();
+        assert_ne!(keys_with(&s, &tools, "H1"), keys_with(&s, &rebuilt, "H1"));
+    }
+
+    // Two points of one id would share a folder: refused, as is a grid
+    // exclude empties.
+    #[test]
+    fn each_point_has_its_own_id() {
+        let text = |axis: &str, exclude: &str| {
+            format!(
+                r#"{{"name": "N1", "seeds": {{"n": 1}}, "axes": {{"A": {axis}}}, "exclude": {exclude},
+                "stages": [{{"name": "sim", "run": ["T", "{{A}}"], "makes": ["m.score.tsv"]}}]}}"#
+            )
+        };
+        let one = |l: &str| point_id(&[("A".to_string(), l.to_string())].into());
+        assert_eq!(one("82777"), one("105161"));
+        assert_eq!(
+            refused(&text(r#"["82777", "105161"]"#, "[]")),
+            format!(
+                "axes: the points A=82777 and A=105161 share the id {}; relabel one",
+                one("82777")
+            )
+        );
+        assert_eq!(
+            refused(&text(r#"["1"]"#, r#"[{"A": "1"}]"#)),
+            "exclude: drops every point of the grid"
+        );
+    }
+
     #[test]
     fn the_last_stage_of_each_lane_makes_one_score() {
         let no_score = LANES.replace(
@@ -1155,6 +1287,13 @@ mod tests {
                 "{extra}"
             );
         }
+        // A stage that makes no score may read it, for a diagnostic.
+        let diagnostic = r#"{"name": "N1", "seeds": {"n": 1}, "stages": [
+            {"name": "sim", "run": ["data-beans-sim", "multiome", "--reference-atac", "R.zarr"],
+             "makes": ["sim.ground_truth.tsv.gz"]},
+            {"name": "fit", "run": ["T", "--truth", "{sim}/sim.ground_truth.tsv.gz"], "makes": ["fit.tsv"]},
+            {"name": "score", "run": ["T", "{fit}/fit.tsv"], "makes": ["m.score.tsv"]}]}"#;
+        check(&spec(diagnostic)).unwrap();
     }
 
     #[test]
@@ -1178,6 +1317,21 @@ mod tests {
         let words = tool_words(&own).unwrap();
         assert_eq!(words.len(), 1);
         assert_eq!((words[0].0.as_str(), words[0].1), (LEGUME, false));
+        // {legume} inside another lane's argv runs it as the lanes that
+        // run it do, and snapshot when none does.
+        let embedded = |m1: &str| {
+            let s = spec(&format!(
+                r#"{{"name": "N1", "seeds": {{"n": 1}}, "stages": [
+                {{"name": "fit", "methods": {{{m1}
+                  "M2": {{"run": ["T", "{{legume}}"], "makes": ["m.score.tsv"]}}}}}}]}}"#
+            ));
+            let words = tool_words(&s).unwrap();
+            words.iter().find(|w| w.0 == LEGUME).map(|w| w.1)
+        };
+        let m1 =
+            r#""M1": {"snapshot": false, "run": ["{legume}", "score"], "makes": ["m.score.tsv"]},"#;
+        assert_eq!(embedded(m1), Some(false));
+        assert_eq!(embedded(""), Some(true));
     }
 
     // glob_natural_sort_fails_empty: matches are natural-sorted and

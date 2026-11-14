@@ -138,7 +138,10 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
         inputs.insert(i.name.clone(), (p, k));
     }
     let dir = root.join("results").join("benchmarks").join(&spec.name);
-    std::fs::create_dir_all(&dir).with_context(|| format!("making {}", dir.display()))?;
+    // The last refusal, before any tool is snapshot: what a refusal stops
+    // writes nothing but this spec, named by its content.
+    let spec_file = dir.join("specs").join(format!("{spec_key}.json"));
+    write_spec(&spec_file, &canonical)?;
     let (resolved, mut drift) = tools::settle(&dir, &found, retool, tools::VERSION_TIMEOUT)?;
     let tool_map: HashMap<String, plan::Tool> = resolved
         .iter()
@@ -158,8 +161,6 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
     let cells = plan::cells(&spec, &ctx)?;
     warnings.extend(plan::warnings(&spec, &cells, &ctx));
 
-    let spec_file = dir.join("specs").join(format!("{spec_key}.json"));
-    write_spec(&spec_file, &canonical)?;
     let machine_file = dir.join("machine.json");
     match std::fs::read(&machine_file) {
         Ok(bytes) => match serde_json::from_slice::<machine::Machine>(&bytes) {
