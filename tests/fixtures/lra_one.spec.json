@@ -1,0 +1,34 @@
+{
+  "name": "lra-one",
+  "mem_gb": 8,
+  "grace_secs": 10,
+  "axes": {
+    "effect_pve": ["0.02", "0.05", "0.1", "0.2", "0.4"],
+    "conf": [
+      {"label": "none", "confounder": "none", "confound_scale": "0"},
+      {"label": "CT1", "confounder": "celltype", "confound_scale": "1"}
+    ]
+  },
+  "seeds": {"n": 5, "base": 1},
+  "inputs": {"RUN1": {"path": "RUN1/manifest.json"}},
+  "stages": [
+    {"name": "sim", "threads": 4, "mem_gb": 4, "timeout": "30m",
+     "run": ["pinto", "lra-simulate", "--one", "--from", "{inputs.RUN1}",
+             "--set", "effect_pve={effect_pve}", "--set", "confounder={confounder}",
+             "--set", "confound_scale={confound_scale}", "--set", "n_planted=10",
+             "--set", "n_null=10", "--seed", "{rep_seed}", "-o", "{out}/sim"],
+     "makes": ["sim.lra-simulate.parquet"]},
+    {"name": "score", "threads": 1, "timeout": "10m",
+     "run": ["{legume}", "score", "--scores", "{sim}/sim.lra-simulate.parquet",
+             "--key", "ligand,receptor",
+             "--score", "estimate=t", "--score", "estimate_p=neglog10:p",
+             "--score", "ipw=neglog10:effect_ipw_p",
+             "--score", "unadjusted_diff=neglog10:unadjusted_diff_p",
+             "--score", "marginal=neglog10:marginal_cor_p",
+             "--truth", "{sim}/sim.lra-simulate.parquet", "--truth-key", "ligand,receptor",
+             "--universe", "same", "--label", "planted", "--above", "0.5",
+             "-o", "{out}/m.score.tsv"],
+     "makes": ["m.score.tsv"]}
+  ],
+  "plot": {"x": "effect_pve", "facet": "conf", "metrics": ["auprc", "auroc"]}
+}

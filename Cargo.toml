@@ -97,3 +97,7 @@ required-features = ["benchmark"]
 [[test]]
 name = "universe"
 required-features = ["benchmark"]
+
+[[test]]
+name = "benchmark_plan"
+required-features = ["benchmark"]
