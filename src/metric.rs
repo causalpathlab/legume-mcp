@@ -56,7 +56,7 @@ pub fn clean(score: Option<f64>) -> Option<f64> {
 ///
 /// When `scores` and `labels` differ in length.
 pub fn auroc(scores: &[Option<f64>], labels: &[bool]) -> f64 {
-    auroc_of(&ranked(scores, labels))
+    Ranking::new(scores, labels).auroc()
 }
 
 /// Average precision, the step-wise area under the precision-recall curve:
@@ -69,7 +69,7 @@ pub fn auroc(scores: &[Option<f64>], labels: &[bool]) -> f64 {
 ///
 /// When `scores` and `labels` differ in length.
 pub fn average_precision(scores: &[Option<f64>], labels: &[bool]) -> f64 {
-    ap_of(&ranked(scores, labels))
+    Ranking::new(scores, labels).average_precision()
 }
 
 /// The counts beside the metrics (see [`Counts`]).
@@ -78,7 +78,44 @@ pub fn average_precision(scores: &[Option<f64>], labels: &[bool]) -> f64 {
 ///
 /// When `scores` and `labels` differ in length.
 pub fn counts(scores: &[Option<f64>], labels: &[bool]) -> Counts {
-    counts_of(&ranked(scores, labels))
+    Ranking::new(scores, labels).counts()
+}
+
+/// One method's scores ranked once, for all three of [`auroc`],
+/// [`average_precision`] and [`counts`]: the universe is cleaned and sorted
+/// a single time.
+#[derive(Clone, Debug)]
+pub struct Ranking {
+    groups: Vec<Group>,
+}
+
+impl Ranking {
+    /// `scores` ranked against `labels`, one label per score.
+    ///
+    /// # Panics
+    ///
+    /// When `scores` and `labels` differ in length.
+    pub fn new(scores: &[Option<f64>], labels: &[bool]) -> Self {
+        assert_eq!(scores.len(), labels.len(), "one label per score");
+        Self {
+            groups: groups(scores, labels),
+        }
+    }
+
+    /// See [`auroc`].
+    pub fn auroc(&self) -> f64 {
+        auroc_of(&self.groups)
+    }
+
+    /// See [`average_precision`].
+    pub fn average_precision(&self) -> f64 {
+        ap_of(&self.groups)
+    }
+
+    /// See [`counts`].
+    pub fn counts(&self) -> Counts {
+        counts_of(&self.groups)
+    }
 }
 
 /// Items tied after cleaning: how many, how many positive, and their
@@ -90,20 +127,20 @@ struct Group {
     score: Option<f64>,
 }
 
-/// The ranking's tie groups, from the highest score down.
-fn ranked(scores: &[Option<f64>], labels: &[bool]) -> Vec<Group> {
-    assert_eq!(scores.len(), labels.len(), "one label per score");
-    let cleaned: Vec<_> = scores.iter().map(|&s| clean(s)).collect();
-    groups(&cleaned, labels)
+/// The tie groups of `scores`, cleaned, from the highest down.
+fn groups(scores: &[Option<f64>], labels: &[bool]) -> Vec<Group> {
+    tie_groups(
+        scores
+            .iter()
+            .map(|&s| clean(s))
+            .zip(labels.iter().copied())
+            .collect(),
+    )
 }
 
-/// The tie groups of cleaned scores, from the highest down.
-fn groups(cleaned: &[Option<f64>], labels: &[bool]) -> Vec<Group> {
-    let mut items: Vec<_> = cleaned
-        .iter()
-        .copied()
-        .zip(labels.iter().copied())
-        .collect();
+/// The tie groups of cleaned scores, each with its label, from the
+/// highest down.
+fn tie_groups(mut items: Vec<(Option<f64>, bool)>) -> Vec<Group> {
     items.sort_unstable_by(|a, b| order(b.0, a.0));
     items
         .chunk_by(|a, b| order(a.0, b.0).is_eq())
@@ -536,7 +573,7 @@ mod tests {
         let (roc, ap, c) = real(scores, labels);
         let (mut tp, mut seen, mut area) = (0, 0, 0.0);
         let (mut r0, mut p0) = (0.0, 1.0);
-        for g in ranked(scores, labels) {
+        for g in groups(scores, labels) {
             tp += g.pos;
             seen += g.items;
             let (r, p) = (tp as f64 / c.n_pos as f64, tp as f64 / seen as f64);
@@ -565,7 +602,9 @@ mod tests {
                 s => clean(s),
             })
             .collect();
-        of_groups(&groups(&kept, labels))
+        of_groups(&tie_groups(
+            kept.into_iter().zip(labels.iter().copied()).collect(),
+        ))
     }
 
     /// Cleaned but for NaN, which stays and sorts above everything.
@@ -577,13 +616,15 @@ mod tests {
                 s => clean(s),
             })
             .collect();
-        of_groups(&groups(&kept, labels))
+        of_groups(&tie_groups(
+            kept.into_iter().zip(labels.iter().copied()).collect(),
+        ))
     }
 
     /// The tie share with the unscored block counted as a tie.
     fn unscored_counted_as_tied(scores: &[Option<f64>], labels: &[bool]) -> (f64, f64, Counts) {
         let (roc, ap, mut c) = real(scores, labels);
-        let tied: usize = ranked(scores, labels)
+        let tied: usize = groups(scores, labels)
             .iter()
             .filter(|g| g.items > 1)
             .map(|g| g.items)
@@ -598,7 +639,7 @@ mod tests {
     fn ap_without_negatives(scores: &[Option<f64>], labels: &[bool]) -> (f64, f64, Counts) {
         let (roc, _, c) = real(scores, labels);
         let (mut tp, mut seen, mut sum) = (0, 0, 0.0);
-        for g in ranked(scores, labels) {
+        for g in groups(scores, labels) {
             tp += g.pos;
             seen += g.items;
             sum += g.pos as f64 * tp as f64 / seen as f64;
@@ -708,7 +749,7 @@ mod tests {
 
     /// Every labelled vector of up to `longest` items over the first
     /// `classes` classes, against the brute-force metrics, split over the
-    /// cores. (The public functions are these over [`ranked`]; ranking once
+    /// cores. (The public functions are these over [`groups`]; ranking once
     /// keeps it quick.)
     fn brute_force(classes: usize, longest: u32) {
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -739,7 +780,7 @@ mod tests {
             scores.push(raw(rest % classes, i + code));
             rest /= 2 * classes;
         }
-        let g = ranked(&scores, &labels);
+        let g = groups(&scores, &labels);
         let (roc, ap) = (auroc_of(&g), ap_of(&g));
         assert!(
             near(roc, pairs_auroc(&class, &labels)),
