@@ -23,6 +23,9 @@
 //!   (`{out}`, `{<stage>}`, `{glob:...}`, `{inputs.NAME}`, `{legume}`) and
 //!   `{threads}` and `{gpu}` as written: what they name is keyed by
 //!   content, so a key survives moving the project.
+//! - **Braces.** `{{` and `}}` write one brace (an awk program, a JSON
+//!   value); the key's template keeps them doubled, apart from a
+//!   placeholder.
 //! - **Globs.** `{glob:<stage>/<pattern>}` matches in the upstream cell's
 //!   folder when the cell starts ([`glob`]); the plan's argv holds it with
 //!   the folder made absolute.
@@ -87,18 +90,26 @@ enum Seg<'a> {
     Name(&'a str),
 }
 
-/// `token` split at its placeholders; why not, when a brace is left open
-/// or a placeholder is empty.
+/// `token` split at its placeholders, `{{` and `}}` each one brace of
+/// text; why not, when a brace is left open or a placeholder is empty.
 fn segments(token: &str) -> std::result::Result<Vec<Seg<'_>>, String> {
     let mut out = Vec::new();
     let mut rest = token;
-    while let Some(open) = rest.find('{') {
-        if open > 0 {
-            out.push(Seg::Text(&rest[..open]));
+    while let Some(at) = rest.find(['{', '}']) {
+        if at > 0 {
+            out.push(Seg::Text(&rest[..at]));
         }
-        let after = &rest[open + 1..];
+        let (brace, after) = (&rest[at..=at], &rest[at + 1..]);
+        if let Some(after) = after.strip_prefix(brace) {
+            out.push(Seg::Text(brace));
+            rest = after;
+            continue;
+        }
+        if brace == "}" {
+            return Err(format!("{token:?} has a }} with no {{ (}}}} writes a }})"));
+        }
         let Some(close) = after.find('}') else {
-            return Err(format!("{token:?} leaves a {{ open"));
+            return Err(format!("{token:?} leaves a {{ open ({{{{ writes a {{)"));
         };
         let name = &after[..close];
         if name.is_empty() || name.contains('{') {
@@ -107,13 +118,17 @@ fn segments(token: &str) -> std::result::Result<Vec<Seg<'_>>, String> {
         out.push(Seg::Name(name));
         rest = &after[close + 1..];
     }
-    if rest.contains('}') {
-        return Err(format!("{token:?} has a }} with no {{"));
-    }
     if !rest.is_empty() {
         out.push(Seg::Text(rest));
     }
     Ok(out)
+}
+
+/// `token` names `{legume}`.
+fn uses_legume(token: &str) -> bool {
+    segments(token)
+        .unwrap_or_default()
+        .contains(&Seg::Name("legume"))
 }
 
 /// What a placeholder names.
@@ -488,7 +503,7 @@ pub fn tool_words(spec: &Spec) -> Result<Vec<(String, bool, String)>> {
     let mut embeds: Option<&str> = None;
     for lane in spec.stages.iter().flat_map(|s| &s.lanes) {
         let word = lane.tool_word();
-        if word != LEGUME && embeds.is_none() && lane.run.iter().any(|t| t.contains(LEGUME)) {
+        if word != LEGUME && embeds.is_none() && lane.run.iter().any(|t| uses_legume(t)) {
             embeds = Some(&lane.at);
         }
         match out.iter().find(|(w, _, _)| w == word) {
@@ -530,6 +545,13 @@ impl Fill<'_> {
         // Checked by `check`: each segment parses and names something.
         for seg in segments(token).unwrap_or_default() {
             let name = match seg {
+                // The template writes a brace as the spec does, apart from
+                // a placeholder.
+                Seg::Text(t @ ("{" | "}")) if template => {
+                    s.push_str(t);
+                    s.push_str(t);
+                    continue;
+                }
                 Seg::Text(t) => {
                     s.push_str(t);
                     continue;
@@ -757,7 +779,8 @@ const CLOSE_SEEDS: u64 = 1 << 20;
 
 /// What `{glob:<folder>/<pattern>}` gives when a cell starts: every path
 /// under `folder` that `pattern` matches (`*` and `?` within a part of
-/// the path), natural-sorted, joined by commas; refused when none does.
+/// the path, a hidden name only by a part that starts with `.`, as in a
+/// shell), natural-sorted, joined by commas; refused when none does.
 pub fn glob(folder: &Path, pattern: &str) -> Result<String> {
     let mut found = vec![folder.to_path_buf()];
     for part in pattern.split('/').filter(|p| !p.is_empty()) {
@@ -774,7 +797,10 @@ pub fn glob(folder: &Path, pattern: &str) -> Result<String> {
                 continue;
             };
             for e in entries.flatten() {
-                if wild(part.as_bytes(), e.file_name().to_string_lossy().as_bytes()) {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                let hidden = name.starts_with('.') && !part.starts_with('.');
+                if !hidden && wild(part.as_bytes(), name.as_bytes()) {
                     next.push(e.path());
                 }
             }
@@ -797,12 +823,12 @@ fn wild(pattern: &[u8], s: &[u8]) -> bool {
     let (mut p, mut i) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
     while i < s.len() {
-        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == s[i]) {
-            p += 1;
-            i += 1;
-        } else if p < pattern.len() && pattern[p] == b'*' {
+        if p < pattern.len() && pattern[p] == b'*' {
             star = Some((p, i));
             p += 1;
+        } else if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == s[i]) {
+            p += 1;
+            i += 1;
         } else if let Some((sp, si)) = star {
             p = sp + 1;
             i = si + 1;
@@ -965,8 +991,9 @@ mod tests {
             ("{sim}", "{sim} is this stage's own folder; that is {out}"),
             ("{glob:sim}", "{glob:sim}: a glob is {glob:STAGE/PATTERN}, the pattern inside the stage's folder"),
             ("{glob:sim/../x}", "{glob:sim/../x}: a glob is {glob:STAGE/PATTERN}, the pattern inside the stage's folder"),
-            ("{out", "\"{out\" leaves a { open"),
+            ("{out", "\"{out\" leaves a { open ({{ writes a {)"),
             ("{}", "\"{}\" has an empty or nested placeholder"),
+            ("a}b", "\"a}b\" has a } with no { (}} writes a })"),
         ];
         for (token, want) in cases {
             let text = format!(
@@ -1220,6 +1247,29 @@ mod tests {
         );
     }
 
+    // {{ and }} write a brace: in argv one brace, in the key's template
+    // as written, so a literal {out} is keyed apart from the folder.
+    #[test]
+    fn doubled_braces_write_one() {
+        let one = |token: &str| {
+            let s = spec(&format!(
+                r#"{{"name": "N1", "seeds": {{"n": 1}}, "stages": [
+                {{"name": "sim", "run": ["T", "-e", "{token}"], "makes": ["m.score.tsv"]}}]}}"#
+            ));
+            let words = tool_words(&s).unwrap();
+            let c = expand(&s).remove(0);
+            (c.argv[2].clone(), c.key, words.len())
+        };
+        let (argv, _, words) = one("{{print $1}} {{legume}}");
+        assert_eq!(argv, "{print $1} {legume}");
+        assert_eq!(words, 1, "a literal {{legume}} runs no legume");
+        let (argv, literal, _) = one("{{out}}");
+        assert_eq!(argv, "{out}");
+        let (argv, folder, _) = one("{out}");
+        assert!(argv.starts_with("/B/cells/"), "{argv}");
+        assert_ne!(literal, folder);
+    }
+
     #[test]
     fn the_last_stage_of_each_lane_makes_one_score() {
         let no_score = LANES.replace(
@@ -1361,6 +1411,19 @@ mod tests {
         assert_eq!(natural("S01", "S1"), Ordering::Equal);
         assert_eq!(natural("a9", "a10"), Ordering::Less);
         assert!(wild(b"*", b"") && wild(b"a*b*c", b"aXbYbc") && !wild(b"a?c", b"ac"));
+        // A star in a name is matched by the pattern's star too.
+        assert!(wild(b"*b", b"*ab"));
+        // A wildcard part, as in a shell, leaves out a hidden file (an
+        // atomic write's temporary) unless it starts with a dot itself.
+        std::fs::write(sec.join(".S3.zarr.123"), b"").unwrap();
+        assert_eq!(
+            glob(d.path(), "sim/sections/*").unwrap().split(',').count(),
+            4
+        );
+        assert_eq!(
+            glob(d.path(), "sim/sections/.S*").unwrap(),
+            at(".S3.zarr.123")
+        );
     }
 
     #[test]

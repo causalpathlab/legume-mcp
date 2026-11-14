@@ -34,8 +34,9 @@ legume benchmark plan SPEC [--retool]
 
 A benchmark's plan: the spec SPEC (JSON) expanded to its cells, a grid
 of parameters times seeds times stages and their methods, each cell with
-its argv, seeds and run key. Every tool is resolved through PATH and
-copied, by its content, into the benchmark's folder, from where it runs.
+its argv, seeds and run key. Every tool is resolved through PATH (a
+path with a / from the project) and copied, by its content, into the
+benchmark's folder, from where it runs.
 It writes results/benchmarks/<name>/ in the project:
 
   specs/<key>.json   the spec as canonical JSON, named by its key
@@ -112,7 +113,8 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
     let words = plan::tool_words(&spec)?;
     let legume = std::env::current_exe().context("finding this legume")?;
     let path_env = std::env::var_os("PATH");
-    let (found, missing) = tools::find(&words, path_env.as_deref(), &legume);
+    let root = crate::project::root().context("finding the project's folder")?;
+    let (found, missing) = tools::find(&words, path_env.as_deref(), &legume, &root);
     if !missing.is_empty() {
         let names: Vec<String> = missing
             .iter()
@@ -120,7 +122,6 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
             .collect();
         return Err(refuse(format!("not found on PATH: {}", names.join(", "))));
     }
-    let root = crate::project::root().context("finding the project's folder")?;
     let mut hashed = key::Inputs::default();
     let mut inputs: HashMap<String, (PathBuf, String)> = HashMap::new();
     for i in &spec.inputs {

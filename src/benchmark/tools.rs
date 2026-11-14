@@ -60,25 +60,25 @@ fn executable(p: &Path) -> bool {
     meta.is_file()
 }
 
-/// `word` as a program: a path when it has a `/`, else the first
-/// executable of that name on `path`. Absolute.
-pub fn which(word: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+/// `word` as a program: a path from the project's folder `root` when it
+/// has a `/` (as an input's path is), else the first executable of that
+/// name in an absolute folder of `path`. Absolute.
+pub fn which(word: &str, path: Option<&OsStr>, root: &Path) -> Option<PathBuf> {
     if word.contains('/') {
-        let p = std::path::absolute(word).ok()?;
+        let p = crate::absolute(&root.join(word));
         return executable(&p).then_some(p);
     }
-    std::env::split_paths(path?)
-        .filter(|d| !d.as_os_str().is_empty())
-        .filter_map(|d| std::path::absolute(d.join(word)).ok())
-        .find(|p| executable(p))
+    crate::on_path_in(word, path?, executable)
 }
 
-/// Each of `words` (word, snapshot, where in the spec) found on `path`,
-/// [`LEGUME`] as `legume`; and those not found, with where they are named.
+/// Each of `words` (word, snapshot, where in the spec) found on `path` or
+/// from `root` ([`which`]), [`LEGUME`] as `legume`; and those not found,
+/// with where they are named.
 pub fn find(
     words: &[(String, bool, String)],
     path: Option<&OsStr>,
     legume: &Path,
+    root: &Path,
 ) -> (Vec<Found>, Vec<(String, String)>) {
     let mut found = Vec::new();
     let mut missing = Vec::new();
@@ -86,7 +86,7 @@ pub fn find(
         let source = if word == LEGUME {
             Some(legume.to_path_buf())
         } else {
-            which(word, path)
+            which(word, path, root)
         };
         match source {
             Some(source) => found.push(Found {
@@ -321,10 +321,23 @@ mod tests {
         std::fs::write(a.join("TOOL1"), "not executable").unwrap();
         let t = script(&b, "TOOL1", "true");
         let path = std::env::join_paths([&a, &b]).unwrap();
-        assert_eq!(which("TOOL1", Some(&path)), Some(t.clone()));
-        assert_eq!(which("TOOL2", Some(&path)), None);
-        assert_eq!(which(&t.display().to_string(), None), Some(t));
-        assert_eq!(which(&a.join("TOOL1").display().to_string(), None), None);
+        let root = Path::new("/R");
+        assert_eq!(which("TOOL1", Some(&path), root), Some(t.clone()));
+        assert_eq!(which("TOOL2", Some(&path), root), None);
+        assert_eq!(which(&t.display().to_string(), None, root), Some(t.clone()));
+        assert_eq!(
+            which(&a.join("TOOL1").display().to_string(), None, root),
+            None
+        );
+        // A path is from the project, as an input's is, wherever legume
+        // runs from.
+        assert_eq!(which("b/TOOL1", None, d.path()), Some(t));
+        // A relative folder of PATH is passed over, so the project's own
+        // files are never taken for a program.
+        let up = std::env::current_dir().unwrap().components().count() - 1;
+        let rel = Path::new(&"../".repeat(up)).join(b.strip_prefix("/").unwrap());
+        assert!(rel.is_relative() && rel.join("TOOL1").is_file());
+        assert_eq!(which("TOOL1", Some(rel.as_os_str()), root), None);
     }
 
     // no_version_still_keys (the tool side): a tool that fails --version,
