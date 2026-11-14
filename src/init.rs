@@ -63,8 +63,8 @@ const AGENTS: &[Agent] = &[
         programs: &["claude"],
         file: ".mcp.json",
         format: Format::McpServers,
-        start: "Claude Code: start `claude` in this folder and approve the project's servers \
-                when it asks; /mcp__legume__explore starts the guided work.",
+        start: "Claude Code: start `claude` in this folder and trust it when it asks; \
+                /mcp__legume__explore starts the guided work.",
     },
     Agent {
         name: "Codex",
@@ -139,7 +139,7 @@ Connect this project to the agents that run the legume tools. The `legume`
 server and each legume tool on the PATH that serves MCP are listed in each
 agent's MCP settings in the project:
 
-  Claude Code   .mcp.json
+  Claude Code   .mcp.json             (approved in .claude/settings.local.json)
   Codex         .codex/config.toml    (read once you trust the project)
   Cursor        .cursor/mcp.json
   VS Code       .vscode/mcp.json      (Copilot Chat, Agent mode)
@@ -215,27 +215,29 @@ pub fn main(args: &[String], out: &mut dyn Write) -> Result<()> {
     mark(&project)?;
     let mut failed = Vec::new();
     for a in &agents {
-        match save(&project, a.file, a.format, &servers) {
-            Ok((path, _, false)) => writeln!(
-                out,
-                "{} for {} lists them all already",
-                rel(&project, &path),
-                a.name
-            )?,
-            Ok((path, kept, true)) => {
-                writeln!(out, "Wrote {} for {}", rel(&project, &path), a.name)?;
-                if !kept.is_empty() {
-                    writeln!(
-                        out,
-                        "  already listed there, kept as they are: {}",
-                        kept.join(", ")
-                    )?;
-                }
-            }
+        let saved = match save(&project, a.file, a.format, &servers) {
+            Ok(saved) => saved,
             Err(e) => {
                 writeln!(out, "Not written for {}: {e:#}", a.name)?;
                 failed.push(a.name);
+                continue;
             }
+        };
+        let at = rel(&project, &saved.path);
+        if !saved.changed {
+            writeln!(out, "{at} for {} lists them all already", a.name)?;
+        } else {
+            writeln!(out, "Wrote {at} for {}", a.name)?;
+            if !saved.kept.is_empty() {
+                writeln!(
+                    out,
+                    "  already listed there, kept as they are: {}",
+                    saved.kept.join(", ")
+                )?;
+            }
+        }
+        if a.flag == "--claude" {
+            approved(&project, &servers, &saved.ours, out, &mut failed)?;
         }
     }
     let claude = agents.iter().any(|a| a.flag == "--claude");
@@ -325,15 +327,8 @@ fn servers() -> (Vec<(String, String)>, Vec<&'static str>) {
     let mut out = vec![("legume".to_string(), legume)];
     let mut left = Vec::new();
     for &tool in TOOLS {
-        let serves = crate::on_path(tool).is_some_and(|path| {
-            std::process::Command::new(path)
-                .args(["mcp", "--help"])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
-        });
+        let serves = crate::on_path(tool)
+            .is_some_and(|path| quiet(std::process::Command::new(path).args(["mcp", "--help"])));
         if serves {
             out.push((tool.to_string(), tool.to_string()));
         } else {
@@ -343,21 +338,27 @@ fn servers() -> (Vec<(String, String)>, Vec<&'static str>) {
     (out, left)
 }
 
+/// What [`save`] did with an agent's MCP settings.
+struct Saved {
+    path: PathBuf,
+    /// The servers listed there already, kept as they are.
+    kept: Vec<String>,
+    /// The servers listed as `legume init` writes them ([`entry`]), new or
+    /// kept.
+    ours: Vec<String>,
+    /// Whether the file changed (it is not written when it would not).
+    changed: bool,
+}
+
 /// The project's MCP settings at `file` with `servers` added (each
 /// `<command> mcp`), the servers already there kept as they are (their
-/// command, arguments and environment are the user's); where they went,
-/// the servers kept, and whether the file changed (it is not written when
-/// it would not).
-fn save(
-    project: &Path,
-    file: &str,
-    format: Format,
-    servers: &[(String, String)],
-) -> Result<(PathBuf, Vec<String>, bool)> {
+/// command, arguments and environment are the user's).
+fn save(project: &Path, file: &str, format: Format, servers: &[(String, String)]) -> Result<Saved> {
     let path = project.join(file);
     let old = read_own(&path)?;
     let mut changed = old.is_none();
     let mut kept = Vec::new();
+    let mut ours = Vec::new();
     let text = if format == Format::Toml {
         let mut text = String::from_utf8(old.unwrap_or_default())
             .with_context(|| format!("{} is not UTF-8", path.display()))?;
@@ -378,6 +379,7 @@ fn save(
             }
             text.push_str("# The legume tools (legume init).\n");
             for (name, command) in fresh {
+                ours.push(name.clone());
                 // A JSON string is a TOML basic string: the same escapes.
                 text.push_str(&format!(
                     "[mcp_servers.{name}]\ncommand = {}\nargs = [\"mcp\"]\n\n",
@@ -388,14 +390,7 @@ fn save(
         }
         text
     } else {
-        let mut settings = match old {
-            Some(b) => serde_json::from_slice::<Value>(&b)
-                .with_context(|| format!("reading {}", path.display()))?,
-            None => json!({}),
-        };
-        let root = settings
-            .as_object_mut()
-            .with_context(|| format!("{} is not a JSON object", path.display()))?;
+        let mut root = object(old.as_deref(), &path)?;
         let key = match format {
             Format::Servers => "servers",
             Format::Local => "mcp",
@@ -407,21 +402,20 @@ fn save(
             .as_object_mut()
             .with_context(|| format!("{}'s {key} is not an object", path.display()))?;
         for (name, command) in servers {
-            if map.contains_key(name) {
-                kept.push(name.clone());
-                continue;
+            let mine = entry(format, command);
+            match map.get(name) {
+                Some(theirs) => {
+                    kept.push(name.clone());
+                    if *theirs == mine {
+                        ours.push(name.clone());
+                    }
+                }
+                None => {
+                    map.insert(name.clone(), mine);
+                    ours.push(name.clone());
+                    changed = true;
+                }
             }
-            let entry = match format {
-                Format::Stdio | Format::Servers => {
-                    json!({ "type": "stdio", "command": command, "args": ["mcp"] })
-                }
-                Format::Local => {
-                    json!({ "type": "local", "command": [command, "mcp"], "enabled": true })
-                }
-                _ => json!({ "command": command, "args": ["mcp"] }),
-            };
-            map.insert(name.clone(), entry);
-            changed = true;
         }
         if format == Format::Gemini {
             let context = root
@@ -445,17 +439,205 @@ fn save(
             changed |= before.as_ref() != Some(&names);
             context.insert("fileName".into(), names);
         }
-        serde_json::to_string_pretty(&settings)? + "\n"
+        serde_json::to_string_pretty(&root)? + "\n"
     };
+    folder_for(&path)?;
+    if changed {
+        replace(&path, text.as_bytes())?;
+    }
+    Ok(Saved {
+        path,
+        kept,
+        ours,
+        changed,
+    })
+}
+
+/// A server as `legume init` lists it in a JSON settings file of `format`:
+/// `<command> mcp`.
+fn entry(format: Format, command: &str) -> Value {
+    match format {
+        Format::Stdio | Format::Servers => {
+            json!({ "type": "stdio", "command": command, "args": ["mcp"] })
+        }
+        Format::Local => json!({ "type": "local", "command": [command, "mcp"], "enabled": true }),
+        _ => json!({ "command": command, "args": ["mcp"] }),
+    }
+}
+
+/// The JSON object a settings file at `path` holds (`old`, its bytes), or
+/// an empty one when there is no file.
+fn object(old: Option<&[u8]>, path: &Path) -> Result<serde_json::Map<String, Value>> {
+    match old {
+        Some(b) => match serde_json::from_slice::<Value>(b)
+            .with_context(|| format!("reading {}", path.display()))?
+        {
+            Value::Object(m) => Ok(m),
+            _ => anyhow::bail!("{} is not a JSON object", path.display()),
+        },
+        None => Ok(serde_json::Map::new()),
+    }
+}
+
+/// The folder the file at `path` goes in, made if it is not there.
+fn folder_for(path: &Path) -> Result<&Path> {
     let dir = path.parent().context("a file in the project")?;
     if std::fs::symlink_metadata(dir).is_ok_and(|m| !m.is_dir()) {
         anyhow::bail!("{} is not a folder", dir.display());
     }
     std::fs::create_dir_all(dir).with_context(|| format!("making {}", dir.display()))?;
-    if changed {
-        replace(&path, text.as_bytes())?;
+    Ok(dir)
+}
+
+/// Claude Code's own settings for the project, kept out of version control.
+const CLAUDE_LOCAL: &str = ".claude/settings.local.json";
+
+/// What [`approve`] did.
+struct Approval {
+    changed: bool,
+    /// Git tracks the file, so Claude Code does not use it.
+    tracked: bool,
+}
+
+/// The servers listed as `legume init` writes them (`ours`, of `servers`)
+/// approved for Claude Code ([`approve`]), and said; a failure is added to
+/// `failed`.
+fn approved(
+    project: &Path,
+    servers: &[(String, String)],
+    ours: &[String],
+    out: &mut dyn Write,
+    failed: &mut Vec<&str>,
+) -> Result<()> {
+    let done = match approve(project, ours) {
+        Ok(done) => done,
+        Err(e) => {
+            writeln!(
+                out,
+                "Not approved for Claude Code (it asks to approve the project's servers): {e:#}"
+            )?;
+            failed.push(CLAUDE_LOCAL);
+            return Ok(());
+        }
+    };
+    if done.changed {
+        writeln!(
+            out,
+            "Approved them for Claude Code in {CLAUDE_LOCAL} (it will not ask each time)"
+        )?;
+    } else if !ours.is_empty() {
+        writeln!(out, "{CLAUDE_LOCAL} approves them for Claude Code already")?;
     }
-    Ok((path, kept, changed))
+    let asked: Vec<&str> = servers
+        .iter()
+        .map(|s| s.0.as_str())
+        .filter(|n| !ours.iter().any(|o| o == n))
+        .collect();
+    if !asked.is_empty() {
+        writeln!(
+            out,
+            "  not approved, as .mcp.json lists them its own way (Claude Code asks about \
+             these): {}",
+            asked.join(", ")
+        )?;
+    }
+    if done.tracked {
+        writeln!(
+            out,
+            "  git tracks {CLAUDE_LOCAL}, so Claude Code does not use it: \
+             `git rm --cached {CLAUDE_LOCAL}` keeps it yours alone"
+        )?;
+    }
+    Ok(())
+}
+
+/// The servers listed as `legume init` writes them (`ours`, from [`save`])
+/// approved for Claude Code in the project ([`CLAUDE_LOCAL`]'s
+/// `enabledMcpjsonServers`), so it does not ask each time it starts; an
+/// entry the project lists its own way is left for Claude Code to ask
+/// about. The user's own entries are kept, a server they turned off
+/// (`disabledMcpjsonServers`) stays off, and a project that approves all
+/// its servers is left as it is. Claude Code applies the approvals only
+/// while git does not track the file, so it is ignored ([`ignore_local`]).
+fn approve(project: &Path, ours: &[String]) -> Result<Approval> {
+    let path = project.join(CLAUDE_LOCAL);
+    let old = read_own(&path)?;
+    let mut root = object(old.as_deref(), &path)?;
+    let mut changed = false;
+    if root.get("enableAllProjectMcpServers") != Some(&json!(true)) {
+        let off = root
+            .get("disabledMcpjsonServers")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let on = root
+            .entry("enabledMcpjsonServers")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .with_context(|| format!("{}'s enabledMcpjsonServers is not a list", path.display()))?;
+        for name in ours.iter().map(|n| json!(n)) {
+            if !on.contains(&name) && !off.contains(&name) {
+                on.push(name);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        ignore_local(folder_for(&path)?)?;
+        replace(
+            &path,
+            (serde_json::to_string_pretty(&root)? + "\n").as_bytes(),
+        )?;
+    }
+    Ok(Approval {
+        changed,
+        tracked: (old.is_some() || changed)
+            && git(project, &["ls-files", "--error-unmatch", CLAUDE_LOCAL]),
+    })
+}
+
+/// Whether `git` in `dir` with `args` succeeds (false when there is no git).
+fn git(dir: &Path, args: &[&str]) -> bool {
+    crate::on_path("git").is_some_and(|git| {
+        quiet(
+            std::process::Command::new(git)
+                .arg("-C")
+                .arg(dir)
+                .args(args),
+        )
+    })
+}
+
+/// Whether `cmd` succeeds, run with nothing in and its output dropped.
+fn quiet(cmd: &mut std::process::Command) -> bool {
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// `settings.local.json` named in the `.gitignore` of Claude Code's folder
+/// `dir`, beside whatever the user keeps there, unless git ignores it
+/// already: Claude Code ignores the file for git only when it writes the
+/// file itself.
+fn ignore_local(dir: &Path) -> Result<()> {
+    let name = CLAUDE_LOCAL.rsplit('/').next().unwrap_or(CLAUDE_LOCAL);
+    if git(dir, &["check-ignore", "-q", name]) {
+        return Ok(());
+    }
+    let path = dir.join(".gitignore");
+    let mut text = read_own_text(&path)?.unwrap_or_default();
+    if text.lines().any(|l| l.trim() == name) {
+        return Ok(());
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(name);
+    text.push('\n');
+    replace(&path, text.as_bytes())
 }
 
 /// The file at `path`, if there is one and it is the user's own.
@@ -470,6 +652,13 @@ fn read_own(path: &Path) -> Result<Option<Vec<u8>>> {
             )
         }),
     }
+}
+
+/// The text file at `path`, if there is one and it is the user's own.
+fn read_own_text(path: &Path) -> Result<Option<String>> {
+    read_own(path)?
+        .map(|b| String::from_utf8(b).with_context(|| format!("{} is not UTF-8", path.display())))
+        .transpose()
 }
 
 /// Whether Codex's settings already list the server `name`: as its own
@@ -552,12 +741,7 @@ fn claude_md() -> String {
 /// user's own text. With `import`, a file that already imports
 /// `AGENTS.md` is kept as it is (None). What was done, to say.
 fn write_section(path: &Path, body: &str, import: bool) -> Result<Option<&'static str>> {
-    let old = match read_own(path)? {
-        Some(b) => {
-            Some(String::from_utf8(b).with_context(|| format!("{} is not UTF-8", path.display()))?)
-        }
-        None => None,
-    };
+    let old = read_own_text(path)?;
     let text = match &old {
         None => body.to_string(),
         Some(old) if import && old.lines().any(|l| l.trim() == format!("@{INSTRUCTIONS}")) => {
@@ -750,14 +934,164 @@ mod tests {
 
         // Run again: nothing new, nothing doubled.
         for a in AGENTS {
-            let (_, kept, changed) = save(dir.path(), a.file, a.format, &servers).unwrap();
-            assert_eq!((kept.len(), changed), (3, false), "{}", a.name);
+            let s = save(dir.path(), a.file, a.format, &servers).unwrap();
+            assert_eq!((s.kept.len(), s.changed), (3, false), "{}", a.name);
         }
         let again = std::fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap();
         assert_eq!(again, toml);
         assert_eq!(
             read(".gemini/settings.json")["context"]["fileName"],
             json!(["GEMINI.md", "AGENTS.md"])
+        );
+    }
+
+    /// `name`s served by commands of the same names.
+    fn named(names: &[&str]) -> Vec<(String, String)> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), n.to_string()))
+            .collect()
+    }
+
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// `legume init --claude` in `dir`: whether it went, and what it said.
+    fn init_claude(dir: &Path) -> (Result<()>, String) {
+        let mut out = Vec::new();
+        let args = [
+            "--project".into(),
+            dir.display().to_string(),
+            "--claude".into(),
+        ];
+        let r = main(&args, &mut out);
+        (r, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn claude_code_is_told_the_servers_are_approved_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CLAUDE_LOCAL);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let ignore = dir.path().join(".claude/.gitignore");
+        std::fs::write(&ignore, "worktrees/").unwrap();
+        std::fs::write(
+            &path,
+            r#"{"permissions":{"allow":["Bash(ls)"]},"enabledMcpjsonServers":["other"],"disabledMcpjsonServers":["senna"]}"#,
+        )
+        .unwrap();
+        // The project came with its own entry for one of the names.
+        std::fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{"mcpServers":{"pinto":{"command":"sh","args":["-c","x"]}}}"#,
+        )
+        .unwrap();
+        let servers = named(&["legume", "senna", "pinto", "cocoa"]);
+        let saved = save(dir.path(), ".mcp.json", Format::McpServers, &servers).unwrap();
+        assert_eq!(
+            saved.ours,
+            ["legume", "senna", "cocoa"],
+            "not pinto: its own"
+        );
+        assert!(approve(dir.path(), &saved.ours).unwrap().changed);
+        let v = read_json(&path);
+        assert_eq!(
+            v["enabledMcpjsonServers"],
+            json!(["other", "legume", "cocoa"]),
+            "the user's own kept first; one they turned off stays off"
+        );
+        assert_eq!(
+            v["permissions"]["allow"],
+            json!(["Bash(ls)"]),
+            "the rest kept"
+        );
+        assert_eq!(v["disabledMcpjsonServers"], json!(["senna"]));
+        assert!(
+            !approve(dir.path(), &saved.ours).unwrap().changed,
+            "nothing new the second time"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ignore).unwrap(),
+            "worktrees/\nsettings.local.json\n",
+            "kept out of git, once, beside the user's own lines"
+        );
+
+        std::fs::write(&path, r#"{"enableAllProjectMcpServers":true}"#).unwrap();
+        assert!(!approve(dir.path(), &saved.ours).unwrap().changed);
+        assert_eq!(
+            read_json(&path),
+            json!({ "enableAllProjectMcpServers": true })
+        );
+    }
+
+    #[test]
+    fn a_fresh_project_gets_its_approvals_kept_out_of_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let servers = named(&["legume", "senna"]);
+        let saved = save(dir.path(), ".mcp.json", Format::McpServers, &servers).unwrap();
+        assert!(approve(dir.path(), &saved.ours).unwrap().changed);
+        assert_eq!(
+            read_json(&dir.path().join(CLAUDE_LOCAL)),
+            json!({ "enabledMcpjsonServers": ["legume", "senna"] })
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".claude/.gitignore")).unwrap(),
+            "settings.local.json\n"
+        );
+
+        // Nothing to approve: no folder made.
+        let none = tempfile::tempdir().unwrap();
+        assert!(!approve(none.path(), &[]).unwrap().changed);
+        assert!(!none.path().join(".claude").exists());
+    }
+
+    #[test]
+    fn approvals_git_tracks_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        if !git(dir.path(), &["init", "-q"]) {
+            return; // no git here
+        }
+        let ours = ["legume".to_string()];
+        assert!(!approve(dir.path(), &ours).unwrap().tracked);
+        assert!(git(dir.path(), &["add", "-f", CLAUDE_LOCAL]));
+        assert!(approve(dir.path(), &ours).unwrap().tracked);
+    }
+
+    #[test]
+    fn init_approves_for_claude_code_only_what_it_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let (r, out) = init_claude(dir.path());
+        assert!(r.is_ok(), "{out}");
+        assert!(
+            out.contains(
+                "Wrote .mcp.json for Claude Code\nApproved them for Claude Code in \
+                 .claude/settings.local.json"
+            ),
+            "{out}"
+        );
+        let (_, out) = init_claude(dir.path());
+        assert!(
+            out.contains(".claude/settings.local.json approves them for Claude Code already"),
+            "{out}"
+        );
+
+        // .mcp.json not written: nothing approved.
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join(".mcp.json"), "not json").unwrap();
+        let (r, out) = init_claude(other.path());
+        assert!(r.is_err());
+        assert!(!out.contains("pproved"), "{out}");
+        assert!(!other.path().join(".claude").exists());
+
+        // Approval not written: said, and init fails.
+        let third = tempfile::tempdir().unwrap();
+        std::fs::write(third.path().join(".claude"), "").unwrap();
+        let (r, out) = init_claude(third.path());
+        assert!(r.is_err());
+        assert!(
+            out.contains("Not approved for Claude Code (it asks"),
+            "{out}"
         );
     }
 
@@ -768,14 +1102,14 @@ mod tests {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, r#"{"mcpServers":{"legume":{"command":"legume"}}}"#).unwrap();
         let servers = vec![("legume".to_string(), "legume".to_string())];
-        let (_, kept, changed) = save(
+        let s = save(
             dir.path(),
             ".gemini/settings.json",
             Format::Gemini,
             &servers,
         )
         .unwrap();
-        assert_eq!((kept.len(), changed), (1, true));
+        assert_eq!((s.kept.len(), s.changed), (1, true));
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(v["context"]["fileName"], json!(["AGENTS.md", "GEMINI.md"]));
     }
@@ -882,7 +1216,9 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
-            let e = save(dir.path(), ".mcp.json", Format::McpServers, &[]).unwrap_err();
+            let Err(e) = save(dir.path(), ".mcp.json", Format::McpServers, &[]) else {
+                panic!("written");
+            };
             assert!(format!("{e:#}").contains("not your own file"), "{e:#}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
         }
