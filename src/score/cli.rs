@@ -28,8 +28,8 @@ with a header (gzipped or not) or parquet.
   --universe F       every item the method could have scored, keyed by
                      --universe-key; `same` when the scores file is also the
                      truth, keyed by --key as --truth-key, and lists every
-                     item. Required: an item the
-                     method left unscored ranks last, it is never dropped
+                     item. Required: an item the method left unscored ranks
+                     last, it is never dropped
   --truth-outside    a true item outside the universe: fail (exit 3, the
                      default) or drop (counted as outside_pos)
   --scored-outside   a scored row outside the universe: drop (the default,
