@@ -46,10 +46,11 @@ typst-pdf = { version = "0.15.1", optional = true }
 # The tables the tools write, read by `legume score` and written by `legume
 # universe` (`benchmark`): parquet, compressed as chickpea and pinto write
 # it (ZSTD, Snappy), and TSV, gzipped or not; `half` for a FLOAT16 column,
-# as parquet's own rows read it.
+# as parquet's own rows read it. gzip by zlib-rs, which writes it more than
+# twice as fast as the default backend.
 parquet = { version = "60.1", default-features = false, features = ["zstd", "snap"], optional = true }
 half = { version = "2.1", default-features = false, optional = true }
-flate2 = { version = "1.1", optional = true }
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"], optional = true }
 
 [features]
 pdf = ["dep:typst", "dep:typst-assets", "dep:typst-layout", "dep:typst-pdf"]
