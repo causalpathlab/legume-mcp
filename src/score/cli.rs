@@ -1,6 +1,7 @@
 //! `legume score`'s command line.
 
-use super::{required, run, usage, Dup, Outside, Score, Spec, Transform, Universe};
+use super::{run, Dup, Outside, Score, Spec, Transform, Universe};
+use crate::command::{required, usage};
 use anyhow::Result;
 use std::io::Write;
 use std::path::PathBuf;
@@ -40,7 +41,7 @@ with a header (gzipped or not) or parquet.
                      auprc";
 
 /// `legume score` with `args` (those after `score`), saying what it counted
-/// on `out`. A refusal is an [`super::Exit`] with its exit code.
+/// on `out`. A refusal is a [`crate::command::Exit`] with its exit code.
 pub fn main(args: &[String], out: &mut dyn Write) -> Result<()> {
     match parse(args)? {
         Some(spec) => run(&spec, out),
@@ -52,7 +53,7 @@ pub fn main(args: &[String], out: &mut dyn Write) -> Result<()> {
 fn columns(flag: &str, s: &str) -> Result<Vec<String>> {
     let cols: Vec<String> = s.split(',').map(str::to_string).collect();
     if cols.iter().any(String::is_empty) {
-        return Err(usage(format!("{flag} {s:?} names an empty column"), USAGE));
+        return Err(usage(format!("{flag} {s:?} names an empty column")));
     }
     Ok(cols)
 }
@@ -60,7 +61,7 @@ fn columns(flag: &str, s: &str) -> Result<Vec<String>> {
 /// `NAME=[neg:|abs:|neglog10:]COL`.
 fn score(s: &str) -> Result<Score> {
     let Some((name, column)) = s.split_once('=') else {
-        return Err(usage(format!("--score {s:?} is not NAME=COL"), USAGE));
+        return Err(usage(format!("--score {s:?} is not NAME=COL")));
     };
     let (transform, column) = match column.split_once(':') {
         Some(("neg", c)) => (Transform::Neg, c),
@@ -69,10 +70,9 @@ fn score(s: &str) -> Result<Score> {
         _ => (Transform::Plain, column),
     };
     if name.is_empty() || column.is_empty() || name.contains(char::is_whitespace) {
-        return Err(usage(
-            format!("--score {s:?} needs a name, without spaces, and a column"),
-            USAGE,
-        ));
+        return Err(usage(format!(
+            "--score {s:?} needs a name, without spaces, and a column"
+        )));
     }
     Ok(Score {
         name: name.into(),
@@ -94,7 +94,7 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
             return Ok(None);
         }
         let Some(value) = it.next() else {
-            return Err(usage(format!("{flag} needs a value, or is unknown"), USAGE));
+            return Err(usage(format!("{flag} needs a value, or is unknown")));
         };
         let v = value.as_str();
         match flag.as_str() {
@@ -106,7 +106,7 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
             "--label" => label = Some(v.to_string()),
             "--above" => match v.parse::<f64>() {
                 Ok(x) if !x.is_nan() => above = Some(x),
-                _ => return Err(usage(format!("--above {v:?} is not a number"), USAGE)),
+                _ => return Err(usage(format!("--above {v:?} is not a number"))),
             },
             "--universe" => universe = Some(v.to_string()),
             "--universe-key" => universe_key = Some(columns(flag, v)?),
@@ -114,7 +114,7 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
                 let o = match v {
                     "fail" => Outside::Fail,
                     "drop" => Outside::Drop,
-                    _ => return Err(usage(format!("{flag} is fail or drop, not {v:?}"), USAGE)),
+                    _ => return Err(usage(format!("{flag} is fail or drop, not {v:?}"))),
                 };
                 if flag == "--truth-outside" {
                     truth_outside = o;
@@ -126,55 +126,51 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
                 dup = match v {
                     "fail" => Dup::Fail,
                     "max" => Dup::Max,
-                    _ => return Err(usage(format!("--dup is fail or max, not {v:?}"), USAGE)),
+                    _ => return Err(usage(format!("--dup is fail or max, not {v:?}"))),
                 }
             }
             "-o" | "--out" => out = Some(PathBuf::from(v)),
-            _ => return Err(usage(format!("unknown argument {flag}"), USAGE)),
+            _ => return Err(usage(format!("unknown argument {flag}"))),
         }
     }
-    let universe = match (
-        required(universe, "--universe", USAGE)?.as_str(),
-        universe_key,
-    ) {
+    let universe = match (required(universe, "--universe")?.as_str(), universe_key) {
         ("same", None) => Universe::Same,
         ("same", Some(_)) => {
             return Err(usage(
                 "--universe same takes no --universe-key: it is the scores' own keys",
-                USAGE,
             ))
         }
         (path, Some(key)) => Universe::File {
             path: path.into(),
             key,
         },
-        (_, None) => return Err(usage("--universe F needs --universe-key", USAGE)),
+        (_, None) => return Err(usage("--universe F needs --universe-key")),
     };
     let label = match (label, above) {
         (Some(col), Some(x)) => Some((col, x)),
         (None, None) => None,
-        _ => return Err(usage("--label and --above go together", USAGE)),
+        _ => return Err(usage("--label and --above go together")),
     };
     if list.is_empty() {
-        return Err(usage("--score is required, once for each score", USAGE));
+        return Err(usage("--score is required, once for each score"));
     }
     for (i, s) in list.iter().enumerate() {
         if list[..i].iter().any(|t| t.name == s.name) {
-            return Err(usage(format!("--score {} is named twice", s.name), USAGE));
+            return Err(usage(format!("--score {} is named twice", s.name)));
         }
     }
     let spec = Spec {
-        scores: required(scores, "--scores", USAGE)?,
-        key: required(key, "--key", USAGE)?,
+        scores: required(scores, "--scores")?,
+        key: required(key, "--key")?,
         score: list,
-        truth: required(truth, "--truth", USAGE)?,
-        truth_key: required(truth_key, "--truth-key", USAGE)?,
+        truth: required(truth, "--truth")?,
+        truth_key: required(truth_key, "--truth-key")?,
         label,
         universe,
         truth_outside,
         scored_outside,
         dup,
-        out: required(out, "-o", USAGE)?,
+        out: required(out, "-o")?,
     };
     let arity = spec.key.len();
     let other = match &spec.universe {
@@ -184,7 +180,6 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
     if spec.truth_key.len() != arity || other != arity {
         return Err(usage(
             "--key, --truth-key and --universe-key name as many columns each",
-            USAGE,
         ));
     }
     Ok(Some(spec))
@@ -199,7 +194,7 @@ mod tests {
     }
 
     fn code(e: anyhow::Error) -> i32 {
-        e.downcast_ref::<super::super::Exit>().map_or(1, |x| x.code)
+        crate::command::code(&e)
     }
 
     const BASE: &str = "--scores s.tsv --key K --truth t.tsv --truth-key K -o o.tsv";

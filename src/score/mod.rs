@@ -14,42 +14,13 @@ pub(crate) mod table;
 
 pub use cli::{main, USAGE};
 
+use crate::command::{usage, Exit};
 use crate::metric;
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use table::Value;
-
-/// A refusal and the exit code it ends `legume` with: 2 for a command line
-/// that cannot run, 3 for a truth or a score outside the universe.
-#[derive(Debug)]
-pub struct Exit {
-    pub code: i32,
-    pub message: String,
-}
-
-impl std::fmt::Display for Exit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for Exit {}
-
-/// A command line that cannot run, with the usage `usage` it breaks.
-pub(crate) fn usage(message: impl std::fmt::Display, usage: &str) -> anyhow::Error {
-    Exit {
-        code: 2,
-        message: format!("{message}\n\n{usage}"),
-    }
-    .into()
-}
-
-/// `what`, or the refusal that `flag` is required.
-pub(crate) fn required<T>(what: Option<T>, flag: &str, usage_text: &str) -> Result<T> {
-    what.ok_or_else(|| usage(format!("{flag} is required"), usage_text))
-}
 
 /// The output's columns, in order.
 pub const COLUMNS: &str = "score\tmetric\tvalue\tpart\tn_pos\tn_neg\tn_universe\tpos_rate\t\
@@ -319,7 +290,6 @@ fn run(spec: &Spec, out: &mut dyn Write) -> Result<()> {
         return Err(usage(
             "--universe same needs --truth and --scores to be one file; give the universe as a \
              file otherwise",
-            USAGE,
         ));
     }
     let (score_keys, score_columns) = read_score_table(spec)?;

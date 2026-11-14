@@ -51,6 +51,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --features tui,clap,sessions,pdf,benchmark
+      # What `legume score` and `legume universe` say in a build without `benchmark`.
+      - run: cargo test --test legume
 
   # The library as the tools take it keeps 1.91; the report's PDF (`pdf`,
   # Typst 0.15) needs 1.92.

@@ -46,6 +46,7 @@ use std::time::Duration;
 pub mod brain;
 #[cfg(feature = "clap")]
 pub mod cli;
+pub mod command;
 mod evidence;
 mod hints;
 pub mod init;
@@ -77,19 +78,6 @@ pub mod watch;
 use jobs::{Jobs, State as JobState};
 use project::Project;
 use watch::{Body, Feed, Steer};
-
-/// What `legume score` and `legume universe` say in a build without
-/// `benchmark`: how to install the one that has them.
-pub const WITHOUT_BENCHMARK: &str =
-    "this legume was built without benchmark: cargo install legume-mcp --features pdf,benchmark";
-
-/// Say [`WITHOUT_BENCHMARK`] on `err`, and return the exit code: 2, a
-/// command this build cannot run.
-pub fn without_benchmark(err: &mut dyn Write) -> i32 {
-    // Nothing is left to do when even stderr is gone.
-    let _ = writeln!(err, "{WITHOUT_BENCHMARK}");
-    2
-}
 
 /// Protocol revisions this server speaks, newest first. A client asking for
 /// one of them gets it; any other gets the newest.
@@ -1397,17 +1385,6 @@ fn call_result(result: Result<Vec<Content>>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_build_without_benchmark_prints_the_install_line_and_exits_2() {
-        let mut err = Vec::new();
-        assert_eq!(without_benchmark(&mut err), 2);
-        assert_eq!(
-            String::from_utf8(err).unwrap(),
-            "this legume was built without benchmark: \
-             cargo install legume-mcp --features pdf,benchmark\n"
-        );
-    }
 
     fn lines(text: &[&str]) -> VecDeque<String> {
         text.iter().map(|s| s.to_string()).collect()

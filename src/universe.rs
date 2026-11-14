@@ -10,8 +10,8 @@
 //! of the TSS, bounds included. With `--max-per-gene K`, a gene keeps its
 //! K nearest by (distance, peak index), listed by peak index.
 
+use crate::command::{required, usage};
 use crate::score::table::{self, TextOut};
-use crate::score::{required, usage};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -205,7 +205,7 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
     match args.first().map(String::as_str) {
         Some("cis") => {}
         None | Some("-h" | "--help") => return Ok(None),
-        Some(other) => return Err(usage(format!("unknown universe {other:?}"), USAGE)),
+        Some(other) => return Err(usage(format!("unknown universe {other:?}"))),
     }
     let (mut genes, mut peaks, mut window, mut max_per_gene, mut out) =
         (None, None, None, None, None);
@@ -215,34 +215,34 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
             return Ok(None);
         }
         let Some(v) = it.next() else {
-            return Err(usage(format!("{flag} needs a value, or is unknown"), USAGE));
+            return Err(usage(format!("{flag} needs a value, or is unknown")));
         };
         match flag.as_str() {
             "--gene-coords" => genes = Some(PathBuf::from(v)),
             "--peaks" => peaks = Some(PathBuf::from(v)),
             "--window" => match v.parse::<i64>() {
                 Ok(w) if w >= 0 => window = Some(w),
-                _ => return Err(usage(format!("--window {v:?} is not a count of bp"), USAGE)),
+                _ => return Err(usage(format!("--window {v:?} is not a count of bp"))),
             },
             "--max-per-gene" => match v.parse::<usize>() {
                 Ok(k) if k > 0 => max_per_gene = Some(k),
-                _ => return Err(usage(format!("--max-per-gene {v:?} is not a count"), USAGE)),
+                _ => return Err(usage(format!("--max-per-gene {v:?} is not a count"))),
             },
             "-o" | "--out" => out = Some(PathBuf::from(v)),
-            _ => return Err(usage(format!("unknown argument {flag}"), USAGE)),
+            _ => return Err(usage(format!("unknown argument {flag}"))),
         }
     }
     Ok(Some(Spec {
-        genes: required(genes, "--gene-coords", USAGE)?,
-        peaks: required(peaks, "--peaks", USAGE)?,
-        window: required(window, "--window", USAGE)?,
+        genes: required(genes, "--gene-coords")?,
+        peaks: required(peaks, "--peaks")?,
+        window: required(window, "--window")?,
         max_per_gene,
-        out: required(out, "-o", USAGE)?,
+        out: required(out, "-o")?,
     }))
 }
 
 /// `legume universe` with `args` (those after `universe`), saying what it
-/// wrote on `out`. A refusal is a [`crate::score::Exit`] with its exit code.
+/// wrote on `out`. A refusal is a [`crate::command::Exit`] with its exit code.
 pub fn main(args: &[String], out: &mut dyn Write) -> Result<()> {
     let Some(spec) = parse(args)? else {
         writeln!(out, "{USAGE}")?;
