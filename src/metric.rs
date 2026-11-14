@@ -21,8 +21,9 @@ pub struct Counts {
     pub n_neg: usize,
     /// Every item, scored or not.
     pub n_universe: usize,
-    /// `n_pos / n_universe`, what a random ranking's AP comes to; NaN for an
-    /// empty universe.
+    /// `n_pos / n_universe`, the AP of a ranking that ties every item (a
+    /// random ranking's expected AP tends to it as the universe grows); NaN
+    /// for an empty universe.
     pub pos_rate: f64,
     /// The share of scored items in tie groups of more than one, the
     /// unscored block left out; NaN when nothing is scored.
@@ -31,6 +32,8 @@ pub struct Counts {
     pub unscored: usize,
     /// Positives among them.
     pub unscored_pos: usize,
+    /// Items scored `+inf`, the top tie group.
+    pub n_inf: usize,
 }
 
 /// A score made ready to rank: `None` when unscored (missing, NaN or
@@ -78,13 +81,13 @@ pub fn counts(scores: &[Option<f64>], labels: &[bool]) -> Counts {
     counts_of(&ranked(scores, labels))
 }
 
-/// Items tied after cleaning: how many, how many positive, and whether they
-/// are the unscored block.
+/// Items tied after cleaning: how many, how many positive, and their
+/// cleaned score (`None` for the unscored block).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Group {
     items: usize,
     pos: usize,
-    scored: bool,
+    score: Option<f64>,
 }
 
 /// The ranking's tie groups, from the highest score down.
@@ -107,7 +110,7 @@ fn groups(cleaned: &[Option<f64>], labels: &[bool]) -> Vec<Group> {
         .map(|tied| Group {
             items: tied.len(),
             pos: tied.iter().filter(|(_, pos)| *pos).count(),
-            scored: tied[0].0.is_some(),
+            score: tied[0].0,
         })
         .collect()
 }
@@ -164,11 +167,11 @@ fn ap_of(groups: &[Group]) -> f64 {
 fn counts_of(groups: &[Group]) -> Counts {
     let (n_pos, n_neg) = labelled(groups);
     let n_universe = n_pos + n_neg;
-    let unscored = groups.iter().find(|g| !g.scored);
+    let unscored = groups.iter().find(|g| g.score.is_none());
     let unscored_items = unscored.map_or(0, |g| g.items);
     let tied = groups
         .iter()
-        .filter(|g| g.scored && g.items > 1)
+        .filter(|g| g.score.is_some() && g.items > 1)
         .map(|g| g.items)
         .sum::<usize>();
     Counts {
@@ -179,6 +182,10 @@ fn counts_of(groups: &[Group]) -> Counts {
         tied_share: tied as f64 / (n_universe - unscored_items) as f64,
         unscored: unscored_items,
         unscored_pos: unscored.map_or(0, |g| g.pos),
+        n_inf: groups
+            .iter()
+            .find(|g| g.score == Some(f64::INFINITY))
+            .map_or(0, |g| g.items),
     }
 }
 
@@ -414,6 +421,8 @@ mod tests {
     fn cleaning_merges_the_zeros_and_the_unscored() {
         assert_eq!(clean(Some(-0.0)).map(f64::to_bits), Some(0.0f64.to_bits()));
         assert_eq!(clean(Some(f64::NAN)), None);
+        assert_eq!(clean(Some(-f64::NAN)), None);
+        assert_eq!(clean(Some(f64::from_bits(0x7ff0_0000_0000_0001))), None);
         assert_eq!(clean(None), None);
         assert_eq!(clean(Some(f64::NEG_INFINITY)), None);
         assert_eq!(clean(Some(f64::INFINITY)), Some(f64::INFINITY));
@@ -448,6 +457,7 @@ mod tests {
             tied_share: 7.0 / 9.0,
             unscored: 3,
             unscored_pos: 2,
+            n_inf: 3,
         };
         (scores, labels.iter().map(|&l| l == 1).collect(), want)
     }
@@ -466,6 +476,7 @@ mod tests {
             tied_share: 0.0,
             unscored: 998,
             unscored_pos: 8,
+            n_inf: 0,
         };
         assert_eq!(got, want);
         let none = counts(&[None, None], &[true, false]);
@@ -495,10 +506,10 @@ mod tests {
         items.sort_by(|a, b| order(b.0, a.0));
         let singles: Vec<Group> = items
             .iter()
-            .map(|&(s, &pos)| Group {
+            .map(|&(score, &pos)| Group {
                 items: 1,
                 pos: pos as usize,
-                scored: s.is_some(),
+                score,
             })
             .collect();
         of_groups(&singles)
@@ -581,7 +592,28 @@ mod tests {
         (roc, ap, c)
     }
 
-    const MUTANTS: [(&str, Metrics); 7] = [
+    /// AP with no guard, as the earlier implementation has it: without
+    /// negatives every precision is 1, so it scores 1 (without positives,
+    /// 0 / 0 still gives NaN).
+    fn ap_without_negatives(scores: &[Option<f64>], labels: &[bool]) -> (f64, f64, Counts) {
+        let (roc, _, c) = real(scores, labels);
+        let (mut tp, mut seen, mut sum) = (0, 0, 0.0);
+        for g in ranked(scores, labels) {
+            tp += g.pos;
+            seen += g.items;
+            sum += g.pos as f64 * tp as f64 / seen as f64;
+        }
+        (roc, sum / c.n_pos as f64, c)
+    }
+
+    /// `n_inf` counted on the raw scores as every infinity, `-inf` too.
+    fn minus_inf_counted_as_inf(scores: &[Option<f64>], labels: &[bool]) -> (f64, f64, Counts) {
+        let (roc, ap, mut c) = real(scores, labels);
+        c.n_inf = scores.iter().flatten().filter(|x| x.is_infinite()).count();
+        (roc, ap, c)
+    }
+
+    const MUTANTS: [(&str, Metrics); 9] = [
         ("ties broken by input order", ties_by_input_order),
         ("ordinal ranks", ordinal_ranks),
         ("PR trapezoid", pr_trapezoid),
@@ -589,6 +621,8 @@ mod tests {
         ("-0.0 not cleaned", minus_zero_kept),
         ("NaN sorted above everything", nan_on_top),
         ("unscored block counted as tied", unscored_counted_as_tied),
+        ("AP not NaN without negatives", ap_without_negatives),
+        ("-inf counted in n_inf", minus_inf_counted_as_inf),
     ];
 
     /// Whether `metrics` gets every case and the counts right.
@@ -614,7 +648,12 @@ mod tests {
     /// score, written in one of the forms of its class.
     fn raw(class: usize, form: usize) -> Option<f64> {
         match class {
-            0 => [None, Some(f64::NAN), Some(f64::NEG_INFINITY)][form % 3],
+            0 => [
+                None,
+                Some(f64::NAN),
+                Some(f64::NEG_INFINITY),
+                Some(-f64::NAN),
+            ][form % 4],
             1 => [Some(-0.0), Some(0.0)][form % 2],
             2 => Some(1.0),
             _ => Some(f64::INFINITY),
@@ -760,7 +799,7 @@ mod tests {
 
     /// An earlier implementation, written apart from this one: ranked by
     /// `total_cmp` on the raw scores, so it splits -0.0 from +0.0 and puts
-    /// NaN on top; AP is not NaN without negatives.
+    /// a positive NaN on top; AP is not NaN without negatives.
     mod earlier {
         pub fn auroc(scores: &[f64], positive: &[bool]) -> f64 {
             let n_pos = positive.iter().filter(|&&p| p).count();
