@@ -111,53 +111,14 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
             .collect();
         return Err(refuse(format!("not found on PATH: {}", names.join(", "))));
     }
-    let dir = root.join("results").join("benchmarks").join(&spec.name);
-    // The benchmark's folder resolved, as each input is; it need not be
-    // there yet.
-    let real_dir = dir.canonicalize().unwrap_or_else(|_| {
-        let real_root = root.canonicalize().unwrap_or_else(|_| root.clone());
-        real_root
-            .join("results")
-            .join("benchmarks")
-            .join(&spec.name)
-    });
-    let mut inputs: HashMap<String, (PathBuf, String)> = HashMap::new();
-    for i in &spec.inputs {
-        let p = crate::absolute(&root.join(&i.path));
-        let there = if i.dir { p.is_dir() } else { p.is_file() };
-        if !there {
-            let what = if i.dir { "folder" } else { "file" };
-            return Err(refuse(format!(
-                "inputs.{}.path: no {what} at {}",
-                i.name,
-                p.display()
-            )));
-        }
-        // An input is the file it names, its `..` and links resolved, so an
-        // argv path to it is found however it is written.
-        let p = p
-            .canonicalize()
-            .with_context(|| format!("resolving {}", p.display()))?;
-        if i.dir && (real_dir.starts_with(&p) || p.starts_with(&real_dir)) {
-            return Err(refuse(format!(
-                "inputs.{}.path: {} overlaps the benchmark's folder, whose files change with \
-                 every plan and run; name a folder apart from it",
-                i.name,
-                p.display()
-            )));
-        }
-        let k = if i.dir {
-            key::dir_key(&p)?
-        } else {
-            key::file_key(&p)?
-        };
-        inputs.insert(i.name.clone(), (p, k));
-    }
+    let rel = Path::new("results").join("benchmarks").join(&spec.name);
+    let dir = root.join(&rel);
+    let inputs = resolve_inputs(&spec, &root, &rel)?;
     // The last refusal, before any tool is snapshot: what a refusal stops
     // writes nothing but this spec, named by its content.
     let spec_file = dir.join("specs").join(format!("{spec_key}.json"));
     write_spec(&spec_file, &canonical)?;
-    let (resolved, mut drift) = tools::settle(&dir, &found, retool, tools::VERSION_TIMEOUT)?;
+    let (resolved, mut drift) = tools::settle(&dir, &found, retool)?;
     let ctx = plan::Context {
         dir: dir.clone(),
         tools: &resolved,
@@ -222,6 +183,56 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
     Ok(())
 }
 
+/// Each of the spec's inputs, by name: the file or folder it names under
+/// `root`, resolved, and its key. Refused: an input that is not there, and
+/// a folder that overlaps the benchmark's, `rel` under `root`.
+fn resolve_inputs(
+    spec: &spec::Spec,
+    root: &Path,
+    rel: &Path,
+) -> Result<HashMap<String, (PathBuf, String)>> {
+    // The benchmark's folder resolved, as each input is; it need not be
+    // there yet.
+    let real_dir = root.join(rel).canonicalize().unwrap_or_else(|_| {
+        root.canonicalize()
+            .unwrap_or_else(|_| root.to_path_buf())
+            .join(rel)
+    });
+    let mut inputs = HashMap::new();
+    for i in &spec.inputs {
+        let p = crate::absolute(&root.join(&i.path));
+        let there = if i.dir { p.is_dir() } else { p.is_file() };
+        if !there {
+            let what = if i.dir { "folder" } else { "file" };
+            return Err(refuse(format!(
+                "inputs.{}.path: no {what} at {}",
+                i.name,
+                p.display()
+            )));
+        }
+        // An input is the file it names, its `..` and links resolved, so an
+        // argv path to it is found however it is written.
+        let p = p
+            .canonicalize()
+            .with_context(|| format!("resolving {}", p.display()))?;
+        if i.dir && (real_dir.starts_with(&p) || p.starts_with(&real_dir)) {
+            return Err(refuse(format!(
+                "inputs.{}.path: {} overlaps the benchmark's folder, whose files change with \
+                 every plan and run; name a folder apart from it",
+                i.name,
+                p.display()
+            )));
+        }
+        let k = if i.dir {
+            key::dir_key(&p)?
+        } else {
+            key::file_key(&p)?
+        };
+        inputs.insert(i.name.clone(), (p, k));
+    }
+    Ok(inputs)
+}
+
 /// `plan.json`: what the benchmark books and the tools it runs, then
 /// every cell.
 #[derive(Serialize)]
@@ -254,7 +265,9 @@ fn write_spec(file: &Path, canonical: &str) -> Result<()> {
             .write_all(canonical.as_bytes())
             .with_context(|| format!("writing {}", file.display())),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            if std::fs::read(file)? != canonical.as_bytes() {
+            let there =
+                std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+            if there != canonical.as_bytes() {
                 return Err(refuse(format!(
                     "{}: is there with other bytes than this spec's canonical JSON; a spec \
                      under specs/ is not edited in place",

@@ -33,7 +33,8 @@ fn gib(bytes: f64) -> f64 {
     (bytes / GIB * 10.0).round() / 10.0
 }
 
-fn read(path: &str) -> Option<String> {
+/// The text of `path`, if it can be read.
+fn read(path: impl AsRef<std::path::Path>) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
@@ -57,29 +58,14 @@ pub fn here() -> Machine {
     ];
     Machine {
         host,
-        os: read("/etc/os-release").and_then(|t| {
-            t.lines()
-                .find_map(|l| l.strip_prefix("PRETTY_NAME="))
-                .map(|v| v.trim_matches('"').to_string())
-        }),
+        os: os(),
         kernel,
         cores_logical: u32::try_from(cpus).unwrap_or(1).max(1),
         cores_physical: physical_cores(),
         mem_total_gb: gib(pages.max(0) as f64 * page.max(0) as f64),
-        mem_available_gb: read("/proc/meminfo").and_then(|t| {
-            let kb: f64 = t
-                .lines()
-                .find_map(|l| l.strip_prefix("MemAvailable:"))?
-                .trim()
-                .trim_end_matches("kB")
-                .trim()
-                .parse()
-                .ok()?;
-            Some(gib(kb * 1024.0))
-        }),
+        mem_available_gb: mem_available_gb(),
         gpus: gpus(),
-        gpu_driver: read("/proc/driver/nvidia/version")
-            .and_then(|t| t.lines().next().map(|l| l.trim().to_string())),
+        gpu_driver: gpu_driver(),
         legume: env!("CARGO_PKG_VERSION").to_string(),
         features: features
             .iter()
@@ -111,6 +97,35 @@ fn uname() -> (Option<String>, Option<String>) {
     )
 }
 
+/// The OS's PRETTY_NAME in `/etc/os-release`.
+fn os() -> Option<String> {
+    read("/etc/os-release")?
+        .lines()
+        .find_map(|l| l.strip_prefix("PRETTY_NAME="))
+        .map(|v| v.trim_matches('"').to_string())
+}
+
+/// MemAvailable in `/proc/meminfo`, in GB.
+fn mem_available_gb() -> Option<f64> {
+    let kb: f64 = read("/proc/meminfo")?
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .ok()?;
+    Some(gib(kb * 1024.0))
+}
+
+/// The first line of the NVIDIA driver's version file.
+fn gpu_driver() -> Option<String> {
+    read("/proc/driver/nvidia/version")?
+        .lines()
+        .next()
+        .map(|l| l.trim().to_string())
+}
+
 /// Distinct (physical id, core id) pairs in `/proc/cpuinfo`.
 fn physical_cores() -> Option<u32> {
     let text = read("/proc/cpuinfo")?;
@@ -139,7 +154,7 @@ fn gpus() -> Vec<String> {
     let mut found: Vec<(String, String)> = entries
         .flatten()
         .filter_map(|e| {
-            let info = std::fs::read_to_string(e.path().join("information")).ok()?;
+            let info = read(e.path().join("information"))?;
             let model = info
                 .lines()
                 .find_map(|l| l.strip_prefix("Model:"))
@@ -171,8 +186,8 @@ pub fn drift(old: &Machine, new: &Machine) -> Vec<String> {
     );
     diff(
         "physical cores",
-        format!("{:?}", old.cores_physical),
-        format!("{:?}", new.cores_physical),
+        opt(&old.cores_physical.map(|n| n.to_string())),
+        opt(&new.cores_physical.map(|n| n.to_string())),
     );
     diff(
         "memory",
@@ -341,6 +356,10 @@ mod tests {
         b.cores_logical = 4;
         b.legume = "1".into();
         assert_eq!(drift(&a, &b), ["cores: 8 -> 4", "legume: 0 -> 1"]);
+    }
+
+    #[test]
+    fn here_sees_cores_memory_and_this_build() {
         let here = here();
         assert!(
             here.cores_logical >= 1 && here.mem_total_gb > 0.0,
