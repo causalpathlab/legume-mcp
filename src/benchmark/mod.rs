@@ -113,7 +113,7 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
     }
     let rel = Path::new("results").join("benchmarks").join(&spec.name);
     let dir = root.join(&rel);
-    let inputs = resolve_inputs(&spec, &root, &rel)?;
+    let inputs = resolve_inputs(&spec, &root, &rel, &dir)?;
     // The last refusal, before any tool is snapshot: what a refusal stops
     // writes nothing but this spec, named by its content.
     let spec_file = dir.join("specs").join(format!("{spec_key}.json"));
@@ -181,15 +181,17 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
 
 /// Each of the spec's inputs, by name: the file or folder it names under
 /// `root`, resolved, and its key. Refused: an input that is not there, and
-/// a folder that overlaps the benchmark's, `rel` under `root`.
+/// a folder that overlaps the benchmark's, `dir`, which is `rel` under
+/// `root`.
 fn resolve_inputs(
     spec: &spec::Spec,
     root: &Path,
     rel: &Path,
+    dir: &Path,
 ) -> Result<HashMap<String, (PathBuf, String)>> {
     // The benchmark's folder resolved, as each input is; it need not be
     // there yet.
-    let real_dir = root.join(rel).canonicalize().unwrap_or_else(|_| {
+    let real_dir = dir.canonicalize().unwrap_or_else(|_| {
         root.canonicalize()
             .unwrap_or_else(|_| root.to_path_buf())
             .join(rel)

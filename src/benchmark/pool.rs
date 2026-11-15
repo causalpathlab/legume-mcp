@@ -20,7 +20,7 @@
 //!   starts until it fits, and the cores held for it count as `no_fit`.
 //! - **Halts.** A method halts when its first 3 counted attempts all
 //!   fail, or once at least 10 have ended and at least half failed. A
-//!   stage without methods counts as one method named after the stage. A
+//!   stage without methods counts as one method of its own, unnamed. A
 //!   person's stop is not counted. A halted method's pending tasks are
 //!   skipped. The benchmark halts when every method of a stage has
 //!   halted; then nothing starts.
@@ -74,28 +74,28 @@ impl Want {
         }
         tasks
             .iter()
-            .map(|c| {
-                let Some(stage) = stages.iter().position(|s| *s == c.stage) else {
-                    bail!("{}: stage {} is not in the spec", c.id, c.stage);
+            .map(|t| {
+                let Some(stage) = stages.iter().position(|s| *s == t.stage) else {
+                    bail!("{}: stage {} is not in the spec", t.id, t.stage);
                 };
-                let upstream = c
+                let upstream = t
                     .upstream
                     .iter()
                     .map(|u| match index.get(u.as_str()) {
                         Some(&i) => Ok(i),
-                        None => bail!("{}: reads {u}, which is not in the plan", c.id),
+                        None => bail!("{}: reads {u}, which is not in the plan", t.id),
                     })
                     .collect::<Result<_>>()?;
                 Ok(Self {
-                    id: c.id.clone(),
+                    id: t.id.clone(),
                     stage,
-                    stage_name: c.stage.clone(),
-                    method: c.method.clone(),
-                    rep: c.rep,
-                    threads: c.threads,
-                    mem_gb: c.mem_gb,
-                    gpus: c.gpus,
-                    max_running: c.max_running,
+                    stage_name: t.stage.clone(),
+                    method: t.method.clone(),
+                    rep: t.rep,
+                    threads: t.threads,
+                    mem_gb: t.mem_gb,
+                    gpus: t.gpus,
+                    max_running: t.max_running,
                     upstream,
                 })
             })
@@ -189,7 +189,7 @@ enum Hold {
 }
 
 /// A method's cap and tally: a stage's method, or a stage without
-/// methods, which counts as one method named after the stage.
+/// methods, which counts as one method of its own, unnamed.
 #[derive(Clone, Debug)]
 struct MethodTally {
     stage: String,
@@ -209,7 +209,7 @@ pub struct Pool {
     state: Vec<State>,
     budget: Budget,
     /// Each task's method, an index into `methods`.
-    method: Vec<usize>,
+    method_of: Vec<usize>,
     methods: Vec<MethodTally>,
     /// Tasks reading each task.
     downstream: Vec<Vec<usize>>,
@@ -240,7 +240,7 @@ impl Pool {
     pub fn new(wants: Vec<Want>, budget: Budget) -> Result<Self> {
         let mut downstream = vec![Vec::new(); wants.len()];
         let mut methods: Vec<MethodTally> = Vec::new();
-        let mut method = Vec::with_capacity(wants.len());
+        let mut method_of = Vec::with_capacity(wants.len());
         for (i, w) in wants.iter().enumerate() {
             if w.threads > budget.cores {
                 bail!(
@@ -291,7 +291,7 @@ impl Pool {
                     methods.len() - 1
                 }
             };
-            method.push(k);
+            method_of.push(k);
         }
         let mut order: Vec<usize> = (0..wants.len()).collect();
         order.sort_by_key(|&i| (std::cmp::Reverse(wants[i].stage), wants[i].rep, i));
@@ -299,7 +299,7 @@ impl Pool {
             state: vec![State::Pending; wants.len()],
             wants,
             budget,
-            method,
+            method_of,
             methods,
             downstream,
             order,
@@ -477,7 +477,7 @@ impl Pool {
         for (i, st) in self.state.iter().enumerate() {
             if let State::Running(gpus) = st {
                 let rss = self.rss.get(&i).copied().unwrap_or(0.0);
-                u.take(&self.wants[i], self.method[i], rss, gpus);
+                u.take(&self.wants[i], self.method_of[i], rss, gpus);
             }
         }
         u
@@ -504,7 +504,7 @@ impl Pool {
             }
             if hold == Hold::Fits && launch {
                 let gpus = u.devices(self.wants[i].gpus, self.budget.gpu_slots);
-                u.take(&self.wants[i], self.method[i], 0.0, &gpus);
+                u.take(&self.wants[i], self.method_of[i], 0.0, &gpus);
                 self.state[i] = State::Running(gpus.clone());
                 out.push(Launch { task: i, gpus });
                 continue;
@@ -532,16 +532,16 @@ impl Pool {
         if u.threads + w.threads > self.budget.cores {
             return Hold::Cores;
         }
-        let m = self.method[i];
-        if self.methods[m]
+        let k = self.method_of[i];
+        if self.methods[k]
             .max_running
-            .is_some_and(|cap| u.methods[m] >= cap)
+            .is_some_and(|cap| u.methods[k] >= cap)
         {
             return Hold::Capped;
         }
         let floor = |avail: f64| u.grow_gb + w.mem_gb + FLOOR_GB > avail;
         if u.mem_gb + w.mem_gb > self.budget.mem_gb
-            || u.free_devices(self.budget.gpu_slots) < w.gpus as usize
+            || (w.gpus > 0 && u.free_devices(self.budget.gpu_slots) < w.gpus as usize)
             || self.live.disk_low
             || self.live.mem_available_gb.is_some_and(floor)
         {
@@ -561,7 +561,7 @@ impl Pool {
         if outcome == Outcome::Stopped {
             return;
         }
-        let k = self.method[i];
+        let k = self.method_of[i];
         let m = &mut self.methods[k];
         m.ended += 1;
         if outcome == Outcome::Done {
@@ -575,7 +575,7 @@ impl Pool {
         }
         m.halted = true;
         for j in 0..self.wants.len() {
-            if self.method[j] == k && self.state[j] == State::Pending {
+            if self.method_of[j] == k && self.state[j] == State::Pending {
                 self.state[j] = State::Skipped { upstream: None };
                 self.skip_downstream(j);
             }

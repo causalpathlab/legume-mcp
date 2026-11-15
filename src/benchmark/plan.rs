@@ -43,6 +43,7 @@ use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 /// The tool word of `{legume}`, this program.
 pub const LEGUME: &str = "{legume}";
@@ -258,42 +259,46 @@ pub(super) fn base(word: &str) -> &str {
 /// method makes one score, pinto `lra-*` books its memory, and no score reads
 /// the pair truth of a reference-ATAC multiome.
 pub fn check(spec: &Spec) -> Result<()> {
-    for (si, stage) in spec.stages.iter().enumerate() {
-        for method in &stage.methods {
-            for (at, parts) in words(spec, method)? {
-                for part in parts {
-                    let Part::Ph(name, ph) = part else { continue };
-                    match ph {
-                        Ph::Method if method.name.is_none() => {
-                            return Err(bad(&at, "{method} is for a stage with methods"))
-                        }
-                        Ph::Gpu if method.gpus == 0 => {
-                            return Err(bad(&at, "{gpu} names a GPU, and this task asks for none"))
-                        }
-                        Ph::Input(n) if !spec.inputs.iter().any(|i| i.name == n) => {
-                            return Err(bad(&at, format!("{{{name}}}: {n:?} is no declared input")))
-                        }
-                        Ph::Stage(t) => upstream(spec, si, method, t, &at, name)?,
-                        Ph::Glob(t, pattern) => {
-                            if !is_plain_relative(pattern) {
-                                return Err(bad(
-                                    &at,
-                                    format!("{{{name}}}: a glob is {{glob:STAGE/PATTERN}}, the pattern inside the stage's folder"),
-                                ));
-                            }
-                            upstream(spec, si, method, t, &at, name)?;
-                        }
-                        _ => {}
-                    }
+    let methods = spec.stages.iter().enumerate();
+    let methods = methods.flat_map(|(si, s)| s.methods.iter().map(move |m| (si, m)));
+    for (si, method) in methods {
+        let words = words(spec, method)?;
+        let placeholders = words.iter().flat_map(|(at, parts)| {
+            parts.iter().filter_map(move |part| match *part {
+                Part::Ph(name, ph) => Some((at, name, ph)),
+                Part::Text(_) => None,
+            })
+        });
+        for (at, name, ph) in placeholders {
+            match ph {
+                Ph::Method if method.name.is_none() => {
+                    return Err(bad(at, "{method} is for a stage with methods"))
                 }
+                Ph::Gpu if method.gpus == 0 => {
+                    return Err(bad(at, "{gpu} names a GPU, and this task asks for none"))
+                }
+                Ph::Input(n) if !spec.inputs.iter().any(|i| i.name == n) => {
+                    return Err(bad(at, format!("{{{name}}}: {n:?} is no declared input")))
+                }
+                Ph::Stage(t) => upstream(spec, si, method, t, at, name)?,
+                Ph::Glob(t, pattern) => {
+                    if !is_plain_relative(pattern) {
+                        return Err(bad(
+                            at,
+                            format!("{{{name}}}: a glob is {{glob:STAGE/PATTERN}}, the pattern inside the stage's folder"),
+                        ));
+                    }
+                    upstream(spec, si, method, t, at, name)?;
+                }
+                _ => {}
             }
-            if is_pinto_lra(method) && method.mem_gb <= 0.0 {
-                return Err(bad(
-                    &format!("{}.mem_gb", method.at),
-                    "is required for pinto lra-*: it sizes itself to the memory it sees free, \
-                     so each task books what it takes",
-                ));
-            }
+        }
+        if is_pinto_lra(method) && method.mem_gb <= 0.0 {
+            return Err(bad(
+                &format!("{}.mem_gb", method.at),
+                "is required for pinto lra-*: it sizes itself to the memory it sees free, \
+                 so each task books what it takes",
+            ));
         }
     }
     scores_made(spec)?;
@@ -347,7 +352,7 @@ fn upstream(spec: &Spec, si: usize, method: &Method, t: &str, at: &str, name: &s
         ));
     }
     let up = &spec.stages[ti];
-    if !up.has_methods {
+    if !up.has_methods() {
         return Ok(());
     }
     let names = || method_names(up).join(", ");
@@ -595,19 +600,22 @@ impl<'a> Prepared<'a> {
             .map(|w| w.1)
             .collect();
         let (mut upstream, mut inputs) = (Vec::new(), Vec::new());
+        // Another tool's argv names `{legume}`, as [`embeds_legume`] says.
+        let mut embeds = false;
         for part in words.iter().flatten() {
             match *part {
                 Part::Ph(_, Ph::Stage(t) | Ph::Glob(t, _))
                     if !upstream.iter().any(|u: &(&str, bool)| u.0 == t) =>
                 {
-                    let methods = spec.stages.iter().any(|s| s.name == t && s.has_methods);
-                    upstream.push((t, methods));
+                    let has_methods = spec.stages.iter().any(|s| s.name == t && s.has_methods());
+                    upstream.push((t, has_methods));
                 }
                 Part::Ph(_, Ph::Input(n)) if !inputs.contains(&n) => inputs.push(n),
+                Part::Ph(_, Ph::Legume) if word != LEGUME => embeds = true,
                 _ => {}
             }
         }
-        let legume = embeds_legume(method)
+        let legume = embeds
             .then(|| ctx.tool(LEGUME).map(|t| t.content_key.as_str()))
             .flatten();
         let env = THREAD_VARS
@@ -632,13 +640,17 @@ impl<'a> Prepared<'a> {
         &self,
         template: &[String],
         argv: &[String],
-        upstream_keys: Vec<&String>,
+        upstream_keys: &[&String],
         ctx: &Context,
     ) -> String {
         // A declared input named by its path is read as well.
         let mut inputs = self.inputs.clone();
         for t in &argv[1..] {
-            for n in inputs_under(t, ctx.inputs) {
+            let p = named_path(t);
+            if !p.is_absolute() {
+                continue;
+            }
+            for n in inputs_under(p, ctx.inputs) {
                 if !inputs.contains(&n) {
                     inputs.push(n);
                 }
@@ -649,13 +661,11 @@ impl<'a> Prepared<'a> {
             .iter()
             .map(|n| json!({"name": n, "hash": ctx.inputs.get(*n).map(|i| &i.1)}))
             .collect();
-        let threads_env: BTreeMap<&str, &str> =
-            THREAD_VARS.iter().map(|v| (*v, "{threads}")).collect();
         let mut keyed = json!({
             "stage": self.stage.name,
             "method": self.method.name,
             "argv": template,
-            "env": threads_env,
+            "env": *THREADS_ENV,
             "tool": self.tool.content_key,
             "inputs": input_keys,
             "upstream": upstream_keys,
@@ -666,6 +676,13 @@ impl<'a> Prepared<'a> {
         key::key_of(&keyed)
     }
 }
+
+/// The environment a task key records: each thread variable as
+/// `{threads}`, the same for every task.
+static THREADS_ENV: LazyLock<Value> = LazyLock::new(|| {
+    let env: BTreeMap<&str, &str> = THREAD_VARS.iter().map(|v| (*v, "{threads}")).collect();
+    json!(env)
+});
 
 /// The values a task of `point` in replicate `rep` shares with the other
 /// tasks there: each axis's label, its bindings, `rep` and `rep_seed`.
@@ -761,29 +778,29 @@ pub fn tasks(spec: &Spec, ctx: &Context) -> Result<Vec<Task>> {
             let pid = point_id(&labels);
             let shared = values(point, rep, rep_seed);
             for p in &prepared {
-                let (stage, m) = (p.stage, p.method);
-                let method = m.name.as_deref();
-                let id = task_id(&pid, rep, &stage.name, method);
-                let seed = stage_seed(rep_seed, &stage.name, method.unwrap_or(""));
+                let (stage, method) = (p.stage, p.method);
+                let name = method.name.as_deref();
+                let id = task_id(&pid, rep, &stage.name, name);
+                let seed = stage_seed(rep_seed, &stage.name, name.unwrap_or(""));
                 let mut values = shared.clone();
                 values.insert("seed", seed.to_string());
                 let mut upstream: Vec<String> = Vec::new();
                 let mut stages: HashMap<&str, PathBuf> = HashMap::new();
-                for &(t, methods) in &p.upstream {
-                    let uid = task_id(&pid, rep, t, method.filter(|_| methods));
+                for &(t, has_methods) in &p.upstream {
+                    let uid = task_id(&pid, rep, t, name.filter(|_| has_methods));
                     stages.insert(t, tasks_dir.join(&uid));
                     upstream.push(uid);
                 }
                 let dir = tasks_dir.join(&id);
                 let fill = Fill {
                     values: &values,
-                    method,
-                    threads: m.threads,
+                    method: name,
+                    threads: method.threads,
                     out: &dir,
                     stages: &stages,
                     ctx,
                 };
-                let mut template = vec![m.run[0].clone()];
+                let mut template = vec![method.run[0].clone()];
                 let mut argv = vec![p.tool.exec.display().to_string()];
                 for w in &p.words {
                     template.push(fill.word(w, true));
@@ -791,7 +808,7 @@ pub fn tasks(spec: &Spec, ctx: &Context) -> Result<Vec<Task>> {
                 }
                 let upstream_keys: Vec<&String> =
                     upstream.iter().filter_map(|u| keys.get(u)).collect();
-                let key = p.key(&template, &argv, upstream_keys, ctx);
+                let key = p.key(&template, &argv, &upstream_keys, ctx);
                 keys.insert(id.clone(), key.clone());
                 tasks.push(Task {
                     id,
@@ -800,16 +817,16 @@ pub fn tasks(spec: &Spec, ctx: &Context) -> Result<Vec<Task>> {
                     rep_seed,
                     seed,
                     stage: stage.name.clone(),
-                    method: method.map(str::to_string),
+                    method: name.map(str::to_string),
                     argv,
                     env: p.env.clone(),
-                    threads: m.threads,
-                    mem_gb: m.mem_gb,
-                    gpus: m.gpus,
-                    timeout_secs: m.timeout_secs,
-                    max_running: m.max_running,
+                    threads: method.threads,
+                    mem_gb: method.mem_gb,
+                    gpus: method.gpus,
+                    timeout_secs: method.timeout_secs,
+                    max_running: method.max_running,
                     dir,
-                    makes: m.makes.clone(),
+                    makes: method.makes.clone(),
                     upstream,
                     key,
                 });
@@ -850,7 +867,7 @@ pub fn warnings(spec: &Spec, tasks: &[Task], ctx: &Context) -> Vec<String> {
             if !p.is_absolute() || p.starts_with(dir) || !seen.insert(p) {
                 continue;
             }
-            let declared = !inputs_under(token, ctx.inputs).is_empty();
+            let declared = inputs_under(p, ctx.inputs).next().is_some();
             if !declared && p.is_file() {
                 let path = p.display();
                 out.push(format!(
@@ -864,19 +881,19 @@ pub fn warnings(spec: &Spec, tasks: &[Task], ctx: &Context) -> Vec<String> {
     out
 }
 
-/// The declared inputs at or above the path `token` names, if absolute,
-/// as written or once resolved.
-fn inputs_under<'a>(token: &str, inputs: &'a HashMap<String, (PathBuf, String)>) -> Vec<&'a str> {
-    let p = named_path(token);
-    if !p.is_absolute() {
-        return Vec::new();
-    }
+/// The declared inputs at or above the absolute path `p`, as written or
+/// once resolved.
+fn inputs_under<'a>(
+    p: &'a Path,
+    inputs: &'a HashMap<String, (PathBuf, String)>,
+) -> impl Iterator<Item = &'a str> {
     let real = p.canonicalize().ok();
     inputs
         .iter()
-        .filter(|(_, (i, _))| p.starts_with(i) || real.as_deref().is_some_and(|r| r.starts_with(i)))
+        .filter(move |(_, (i, _))| {
+            p.starts_with(i) || real.as_deref().is_some_and(|r| r.starts_with(i))
+        })
         .map(|(n, _)| n.as_str())
-        .collect()
 }
 
 /// The path an argv word names: all of it, or what follows its last `=`

@@ -98,14 +98,19 @@ pub struct Input {
     pub dir: bool,
 }
 
-/// A stage: its methods, or one method named after the stage when it
-/// has none.
+/// A stage: its methods, or one unnamed method of its own when it lists
+/// none. It always has at least one.
 #[derive(Clone, Debug)]
 pub struct Stage {
     pub name: String,
-    /// It lists methods: each method's name is Some.
-    pub has_methods: bool,
     pub methods: Vec<Method>,
+}
+
+impl Stage {
+    /// It lists methods: each method's name is Some.
+    pub fn has_methods(&self) -> bool {
+        self.methods[0].name.is_some()
+    }
 }
 
 /// What one task of a stage, or of a method in it, runs and needs, the
@@ -443,7 +448,7 @@ impl Needs {
 }
 
 /// A method's `run` and `makes`, with what it needs.
-fn method(o: &mut Obj, name: Option<String>, needs: Needs) -> Result<Method> {
+fn parse_method(o: &mut Obj, name: Option<String>, needs: Needs) -> Result<Method> {
     let run = o
         .strings("run")?
         .ok_or_else(|| bad(&o.at("run"), "is required: the command, as a list of words"))?;
@@ -509,41 +514,37 @@ fn stage(at: String, v: &Value) -> Result<Stage> {
     let listed = o.get("methods");
     let has_run = o.map.contains_key("run") || o.map.contains_key("makes");
     let methods = match listed {
-        None => vec![method(&mut o, None, needs)?],
+        None => vec![parse_method(&mut o, None, needs)?],
         Some(_) if has_run => {
             return Err(bad(
                 &o.at,
                 "has both run and methods; each method gives its own run and makes",
             ))
         }
-        Some(m) => {
-            let mo = Obj::new(o.at("methods"), m)?;
+        Some(listed) => {
+            let mo = Obj::new(o.at("methods"), listed)?;
             if mo.map.is_empty() {
                 return Err(bad(&mo.at, "names no method"));
             }
             let mut methods = Vec::new();
-            for (id, mv) in mo.map {
-                let mut one = Obj::new(mo.at(id), mv)?;
-                if !is_method(id) {
+            for (name, v) in mo.map {
+                let mut obj = Obj::new(mo.at(name), v)?;
+                if !is_method(name) {
                     return Err(bad(
-                        &one.at,
-                        format!("{id:?} is no method name (letters, digits, _ and -)"),
+                        &obj.at,
+                        format!("{name:?} is no method name (letters, digits, _ and -)"),
                     ));
                 }
-                let own = Needs::take(&mut one)?;
-                let made = method(&mut one, Some(id.clone()), own.over(&needs))?;
-                one.done()?;
-                methods.push(made);
+                let own = Needs::take(&mut obj)?;
+                let m = parse_method(&mut obj, Some(name.clone()), own.over(&needs))?;
+                obj.done()?;
+                methods.push(m);
             }
             methods
         }
     };
     o.done()?;
-    Ok(Stage {
-        name,
-        has_methods: listed.is_some(),
-        methods,
-    })
+    Ok(Stage { name, methods })
 }
 
 fn axis(at: String, name: &str, v: &Value) -> Result<Axis> {
@@ -843,12 +844,12 @@ fn from_value(v: &Value) -> Result<Spec> {
         None => return Err(bad("stages", "is required")),
     };
     check_stage_names(&stages, &names)?;
-    let methods: Vec<&str> = stages
+    let method_names: Vec<&str> = stages
         .iter()
         .flat_map(|s| s.methods.iter().filter_map(|m| m.name.as_deref()))
         .collect();
     let compare = o
-        .list("compare", "pairs", |at, p| compared(at, p, &methods))?
+        .list("compare", "pairs", |at, p| compared(at, p, &method_names))?
         .unwrap_or_default();
     let plot = plot(o.get("plot"), &axes)?;
     o.done()?;
@@ -998,7 +999,7 @@ mod tests {
         .unwrap();
         assert!(matches!(&s.seeds, Seeds::List(l) if l == &[7, 3]));
         let st = &s.stages[0];
-        assert!(st.has_methods);
+        assert!(st.has_methods());
         let (m1, m2) = (&st.methods[0], &st.methods[1]);
         assert_eq!(m1.name.as_deref(), Some("M1"));
         assert_eq!(

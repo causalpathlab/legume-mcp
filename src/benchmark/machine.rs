@@ -186,8 +186,10 @@ pub fn drift(old: &Machine, new: &Machine) -> Vec<String> {
     );
     diff(
         "physical cores",
-        opt(&old.cores_physical.map(|n| n.to_string())),
-        opt(&new.cores_physical.map(|n| n.to_string())),
+        old.cores_physical
+            .map_or("unknown".into(), |n| n.to_string()),
+        new.cores_physical
+            .map_or("unknown".into(), |n| n.to_string()),
     );
     diff(
         "memory",

@@ -115,7 +115,7 @@ pub fn key_of(v: &Value) -> String {
 pub fn file_key(path: &Path) -> Result<String> {
     let mut h = Fnv128::new();
     std::fs::File::open(path)
-        .and_then(|mut f| std::io::copy(&mut f, &mut h))
+        .and_then(|f| std::io::copy(&mut std::io::BufReader::with_capacity(1 << 20, f), &mut h))
         .with_context(|| format!("reading {}", path.display()))?;
     Ok(h.hex())
 }
@@ -168,7 +168,6 @@ mod tests {
     // values below. splitmix64 seeded 0 gives 0xe220a8397b1dcdaf first.
     #[test]
     fn hashes_match_their_published_vectors() {
-        assert_eq!(key(b""), format!("{:032x}", Fnv128::OFFSET));
         assert_eq!(key(b""), "6c62272e07bb014262b821756295c58d");
         assert_eq!(fnv64(b""), 0xcbf29ce484222325);
         assert_eq!(fnv64(b"a"), 0xaf63dc4c8601ec8c);
