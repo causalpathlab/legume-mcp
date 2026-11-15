@@ -270,6 +270,15 @@ impl<'a> Obj<'a> {
         }
     }
 
+    /// Reads a u32 like `u32`, and refuses 0 with `why`, the whole message after the key.
+    fn nonzero_u32(&mut self, k: &'static str, why: &str) -> Result<Option<u32>> {
+        let n = self.u32(k)?;
+        if n == Some(0) {
+            return Err(bad(&self.at(k), why));
+        }
+        Ok(n)
+    }
+
     fn number(&mut self, k: &'static str) -> Result<Option<f64>> {
         match self.get(k) {
             None => Ok(None),
@@ -345,7 +354,7 @@ fn kind(v: &Value) -> &'static str {
 
 /// A duration: whole numbers each with a unit, s, m, h or d (`30m`,
 /// `1h30m`), in seconds.
-pub fn duration(s: &str) -> Option<u64> {
+fn duration(s: &str) -> Option<u64> {
     let mut secs = 0u64;
     let mut n: Option<u64> = None;
     for c in s.chars() {
@@ -388,14 +397,8 @@ impl Needs {
                 )
             })?),
         };
-        let threads = o.u32("threads")?;
-        if threads == Some(0) {
-            return Err(bad(&o.at("threads"), "is 0; a cell needs a thread"));
-        }
-        let max_running = o.u32("max_running")?;
-        if max_running == Some(0) {
-            return Err(bad(&o.at("max_running"), "is 0, so nothing would run"));
-        }
+        let threads = o.nonzero_u32("threads", "is 0; a cell needs a thread")?;
+        let max_running = o.nonzero_u32("max_running", "is 0, so nothing would run")?;
         let tool = o.string("tool")?;
         if tool
             .as_deref()
@@ -538,8 +541,11 @@ fn axis(at: String, name: &str, v: &Value) -> Result<Axis> {
     }
     let tuple = items[0].is_object();
     let mut values: Vec<AxisValue> = Vec::new();
+    let first_at = format!("{at}[0]");
+    fn names(v: &AxisValue) -> Vec<&str> {
+        v.bindings.iter().map(|b| b.0.as_str()).collect()
+    }
     for (i, x) in items.iter().enumerate() {
-        let first_at = format!("{at}[0]");
         let at = format!("{at}[{i}]");
         let value = match x {
             Value::String(s) if !tuple => AxisValue {
@@ -562,15 +568,15 @@ fn axis(at: String, name: &str, v: &Value) -> Result<Axis> {
             return Err(bad(&at, format!("{:?} is listed twice", value.label)));
         }
         if let Some(first) = values.first() {
-            let names = |v: &AxisValue| v.bindings.iter().map(|b| b.0.clone()).collect::<Vec<_>>();
-            if names(first) != names(&value) {
+            let (want, got) = (names(first), names(&value));
+            if want != got {
                 return Err(bad(
                     &at,
                     format!(
                         "binds {}, but {first_at} binds {}; each value of an axis binds \
                          the same names",
-                        names(&value).join(", "),
-                        names(first).join(", "),
+                        got.join(", "),
+                        want.join(", "),
                     ),
                 ));
             }
@@ -632,7 +638,7 @@ fn seeds(v: Option<&Value>) -> Result<Seeds> {
         )),
         (Some(l), None) => {
             let Value::Array(items) = l else {
-                return Err(bad("seeds.list", "is not a list"));
+                return Err(bad("seeds.list", format!("is {}, not a list", kind(l))));
             };
             if items.is_empty() {
                 return Err(bad("seeds.list", "is empty, so nothing would run"));
@@ -666,10 +672,7 @@ fn from_value(v: &Value) -> Result<Spec> {
             format!("{name:?} starts with a dot; a benchmark's folder is not hidden"),
         ));
     }
-    let cores = o.u32("cores")?;
-    if cores == Some(0) {
-        return Err(bad("cores", "is 0"));
-    }
+    let cores = o.nonzero_u32("cores", "is 0, so nothing could run")?;
     let mem_gb = o.number("mem_gb")?;
     let gpus = match o.get("gpus") {
         None => Vec::new(),
@@ -700,21 +703,21 @@ fn from_value(v: &Value) -> Result<Spec> {
             ))
         }
     };
-    let gpu_slots = o.u32("gpu_slots")?.unwrap_or(1);
-    if gpu_slots == 0 {
-        return Err(bad("gpu_slots", "is 0, so no GPU could be given"));
-    }
+    let gpu_slots = o
+        .nonzero_u32("gpu_slots", "is 0, so no GPU could be given")?
+        .unwrap_or(1);
     let grace_secs = o.uint("grace_secs")?.unwrap_or(10);
     let max_hours = o.number("max_hours")?;
     let min_free_gb = match o.get("disk") {
-        None => 10.0,
+        None => None,
         Some(d) => {
             let mut d = Obj::new("disk", d)?;
-            let f = d.number("min_free_gb")?.unwrap_or(10.0);
+            let f = d.number("min_free_gb")?;
             d.done()?;
             f
         }
-    };
+    }
+    .unwrap_or(10.0);
     if let Some(k) = o.string("keep")? {
         if k != "all" {
             return Err(bad(
@@ -900,7 +903,9 @@ fn compared(at: &str, v: &Value, lanes: &[&str]) -> Result<[String; 2]> {
     let mut out = [String::new(), String::new()];
     for (i, x) in pair.into_iter().enumerate() {
         let at = format!("{at}[{i}]");
-        let s = x.as_str().ok_or_else(|| bad(&at, "is not a string"))?;
+        let s = x
+            .as_str()
+            .ok_or_else(|| bad(&at, format!("is {}, not a string", kind(x))))?;
         match s.split_once('/') {
             Some((m, sc)) if lanes.contains(&m) && !sc.is_empty() => out[i] = s.to_string(),
             Some((m, _)) if !lanes.contains(&m) => {
