@@ -161,16 +161,12 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
     };
     crate::job::replace(&dir, "plan.json", crate::pretty(&plan_json)?.as_bytes())?;
 
-    let shown = |p: &Path| {
-        p.strip_prefix(&root)
-            .map_or_else(|_| p.display().to_string(), |r| r.display().to_string())
-    };
     let said = Summary {
         spec: &spec,
         cells: &cells,
         tools: &resolved,
         drift: &drift,
-        dir: shown(&dir),
+        dir: crate::rel_path(&root, &dir),
         spec_key: &spec_key,
         cores,
         mem_gb,

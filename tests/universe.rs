@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{legume, legume_fed, tsv};
+use common::{cis_args, legume, legume_fed, stderr, tsv};
 use flate2::read::MultiGzDecoder;
 use legume_mcp::universe::{chr_stripped, cis_pairs, parse_peak, Gene, Pair, Peak};
 use std::io::Read;
@@ -156,21 +156,13 @@ fn universe_cis_writes_gene_peak_distance_and_says_how_many() {
         "chr1:9000-9010",
     ];
     std::fs::write(&peaks, names.join("\n") + "\n").unwrap();
-    let o = legume([
-        "universe",
-        "cis",
-        "--gene-coords",
-        genes.to_str().unwrap(),
-        "--peaks",
-        peaks.to_str().unwrap(),
-        "--window",
-        "100",
-        "--max-per-gene",
-        "2",
-        "-o",
-        out.to_str().unwrap(),
-    ]);
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = legume(cis_args(
+        &genes,
+        &peaks,
+        &out,
+        &["--window", "100", "--max-per-gene", "2"],
+    ));
+    assert!(o.status.success(), "{}", stderr(&o));
     let text = gunzip(&out);
     let want = format!(
         "gene\tpeak\tdistance\n\
@@ -197,21 +189,10 @@ fn a_piped_gene_or_peak_file_is_read_whole() {
     let out = dir.path().join("cis.tsv");
     tsv(&genes, "gene\tchr\ttss", &["GENE1\tchr1\t1000"]);
     std::fs::write(&peaks, "chr1:990-1010\nchr1:995-1005\n").unwrap();
-    let args = [
-        "universe",
-        "cis",
-        "--gene-coords",
-        genes.to_str().unwrap(),
-        "--peaks",
-        peaks.to_str().unwrap(),
-        "--window",
-        "100",
-        "-o",
-        out.to_str().unwrap(),
-    ];
+    let args = cis_args(&genes, &peaks, &out, &["--window", "100"]);
     for piped in [&genes, &peaks] {
-        let o = legume_fed(args, piped, std::fs::read(piped).unwrap());
-        let e = String::from_utf8_lossy(&o.stderr);
+        let o = legume_fed(&args, piped, std::fs::read(piped).unwrap());
+        let e = stderr(&o);
         assert!(o.status.success(), "{} piped: {e}", piped.display());
         assert_eq!(
             std::fs::read_to_string(&out).unwrap(),
@@ -230,18 +211,9 @@ fn universe_cis_needs_a_window() {
     tsv(&genes, "gene\tchr\ttss", &["GENE1\tchr1\t1000"]);
     std::fs::write(&peaks, "chr1:990-1010\n").unwrap();
     let out = dir.path().join("cis.tsv.gz");
-    let o = legume([
-        "universe",
-        "cis",
-        "--gene-coords",
-        genes.to_str().unwrap(),
-        "--peaks",
-        peaks.to_str().unwrap(),
-        "-o",
-        out.to_str().unwrap(),
-    ]);
+    let o = legume(cis_args(&genes, &peaks, &out, &[]));
     assert_eq!(o.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&o.stderr).contains("--window"));
+    assert!(stderr(&o).contains("--window"));
     assert!(!out.exists());
 }
 

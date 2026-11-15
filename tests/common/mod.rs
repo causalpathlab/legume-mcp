@@ -52,6 +52,38 @@ pub fn legume_fed(
     o
 }
 
+/// `o`'s standard error as text.
+pub fn stderr(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+/// `p` as an argument; the tests' paths are UTF-8.
+pub fn s(p: &Path) -> &str {
+    p.to_str().unwrap()
+}
+
+/// `universe cis` from the gene coordinates `genes` and the peak names
+/// `peaks` to `out`, with the further arguments `more`.
+pub fn cis_args<'a>(
+    genes: &'a Path,
+    peaks: &'a Path,
+    out: &'a Path,
+    more: &[&'a str],
+) -> Vec<&'a str> {
+    let mut args = vec![
+        "universe",
+        "cis",
+        "--gene-coords",
+        s(genes),
+        "--peaks",
+        s(peaks),
+        "-o",
+        s(out),
+    ];
+    args.extend_from_slice(more);
+    args
+}
+
 /// A TSV with a header, gzipped when the name ends in `.gz`.
 pub fn tsv(path: &Path, header: &str, rows: &[impl AsRef<str>]) {
     let mut text = format!("{header}\n");

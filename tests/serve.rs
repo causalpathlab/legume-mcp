@@ -1,22 +1,11 @@
+mod mcp;
+
 use anyhow::Result;
 use legume_mcp::{serve_on, Call, Content, Fact, Handler, ServerInfo, Step, ToolSpec};
+use mcp::{call, Sink};
 use serde_json::{json, Value};
-use std::io::{Cursor, Write};
+use std::io::Cursor;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
-
-/// A writer the test reads back.
-#[derive(Clone, Default)]
-struct Sink(Arc<Mutex<Vec<u8>>>);
-
-impl Write for Sink {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
 
 struct Tools {
     calls: usize,
@@ -98,11 +87,6 @@ fn session(lines: &[Value]) -> Vec<Value> {
     text.lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect()
-}
-
-fn call(id: u64, name: &str, args: Value) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
-            "params": { "name": name, "arguments": args } })
 }
 
 fn by_id(msgs: &[Value], id: u64) -> &Value {

@@ -1,27 +1,17 @@
 //! The helpers a tool builds its calls from: its arguments, the paths and
 //! command lines it shows, and a free name for a run's outputs.
 
+mod mcp;
+
 use anyhow::Result;
 use legume_mcp::{command_line, free_prefix, parse_args, serve_in, shown_path};
 use legume_mcp::{Call, Content, Handler};
 use legume_mcp::{ServerInfo, ToolSpec};
+use mcp::{call, Sink};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::io::{Cursor, Write};
+use std::io::Cursor;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-
-#[derive(Clone, Default)]
-struct Sink(Arc<Mutex<Vec<u8>>>);
-
-impl Write for Sink {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
@@ -72,28 +62,16 @@ impl Handler for Tools {
     }
 }
 
-fn call(id: u64, name: &str, args: Value) -> String {
-    let msg = json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
-                      "params": { "name": name, "arguments": args } });
-    format!("{msg}\n")
-}
-
 /// The replies of a session of `lines`, by id, keeping records at `project`.
-fn session(project: Option<PathBuf>, lines: &[String]) -> Vec<Value> {
+fn session(project: Option<PathBuf>, lines: &[Value]) -> Vec<Value> {
+    let input: String = lines.iter().map(|l| format!("{l}\n")).collect();
     let sink = Sink::default();
     let info = ServerInfo {
         name: "t".into(),
         version: "0".into(),
         instructions: None,
     };
-    serve_in(
-        Cursor::new(lines.concat()),
-        sink.clone(),
-        info,
-        project,
-        Tools,
-    )
-    .unwrap();
+    serve_in(Cursor::new(input), sink.clone(), info, project, Tools).unwrap();
     let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
     let mut replies: Vec<Value> = text
         .lines()

@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{legume, legume_fed, tsv};
+use common::{cis_args, legume, legume_fed, s, stderr, tsv};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, FloatType, Int32Type, Int64Type};
 use parquet::file::properties::WriterProperties;
@@ -14,10 +14,6 @@ use parquet::schema::parser::parse_message_type;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::Arc;
-
-fn stderr(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stderr).into_owned()
-}
 
 /// The definition levels of an OPTIONAL column: 0 for a null.
 fn levels<T>(v: &[Option<T>]) -> Vec<i16> {
@@ -147,10 +143,6 @@ fn row<'a>(rows: &'a [Row], score: &str, metric: &str) -> &'a Row {
 
 fn near(got: f64, want: f64) {
     assert!((got - want).abs() <= 1e-12, "got {got}, want {want}");
-}
-
-fn s(p: &Path) -> &str {
-    p.to_str().unwrap()
 }
 
 /// A universe of 1000 pairs (GENE{g}, PEAK{p}) with 10 truth pairs, of
@@ -841,18 +833,7 @@ fn a_chickpea_links_parquet_is_scored_over_the_cis_universe() {
         "chr3:1000-1001",
     ];
     std::fs::write(&peaks, names.join("\n") + "\n").unwrap();
-    let o = legume([
-        "universe",
-        "cis",
-        "--gene-coords",
-        s(&genes),
-        "--peaks",
-        s(&peaks),
-        "--window",
-        "100",
-        "-o",
-        s(&universe),
-    ]);
+    let o = legume(cis_args(&genes, &peaks, &universe, &["--window", "100"]));
     assert!(o.status.success(), "{}", stderr(&o));
 
     tsv(

@@ -160,11 +160,7 @@ fn data_files(root: &Path) -> Vec<(String, u64)> {
                 continue;
             }
             let path = e.path();
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
+            let rel = crate::rel_path(root, &path);
             let Ok(m) = std::fs::symlink_metadata(&path) else {
                 continue;
             };

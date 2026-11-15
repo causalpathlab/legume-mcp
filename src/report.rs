@@ -136,12 +136,7 @@ pub(crate) fn build(root: &Path, day: Option<&str>) -> Result<Built> {
 
 /// What was made, in words, paths from the project.
 pub(crate) fn said(root: &Path, b: &Built) -> String {
-    let rel = |p: &Path| {
-        p.strip_prefix(root)
-            .unwrap_or(p)
-            .to_string_lossy()
-            .into_owned()
-    };
+    let rel = |p: &Path| crate::rel_path(root, p);
     let mut out = match &b.pdf {
         Ok(p) => format!("Slides: {}", rel(p)),
         Err(why) => format!("No PDF ({why})."),

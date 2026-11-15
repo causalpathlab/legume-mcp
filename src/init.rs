@@ -232,7 +232,7 @@ fn connect(
                 continue;
             }
         };
-        let at = rel(project, &saved.path);
+        let at = crate::rel_path(project, &saved.path);
         if !saved.changed {
             writeln!(out, "{at} for {} lists them all already", a.name)?;
         } else {
@@ -310,14 +310,6 @@ fn mark(project: &Path) -> Result<()> {
           legume server keeps the project's records in results/ beside it,\n\
           whichever subfolder an agent is started in.\n",
     )
-}
-
-/// `path` from `root`.
-fn rel(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
 }
 
 /// `legume` and each legume tool on the PATH that serves MCP, by name and
