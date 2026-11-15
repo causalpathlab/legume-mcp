@@ -177,13 +177,10 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::code;
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_string).collect()
-    }
-
-    fn code(e: anyhow::Error) -> i32 {
-        crate::command::code(&e)
     }
 
     const BASE: &str = "--scores s.tsv --key K --truth t.tsv --truth-key K -o o.tsv";
@@ -199,7 +196,7 @@ mod tests {
         assert_eq!(score("M3=abs:t").unwrap().transform, Transform::Abs);
         assert_eq!(score("M4=t").unwrap().transform, Transform::Plain);
         for bad in ["M1", "=t", "M1=", "M1=neg:", "M 1=t"] {
-            assert_eq!(code(score(bad).unwrap_err()), 2, "{bad}");
+            assert_eq!(code(&score(bad).unwrap_err()), 2, "{bad}");
         }
     }
 
@@ -225,7 +222,7 @@ mod tests {
             format!("{BASE} --score M1=v --universe same --truth-key L"),
             format!("{BASE} --key K,L --truth-key L,K --score M1=v --universe same"),
         ] {
-            assert_eq!(code(parse(&args(&bad)).unwrap_err()), 2, "{bad}");
+            assert_eq!(code(&parse(&args(&bad)).unwrap_err()), 2, "{bad}");
         }
     }
 }

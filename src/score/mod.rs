@@ -19,7 +19,7 @@ use crate::table::{self, Keyed, Numbers};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The output's columns, in order: the header, and the cells of each
 /// [`ScoreRow`].
@@ -96,13 +96,15 @@ enum Transform {
 }
 
 impl Transform {
+    /// `x` transformed. Never given NaN: a NaN cell is no score and is
+    /// skipped before this.
     fn apply(self, x: f64) -> Result<f64> {
         Ok(match self {
             Transform::Plain => x,
             Transform::Neg => -x,
             Transform::Abs => x.abs(),
             Transform::NegLog10 => {
-                if !(0.0..=1.0).contains(&x) && !x.is_nan() {
+                if !(0.0..=1.0).contains(&x) {
                     bail!("neglog10 of {x}: a p value is in [0, 1]");
                 }
                 -x.log10()
@@ -175,16 +177,12 @@ struct Items<'a> {
 }
 
 impl<'a> Items<'a> {
-    /// The items of the rows `keys`; with `rows`, each row's item pushed
-    /// onto it as it is found.
-    fn new(keys: &'a [String], mut rows: Option<&mut Vec<Option<usize>>>) -> Self {
+    /// The items of the rows `keys`.
+    fn new(keys: &'a [String]) -> Self {
         let mut index = HashMap::with_capacity(keys.len());
         for k in keys {
             let next = index.len();
-            let at = *index.entry(k.as_str()).or_insert(next);
-            if let Some(rows) = rows.as_deref_mut() {
-                rows.push(Some(at));
-            }
+            index.entry(k.as_str()).or_insert(next);
         }
         Items {
             index,
@@ -213,29 +211,38 @@ struct Truth {
     outside_pos: usize,
 }
 
+/// Refuses the first cell of `col` that is not a number among the rows
+/// `read` keeps, naming the row, its `column` and the file at `path`.
+fn numbers_only(
+    col: &Numbers,
+    read: impl Fn(usize) -> bool,
+    column: &str,
+    path: &Path,
+) -> Result<()> {
+    if let Some((row, cell)) = col.first_bad(read) {
+        bail!(
+            "row {} of {column} in {}: {cell:?} is not a number",
+            row + 1,
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// The truth of the rows `keys`, each at its item `at` among `items`
-/// items: each row positive or, with `--label`, positive when its cell of
-/// `label` is above the value.
+/// items: each row positive or, with `label` (the `--label` column's name,
+/// its cells and the value), positive when its cell is above the value.
 fn truth_of(
     spec: &Spec,
     keys: &[String],
     at: &[Option<usize>],
-    label: Option<&Numbers>,
+    label: Option<(&str, &Numbers, f64)>,
     items: usize,
 ) -> Result<Truth> {
-    let label = match (&spec.label, label) {
-        (Some((col, above)), Some(values)) => {
-            if let Some((row, cell)) = values.first_bad(|_| true) {
-                bail!(
-                    "row {} of {col} in {}: {cell:?} is not a number",
-                    row + 1,
-                    spec.truth.display()
-                );
-            }
-            Some((&values.values, *above))
-        }
-        _ => None,
-    };
+    if let Some((column, values, _)) = label {
+        numbers_only(values, |_| true, column, &spec.truth)?;
+    }
+    let label = label.map(|(_, values, above)| (&values.values, above));
     let (mut labels, mut seen) = (vec![false; items], vec![false; items]);
     // Each key outside the universe, and whether it is positive.
     let mut outside: HashMap<&str, bool> = HashMap::new();
@@ -322,9 +329,7 @@ fn score_of(
             spec.scores.display()
         )
     };
-    if let Some((row, cell)) = col.first_bad(|row| at[row].is_some()) {
-        bail!("{}: {cell:?} is not a number", whence(row));
-    }
+    numbers_only(col, |row| at[row].is_some(), &s.column, &spec.scores)?;
     values.fill(None);
     for (row, (&at, &x)) in at.iter().zip(&col.values).enumerate() {
         // NaN is no score, so leaves the item as it was.
@@ -363,18 +368,14 @@ fn over_universe(
     let same_label = numbers.split_off(spec.score.len());
     let same = spec.universe == Universe::Same;
     let (universe_keys, truth_table);
-    let mut own = Vec::new();
     let (items, truth_keys, truth_label) = match &spec.universe {
-        Universe::Same => {
-            own.reserve(keys.len());
-            (Items::new(&keys, Some(&mut own)), &keys, same_label.first())
-        }
+        Universe::Same => (Items::new(&keys), &keys, same_label.first()),
         Universe::File { path, key } => {
             universe_keys = table::read_keyed(path, key, &[])?.keys;
             truth_table =
                 table::read_keyed(&spec.truth, &spec.truth_key, spec.label_column().as_slice())?;
             (
-                Items::new(&universe_keys, None),
+                Items::new(&universe_keys),
                 &truth_table.keys,
                 truth_table.numbers.first(),
             )
@@ -387,15 +388,20 @@ fn over_universe(
         items.rows - items.len()
     )?;
 
-    let at = if same { own } else { items.find(&keys) };
-    let found;
-    let truth_at = if same {
-        &at
-    } else {
-        found = items.find(truth_keys);
-        &found
-    };
-    let truth = truth_of(spec, truth_keys, truth_at, truth_label, items.len())?;
+    let at = items.find(&keys);
+    let found = (!same).then(|| items.find(truth_keys));
+    let label = spec
+        .label
+        .as_ref()
+        .zip(truth_label)
+        .map(|((col, above), values)| (col.as_str(), values, *above));
+    let truth = truth_of(
+        spec,
+        truth_keys,
+        found.as_deref().unwrap_or(&at),
+        label,
+        items.len(),
+    )?;
     let positives = truth.labels.iter().filter(|&&p| p).count();
     writeln!(
         out,
