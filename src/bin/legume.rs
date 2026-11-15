@@ -1,8 +1,9 @@
 //! `legume`: a project connected to the agents that run the legume tools
 //! (`legume init`), and the server they share (`legume mcp`, which the
 //! agents start). Everything else is the server's: the person asks the
-//! agent. Beside them, a benchmark's scoring: `legume score` and `legume
-//! universe` (built with `benchmark`).
+//! agent. Beside them, a benchmark: its plan (`legume benchmark plan`) and
+//! its scoring (`legume score` and `legume universe`), built with
+//! `benchmark`.
 
 use legume_mcp::command;
 use std::io::Write;
@@ -16,6 +17,8 @@ ask: where are we? AGENTS.md tells it how to work with you. The
 agent reaches the rest through the `legume` server, which it starts itself
 (`legume mcp`).
 
+legume benchmark plan SPEC a benchmark's cells, tools and keys, planned from
+                           a spec (legume benchmark --help)
 legume score [...]         a method's scores against a truth over a universe:
                            AUROC and average precision (legume score --help)
 legume universe cis [...]  every gene's cis candidate peaks, a peak-to-gene
@@ -34,15 +37,21 @@ const COMMANDS: &[(&str, Main, &str)] = &[
         |args, out, _| legume_mcp::init::main(args, out),
         legume_mcp::init::USAGE,
     ),
+    benchmark::BENCHMARK,
     benchmark::SCORE,
     benchmark::UNIVERSE,
 ];
 
-/// `legume score` and `legume universe`.
+/// `legume benchmark`, `legume score` and `legume universe`.
 #[cfg(feature = "benchmark")]
 mod benchmark {
     use super::Main;
 
+    pub const BENCHMARK: (&str, Main, &str) = (
+        "benchmark",
+        legume_mcp::benchmark::main,
+        legume_mcp::benchmark::USAGE,
+    );
     pub const SCORE: (&str, Main, &str) =
         ("score", legume_mcp::score::main, legume_mcp::score::USAGE);
     pub const UNIVERSE: (&str, Main, &str) = (
@@ -52,7 +61,8 @@ mod benchmark {
     );
 }
 
-/// `legume score` and `legume universe` in a build without `benchmark`:
+/// `legume benchmark`, `legume score` and `legume universe` in a build
+/// without `benchmark`:
 /// they say how to install the one that has them, and exit 2.
 #[cfg(not(feature = "benchmark"))]
 mod benchmark {
@@ -72,6 +82,7 @@ mod benchmark {
         std::process::exit(2);
     }
 
+    pub const BENCHMARK: (&str, Main, &str) = ("benchmark", without_benchmark, "");
     pub const SCORE: (&str, Main, &str) = ("score", without_benchmark, "");
     pub const UNIVERSE: (&str, Main, &str) = ("universe", without_benchmark, "");
 }
@@ -97,8 +108,9 @@ fn main() -> anyhow::Result<()> {
     };
     if let Err(e) = run(&args[1..], &mut std::io::stdout(), &mut std::io::stderr()) {
         // A refusal's own exit code: 2 for a command line, said with the
-        // command's usage, 3 for a truth or score outside the universe;
-        // 1 for anything else.
+        // command's usage, 3 for what a command refuses to do with what
+        // it was given (a truth outside the universe, a spec that cannot
+        // plan); 1 for anything else.
         let code = command::code(&e);
         eprintln!("legume {name}: {e:#}");
         if code == 2 {

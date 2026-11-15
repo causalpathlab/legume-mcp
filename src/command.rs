@@ -29,6 +29,16 @@ pub fn usage(message: impl std::fmt::Display) -> anyhow::Error {
     .into()
 }
 
+/// What a command refuses to do with what it was given, and why: exit
+/// code 3.
+pub fn refuse(message: impl std::fmt::Display) -> anyhow::Error {
+    Exit {
+        code: 3,
+        message: message.to_string(),
+    }
+    .into()
+}
+
 /// `what`, or the refusal that `flag` is required.
 pub fn required<T>(what: Option<T>, flag: &str) -> Result<T> {
     what.ok_or_else(|| usage(format!("{flag} is required")))
@@ -85,6 +95,8 @@ mod tests {
         assert_eq!(code(&required::<()>(None, "--key").unwrap_err()), 2);
         assert_eq!(required(Some(1), "--key").unwrap(), 1);
         assert_eq!(code(&anyhow::anyhow!("M1")), 1);
+        assert_eq!(code(&refuse("M1")), 3);
+        assert_eq!(refuse("M1").to_string(), "M1");
         let e = Exit {
             code: 3,
             message: "M1".into(),

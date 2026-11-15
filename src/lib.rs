@@ -43,6 +43,8 @@ use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(feature = "benchmark")]
+pub mod benchmark;
 pub mod brain;
 #[cfg(feature = "clap")]
 pub mod cli;
@@ -772,11 +774,25 @@ pub fn shown_path(p: &Path) -> String {
 /// `name` in a folder of the PATH; a relative folder (`.`) is passed over,
 /// so a project's own files are never taken for a program.
 pub(crate) fn on_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+    on_path_in(name, &std::env::var_os("PATH")?, Path::is_file)
+}
+
+/// `name` in the first folder of `path` where `accept` takes it; a
+/// relative folder is passed over, as [`on_path`] does.
+pub(crate) fn on_path_in(
+    name: &str,
+    path: &std::ffi::OsStr,
+    accept: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    std::env::split_paths(path)
         .filter(|d| d.is_absolute())
         .map(|d| d.join(name))
-        .find(|p| p.is_file())
+        .find(|p| accept(p))
+}
+
+/// `v` as pretty JSON, ending in a newline, as a file holds it.
+pub(crate) fn pretty<T: serde::Serialize + ?Sized>(v: &T) -> Result<String> {
+    Ok(serde_json::to_string_pretty(v)? + "\n")
 }
 
 /// `p` absolute, against the working directory, without touching the disk.

@@ -1,6 +1,6 @@
 //! `legume`, run as the binary: each command's refusals and the exit codes
 //! they end with, and what a build without `benchmark` says for `legume
-//! score` and `legume universe`.
+//! benchmark`, `legume score` and `legume universe`.
 
 use std::process::{Command, Output};
 
@@ -35,9 +35,13 @@ fn a_command_line_init_cannot_run_exits_2_with_its_usage() {
 
 #[cfg(feature = "benchmark")]
 #[test]
-fn a_command_line_score_or_universe_cannot_run_exits_2_with_its_usage() {
+fn a_command_line_benchmark_score_or_universe_cannot_run_exits_2_with_its_usage() {
     for (args, usage) in [
-        (&["score", "--bogus", "1"][..], legume_mcp::score::USAGE),
+        (
+            &["benchmark", "plan", "--bogus"][..],
+            legume_mcp::benchmark::USAGE,
+        ),
+        (&["score", "--bogus", "1"], legume_mcp::score::USAGE),
         (
             &["universe", "cis", "--bogus", "1"],
             legume_mcp::universe::USAGE,
@@ -56,7 +60,12 @@ fn a_command_line_score_or_universe_cannot_run_exits_2_with_its_usage() {
 #[cfg(not(feature = "benchmark"))]
 #[test]
 fn a_build_without_benchmark_prints_the_install_line_and_exits_2() {
-    for args in [&["score"][..], &["score", "--help"], &["universe", "cis"]] {
+    for args in [
+        &["score"][..],
+        &["score", "--help"],
+        &["universe", "cis"],
+        &["benchmark", "plan", "S1.json"],
+    ] {
         let o = legume(args);
         assert_eq!(o.status.code(), Some(2), "{args:?}");
         assert_eq!(

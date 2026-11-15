@@ -445,7 +445,7 @@ fn save(project: &Path, file: &str, format: Format, servers: &[(String, String)]
             changed |= before.as_ref() != Some(&names);
             context.insert("fileName".into(), names);
         }
-        serde_json::to_string_pretty(&root)? + "\n"
+        crate::pretty(&root)?
     };
     folder_for(&path)?;
     if changed {
@@ -618,10 +618,7 @@ fn approve(project: &Path, ours: &[String]) -> Result<Approval> {
     if changed {
         std::fs::create_dir_all(dir).with_context(|| format!("making {}", dir.display()))?;
         ignore_local(dir)?;
-        replace(
-            &path,
-            (serde_json::to_string_pretty(&root)? + "\n").as_bytes(),
-        )?;
+        replace(&path, crate::pretty(&root)?.as_bytes())?;
     }
     Ok(Approval::Listed {
         changed,

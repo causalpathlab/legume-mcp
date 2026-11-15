@@ -13,7 +13,7 @@ mod cli;
 
 pub use cli::{main, USAGE};
 
-use crate::command::{usage, Exit};
+use crate::command::{refuse, usage};
 use crate::metric;
 use crate::table::{self, Keyed, Numbers};
 use anyhow::{bail, Context, Result};
@@ -341,14 +341,10 @@ fn score_of(
 /// fail (`flag` drop leaves them out, counted as `column`): exit 3.
 fn outside(count: usize, policy: Outside, what: &str, flag: &str, column: &str) -> Result<()> {
     if count > 0 && policy == Outside::Fail {
-        return Err(Exit {
-            code: 3,
-            message: format!(
-                "{count} {what} are outside the universe; {flag} drop leaves them out, counted \
-                 as {column}"
-            ),
-        }
-        .into());
+        return Err(refuse(format!(
+            "{count} {what} are outside the universe; {flag} drop leaves them out, counted as \
+             {column}"
+        )));
     }
     Ok(())
 }
