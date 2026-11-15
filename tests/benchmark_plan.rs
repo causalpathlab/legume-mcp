@@ -20,6 +20,14 @@ impl Project {
         p
     }
 
+    /// A project whose TOOL1 and TOOL2 do nothing.
+    fn with_tools() -> Self {
+        let p = Self::new();
+        p.tool("TOOL1", "true");
+        p.tool("TOOL2", "true");
+        p
+    }
+
     fn root(&self) -> &Path {
         self.dir.path()
     }
@@ -29,12 +37,11 @@ impl Project {
     }
 
     /// The stand-in tool `name`, a shell script running `body`.
-    fn tool(&self, name: &str, body: &str) -> PathBuf {
+    fn tool(&self, name: &str, body: &str) {
         use std::os::unix::fs::PermissionsExt;
         let p = self.bin().join(name);
         std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        p
     }
 
     /// `text` as the spec file `name`.
@@ -61,6 +68,13 @@ impl Project {
             .unwrap()
     }
 
+    /// `legume benchmark plan SPEC` with `more` after it.
+    fn plan_spec(&self, spec: &Path, more: &[&str]) -> Output {
+        let mut args = vec!["plan", spec.to_str().unwrap()];
+        args.extend_from_slice(more);
+        self.legume(&args)
+    }
+
     fn bench(&self, name: &str) -> PathBuf {
         self.root().join("results/benchmarks").join(name)
     }
@@ -68,6 +82,15 @@ impl Project {
     fn plan(&self, name: &str) -> Value {
         let text = std::fs::read(self.bench(name).join("plan.json")).unwrap();
         serde_json::from_slice(&text).unwrap()
+    }
+
+    /// The rows of benchmark `name`'s versions.tsv, split on tabs.
+    fn versions(&self, name: &str) -> Vec<Vec<String>> {
+        std::fs::read_to_string(self.bench(name).join("versions.tsv"))
+            .unwrap()
+            .lines()
+            .map(|l| l.split('\t').map(str::to_string).collect())
+            .collect()
     }
 }
 
@@ -81,6 +104,18 @@ fn stderr(o: &Output) -> String {
 
 fn ok(o: &Output) {
     assert!(o.status.success(), "{}\n{}", stdout(o), stderr(o));
+}
+
+/// The stderr of `o`, which exited 3, refused.
+fn refused(o: &Output) -> String {
+    let e = stderr(o);
+    assert_eq!(o.status.code(), Some(3), "{e}");
+    e
+}
+
+/// `TWO` with the top-level `fields` before its seeds.
+fn two_with(fields: &str) -> String {
+    TWO.replace("\"seeds\"", &format!("{fields}, \"seeds\""))
 }
 
 /// Each cell's id and key.
@@ -114,7 +149,7 @@ fn the_lra_one_spec_plans_its_cells_tools_and_keys() {
     std::fs::create_dir_all(p.root().join("RUN1")).unwrap();
     std::fs::write(p.root().join("RUN1/manifest.json"), "{}\n").unwrap();
     let spec = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lra_one.spec.json");
-    let o = p.legume(&["plan", spec.to_str().unwrap()]);
+    let o = p.plan_spec(&spec, &[]);
     ok(&o);
     let bench = p.bench("lra-one");
     let plan = p.plan("lra-one");
@@ -133,15 +168,14 @@ fn the_lra_one_spec_plans_its_cells_tools_and_keys() {
     );
     assert!(text.ends_with("]\n}\n"));
 
-    let versions = std::fs::read_to_string(bench.join("versions.tsv")).unwrap();
-    let rows: Vec<Vec<&str>> = versions.lines().map(|l| l.split('\t').collect()).collect();
+    let rows = p.versions("lra-one");
     assert_eq!(
         rows[0],
         ["tool", "source", "content_key", "exec", "version"]
     );
     let pinto = rows.iter().find(|r| r[0] == "pinto").unwrap();
     assert_eq!(pinto[1], p.bin().join("pinto").display().to_string());
-    let snap = bench.join("tools").join(pinto[2]).join("pinto");
+    let snap = bench.join("tools").join(&pinto[2]).join("pinto");
     assert_eq!(pinto[3], snap.display().to_string());
     assert_eq!(pinto[4], "pinto 0.17.0");
     let legume = rows.iter().find(|r| r[0] == "{legume}").unwrap();
@@ -228,7 +262,7 @@ fn the_lra_one_spec_plans_its_cells_tools_and_keys() {
     assert!(stderr(&o).is_empty(), "{}", stderr(&o));
 
     // Planned again unchanged: the same keys, nothing changed.
-    let again = p.legume(&["plan", spec.to_str().unwrap()]);
+    let again = p.plan_spec(&spec, &[]);
     ok(&again);
     assert_eq!(keys(&p.plan("lra-one")), keys(&plan));
     assert!(
@@ -240,7 +274,7 @@ fn the_lra_one_spec_plans_its_cells_tools_and_keys() {
     // The run input's content enters its cells' keys, and their
     // downstream's.
     std::fs::write(p.root().join("RUN1/manifest.json"), "{\"v\": 2}\n").unwrap();
-    ok(&p.legume(&["plan", spec.to_str().unwrap()]));
+    ok(&p.plan_spec(&spec, &[]));
     let edited = keys(&p.plan("lra-one"));
     for ((id, k), (id2, k2)) in keys(&plan).iter().zip(&edited) {
         assert_eq!(id, id2);
@@ -256,7 +290,7 @@ fn same_bytes_same_key() {
         let p = Project::new();
         p.tool("TOOL1", body);
         p.tool("TOOL2", "true");
-        ok(&p.legume(&["plan", p.spec("S1.json", TWO).to_str().unwrap()]));
+        ok(&p.plan_spec(&p.spec("S1.json", TWO), &[]));
         let plan = p.plan("N1");
         (keys(&plan), plan["spec_key"].clone())
     };
@@ -276,11 +310,9 @@ fn same_bytes_same_key() {
 // key, or unreadable, is not.
 #[test]
 fn done_counts_only_cells_of_their_key() {
-    let p = Project::new();
-    p.tool("TOOL1", "true");
-    p.tool("TOOL2", "true");
+    let p = Project::with_tools();
     let spec = p.spec("S1.json", TWO);
-    ok(&p.legume(&["plan", spec.to_str().unwrap()]));
+    ok(&p.plan_spec(&spec, &[]));
     let plan = p.plan("N1");
     let cells = plan["cells"].as_array().unwrap();
     for (c, done) in cells.iter().zip([
@@ -292,7 +324,7 @@ fn done_counts_only_cells_of_their_key() {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("done.json"), done).unwrap();
     }
-    let o = p.legume(&["plan", spec.to_str().unwrap()]);
+    let o = p.plan_spec(&spec, &[]);
     ok(&o);
     assert!(
         stdout(&o).contains("done 1 of 8 (by key)\n"),
@@ -305,16 +337,14 @@ fn done_counts_only_cells_of_their_key() {
 // and file name plan the same spec file and keys.
 #[test]
 fn a_spec_written_another_way_is_the_same_spec() {
-    let p = Project::new();
-    p.tool("TOOL1", "true");
-    p.tool("TOOL2", "true");
-    ok(&p.legume(&["plan", p.spec("S1.json", TWO).to_str().unwrap()]));
+    let p = Project::with_tools();
+    ok(&p.plan_spec(&p.spec("S1.json", TWO), &[]));
     let first = p.plan("N1");
     let v: Value = serde_json::from_str(TWO).unwrap();
     let pretty = serde_json::to_string_pretty(&v)
         .unwrap()
         .replace("\"seeds\"", " \"seeds\"");
-    ok(&p.legume(&["plan", p.spec("S2.json", &pretty).to_str().unwrap()]));
+    ok(&p.plan_spec(&p.spec("S2.json", &pretty), &[]));
     assert_eq!(p.plan("N1")["spec_key"], first["spec_key"]);
     assert_eq!(keys(&p.plan("N1")), keys(&first));
     let specs = std::fs::read_dir(p.bench("N1").join("specs"))
@@ -326,11 +356,11 @@ fn a_spec_written_another_way_is_the_same_spec() {
         "specs/{}.json",
         first["spec_key"].as_str().unwrap()
     ));
-    ok(&p.legume(&["plan", copy.to_str().unwrap()]));
+    ok(&p.plan_spec(&copy, &[]));
     std::fs::write(&copy, TWO.replace("\"n\": 2", "\"n\": 3")).unwrap();
-    let o = p.legume(&["plan", copy.to_str().unwrap()]);
-    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
-    assert!(stderr(&o).contains("not its name; a spec under specs/ is not edited in place"));
+    let o = p.plan_spec(&copy, &[]);
+    let e = refused(&o);
+    assert!(e.contains("not its name; a spec under specs/ is not edited in place"));
 }
 
 // no_version_still_keys: a tool with no --version (it exits 2) has NA
@@ -340,17 +370,9 @@ fn no_version_still_keys() {
     let p = Project::new();
     p.tool("TOOL1", "[ \"$1\" = --version ] && exit 2; true");
     p.tool("TOOL2", "echo 'TOOL2 1.0'");
-    ok(&p.legume(&["plan", p.spec("S1.json", TWO).to_str().unwrap()]));
-    let versions = std::fs::read_to_string(p.bench("N1").join("versions.tsv")).unwrap();
-    let row = |t: &str| {
-        versions
-            .lines()
-            .find(|l| l.starts_with(&format!("{t}\t")))
-            .unwrap()
-            .split('\t')
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    };
+    ok(&p.plan_spec(&p.spec("S1.json", TWO), &[]));
+    let rows = p.versions("N1");
+    let row = |t: &str| rows.iter().find(|r| r[0] == t).unwrap();
     assert_eq!(row("TOOL1")[4], "NA");
     assert_eq!(row("TOOL2")[4], "TOOL2 1.0");
     let k1 = &row("TOOL1")[2];
@@ -378,7 +400,7 @@ fn rebuild_mid_sweep_keeps_snapshot() {
     p.tool("TOOL1", "echo v1");
     p.tool("TOOL2", "true");
     let spec = p.spec("S1.json", TWO);
-    ok(&p.legume(&["plan", spec.to_str().unwrap()]));
+    ok(&p.plan_spec(&spec, &[]));
     let first = p.plan("N1");
     let exec = first["cells"][0]["argv"][0].as_str().unwrap().to_string();
     assert!(
@@ -387,7 +409,7 @@ fn rebuild_mid_sweep_keeps_snapshot() {
     );
 
     p.tool("TOOL1", "echo v2");
-    let o = p.legume(&["plan", spec.to_str().unwrap()]);
+    let o = p.plan_spec(&spec, &[]);
     ok(&o);
     let kept = p.plan("N1");
     assert_eq!(keys(&kept), keys(&first));
@@ -404,7 +426,7 @@ fn rebuild_mid_sweep_keeps_snapshot() {
         "{said}"
     );
 
-    ok(&p.legume(&["plan", spec.to_str().unwrap(), "--retool"]));
+    ok(&p.plan_spec(&spec, &["--retool"]));
     let retooled = p.plan("N1");
     assert_ne!(retooled["cells"][0]["argv"][0], exec.as_str());
     for ((id, k), (_, k2)) in keys(&first).iter().zip(&keys(&retooled)) {
@@ -417,13 +439,10 @@ fn rebuild_mid_sweep_keeps_snapshot() {
 // with nothing written.
 #[test]
 fn mem_over_total_refused() {
-    let p = Project::new();
-    p.tool("TOOL1", "true");
-    p.tool("TOOL2", "true");
-    let spec = TWO.replace("\"seeds\"", "\"mem_gb\": 1000000, \"seeds\"");
-    let o = p.legume(&["plan", p.spec("S1.json", &spec).to_str().unwrap()]);
-    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
-    let e = stderr(&o);
+    let p = Project::with_tools();
+    let spec = two_with("\"mem_gb\": 1000000");
+    let o = p.plan_spec(&p.spec("S1.json", &spec), &[]);
+    let e = refused(&o);
     assert!(
         e.starts_with(
             "legume benchmark: mem_gb: 1000000 GB is more than this machine's MemTotal, "
@@ -443,12 +462,11 @@ fn reference_atac_pair_truth_refused() {
        "makes": ["sim.ground_truth.tsv.gz"]},
       {"name": "score", "run": ["{legume}", "score", "--truth", "{sim}/sim.ground_truth.tsv.gz"],
        "makes": ["m.score.tsv"]}]}"#;
-    let o = p.legume(&["plan", p.spec("S1.json", spec).to_str().unwrap()]);
-    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    let o = p.plan_spec(&p.spec("S1.json", spec), &[]);
+    let e = refused(&o);
     assert!(
-        stderr(&o).contains("stages[1].run[3]: reads the pair truth of stage sim"),
-        "{}",
-        stderr(&o)
+        e.contains("stages[1].run[3]: reads the pair truth of stage sim"),
+        "{e}"
     );
     assert!(!p.root().join("results").exists());
 }
@@ -457,17 +475,12 @@ fn reference_atac_pair_truth_refused() {
 // snapshot or asked its version: nothing written.
 #[test]
 fn an_empty_grid_is_refused_with_nothing_written() {
-    let p = Project::new();
-    p.tool("TOOL1", "true");
-    p.tool("TOOL2", "true");
-    let spec = TWO.replace(
-        "\"seeds\"",
-        "\"exclude\": [{\"A\": \"1\"}, {\"A\": \"2\"}], \"seeds\"",
-    );
-    let o = p.legume(&["plan", p.spec("S1.json", &spec).to_str().unwrap()]);
-    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    let p = Project::with_tools();
+    let spec = two_with("\"exclude\": [{\"A\": \"1\"}, {\"A\": \"2\"}]");
+    let o = p.plan_spec(&p.spec("S1.json", &spec), &[]);
+    let e = refused(&o);
     assert_eq!(
-        stderr(&o),
+        e,
         "legume benchmark: exclude: drops every point of the grid\n"
     );
     assert!(!p.root().join("results").exists());
@@ -477,20 +490,18 @@ fn an_empty_grid_is_refused_with_nothing_written() {
 // refused before any tool is snapshot.
 #[test]
 fn a_spec_file_of_other_bytes_is_refused_before_the_tools() {
-    let p = Project::new();
-    p.tool("TOOL1", "true");
-    p.tool("TOOL2", "true");
+    let p = Project::with_tools();
     let spec = p.spec("S1.json", TWO);
-    ok(&p.legume(&["plan", spec.to_str().unwrap()]));
+    ok(&p.plan_spec(&spec, &[]));
     let key = p.plan("N1")["spec_key"].as_str().unwrap().to_string();
     let bench = p.bench("N1");
     std::fs::write(bench.join(format!("specs/{key}.json")), "{}\n").unwrap();
     std::fs::remove_dir_all(bench.join("tools")).unwrap();
     let other = "is there with other bytes than this spec's canonical JSON; a spec under \
                  specs/ is not edited in place\n";
-    let o = p.legume(&["plan", spec.to_str().unwrap()]);
-    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
-    assert!(stderr(&o).ends_with(other), "{}", stderr(&o));
+    let o = p.plan_spec(&spec, &[]);
+    let e = refused(&o);
+    assert!(e.ends_with(other), "{e}");
     assert!(!bench.join("tools").exists());
 
     // The same spec laid out another way in its place keeps its key, so
@@ -498,9 +509,9 @@ fn a_spec_file_of_other_bytes_is_refused_before_the_tools() {
     let file = bench.join(format!("specs/{key}.json"));
     let same: Value = serde_json::from_str(TWO).unwrap();
     std::fs::write(&file, serde_json::to_string_pretty(&same).unwrap()).unwrap();
-    let o = p.legume(&["plan", file.to_str().unwrap()]);
-    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
-    assert!(stderr(&o).ends_with(other), "{}", stderr(&o));
+    let o = p.plan_spec(&file, &[]);
+    let e = refused(&o);
+    assert!(e.ends_with(other), "{e}");
     assert!(!bench.join("tools").exists());
 }
 
@@ -508,10 +519,10 @@ fn a_spec_file_of_other_bytes_is_refused_before_the_tools() {
 #[test]
 fn unresolved_tools_are_listed() {
     let p = Project::new();
-    let o = p.legume(&["plan", p.spec("S1.json", TWO).to_str().unwrap()]);
-    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    let o = p.plan_spec(&p.spec("S1.json", TWO), &[]);
+    let e = refused(&o);
     assert_eq!(
-        stderr(&o),
+        e,
         "legume benchmark: not found on PATH: TOOL1 (stages[0]), TOOL2 (stages[1])\n"
     );
     assert!(!p.root().join("results").exists());
@@ -554,14 +565,11 @@ fn the_command_line_exits_by_what_went_wrong() {
 
     p.tool("TOOL1", "true");
     p.tool("TOOL2", "true");
-    let spec = TWO.replace(
-        "\"seeds\"",
-        "\"inputs\": {\"RUN1\": {\"path\": \"RUN1\", \"dir\": true}}, \"seeds\"",
-    );
-    let o = p.legume(&["plan", p.spec("S1.json", &spec).to_str().unwrap()]);
-    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
+    let spec = two_with("\"inputs\": {\"RUN1\": {\"path\": \"RUN1\", \"dir\": true}}");
+    let o = p.plan_spec(&p.spec("S1.json", &spec), &[]);
+    let e = refused(&o);
     assert_eq!(
-        stderr(&o),
+        e,
         format!(
             "legume benchmark: inputs.RUN1.path: no folder at {}\n",
             p.root().join("RUN1").display()
@@ -569,36 +577,27 @@ fn the_command_line_exits_by_what_went_wrong() {
     );
     // A file is no folder.
     std::fs::write(p.root().join("RUN1"), "").unwrap();
-    let o = p.legume(&["plan", p.root().join("S1.json").to_str().unwrap()]);
-    assert_eq!(o.status.code(), Some(3), "{}", stderr(&o));
-    assert!(
-        stderr(&o).contains("inputs.RUN1.path: no folder at "),
-        "{}",
-        stderr(&o)
-    );
-    let o = p.legume(&["plan", p.spec("S2.json", "{\"name\": 1}").to_str().unwrap()]);
-    assert_eq!(o.status.code(), Some(3));
-    assert_eq!(
-        stderr(&o),
-        "legume benchmark: name: is a number, not a string\n"
-    );
+    let o = p.plan_spec(&p.root().join("S1.json"), &[]);
+    let e = refused(&o);
+    assert!(e.contains("inputs.RUN1.path: no folder at "), "{e}");
+    let o = p.plan_spec(&p.spec("S2.json", "{\"name\": 1}"), &[]);
+    let e = refused(&o);
+    assert_eq!(e, "legume benchmark: name: is a number, not a string\n");
 }
 
 // A machine that changed since the first plan is listed; machine.json
 // stays the first one's.
 #[test]
 fn a_changed_machine_is_said_and_the_first_kept() {
-    let p = Project::new();
-    p.tool("TOOL1", "true");
-    p.tool("TOOL2", "true");
+    let p = Project::with_tools();
     let spec = p.spec("S1.json", TWO);
-    ok(&p.legume(&["plan", spec.to_str().unwrap()]));
+    ok(&p.plan_spec(&spec, &[]));
     let file = p.bench("N1").join("machine.json");
     let mut m: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
     m["legume"] = "0.0.1".into();
     let first = serde_json::to_string(&m).unwrap();
     std::fs::write(&file, &first).unwrap();
-    let o = p.legume(&["plan", spec.to_str().unwrap()]);
+    let o = p.plan_spec(&spec, &[]);
     ok(&o);
     let line = format!("  legume: 0.0.1 -> {}\n", env!("CARGO_PKG_VERSION"));
     assert!(stdout(&o).contains(&line), "{}", stdout(&o));
@@ -611,29 +610,24 @@ fn a_changed_machine_is_said_and_the_first_kept() {
 // first.
 #[test]
 fn a_folder_input_holding_the_benchmark_is_refused() {
-    let p = Project::new();
-    p.tool("TOOL1", "true");
-    p.tool("TOOL2", "true");
+    let p = Project::with_tools();
     std::fs::create_dir_all(p.bench("N1").join("cells")).unwrap();
     for path in [".", "bin/..", "results/benchmarks/N1/cells"] {
-        let spec = TWO.replace(
-            "\"seeds\"",
-            &format!("\"inputs\": {{\"R\": {{\"path\": \"{path}\", \"dir\": true}}}}, \"seeds\""),
-        );
-        let o = p.legume(&["plan", p.spec("S1.json", &spec).to_str().unwrap()]);
-        assert_eq!(o.status.code(), Some(3), "{path}: {}", stderr(&o));
+        let spec = two_with(&format!(
+            "\"inputs\": {{\"R\": {{\"path\": \"{path}\", \"dir\": true}}}}"
+        ));
+        let o = p.plan_spec(&p.spec("S1.json", &spec), &[]);
+        let e = refused(&o);
         assert!(
-            stderr(&o).starts_with("legume benchmark: inputs.R.path: "),
-            "{path}: {}",
-            stderr(&o)
+            e.starts_with("legume benchmark: inputs.R.path: "),
+            "{path}: {e}"
         );
         assert!(
-            stderr(&o).ends_with(
+            e.ends_with(
                 " overlaps the benchmark's folder, whose files change with every plan and \
                  run; name a folder apart from it\n"
             ),
-            "{path}: {}",
-            stderr(&o)
+            "{path}: {e}"
         );
         assert_eq!(
             std::fs::read_dir(p.bench("N1")).unwrap().count(),
@@ -653,24 +647,17 @@ fn an_input_is_matched_once_resolved() {
         ("link/r.tsv", "d/r.tsv"),
         ("d/r.tsv", "link/r.tsv"),
     ] {
-        let p = Project::new();
-        p.tool("TOOL1", "true");
-        p.tool("TOOL2", "true");
+        let p = Project::with_tools();
         let r = p.root().join("d/r.tsv");
         std::fs::create_dir_all(r.parent().unwrap()).unwrap();
         std::fs::write(&r, "GENE1\n").unwrap();
         std::os::unix::fs::symlink(p.root().join("d"), p.root().join("link")).unwrap();
-        let spec = TWO
-            .replace(
-                "\"seeds\"",
-                &format!("\"inputs\": {{\"R\": {{\"path\": \"{path}\"}}}}, \"seeds\""),
-            )
-            .replace(
-                "\"{A}\"",
-                &format!("\"{{A}}\", \"{}\"", p.root().join(named).display()),
-            );
+        let spec = two_with(&format!("\"inputs\": {{\"R\": {{\"path\": \"{path}\"}}}}")).replace(
+            "\"{A}\"",
+            &format!("\"{{A}}\", \"{}\"", p.root().join(named).display()),
+        );
         let spec = p.spec("S1.json", &spec);
-        let o = p.legume(&["plan", spec.to_str().unwrap()]);
+        let o = p.plan_spec(&spec, &[]);
         ok(&o);
         assert!(
             !stderr(&o).contains("is a file outside the benchmark"),
@@ -679,7 +666,7 @@ fn an_input_is_matched_once_resolved() {
         );
         let before = keys(&p.plan("N1"));
         std::fs::write(&r, "GENE2\n").unwrap();
-        ok(&p.legume(&["plan", spec.to_str().unwrap()]));
+        ok(&p.plan_spec(&spec, &[]));
         assert_ne!(before[0], keys(&p.plan("N1"))[0], "{path}");
     }
 }
