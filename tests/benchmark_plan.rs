@@ -166,7 +166,8 @@ fn the_lra_one_spec_plans_its_cells_tools_and_keys() {
         .iter()
         .map(|a| a.as_str().unwrap())
         .collect();
-    let run1 = p.root().join("RUN1/manifest.json");
+    // Inputs are resolved through links (on macOS the temp folder is one).
+    let run1 = std::fs::canonicalize(p.root().join("RUN1/manifest.json")).unwrap();
     let rep_seed = sim["rep_seed"].as_u64().unwrap().to_string();
     let sim_out = format!("{}/sim", out.display());
     assert_eq!(
