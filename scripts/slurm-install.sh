@@ -124,7 +124,9 @@ run="${LEGUME_INSTALL_RUN:?}"
 say() { echo "[$(date '+%F %T')] $*"; }
 status() { echo "$*" > "$run/status.part" && mv "$run/status.part" "$run/status"; }
 status running
-say "node $(hostname -s), $(ldd --version 2>&1 | head -1)"
+node=$(hostname -s)
+glibc=$(ldd --version 2>&1 | head -1)
+say "node $node, $glibc"
 
 # Rust: the cargo on PATH, else ~/.cargo's or the prefix's, else rustup
 # into the prefix.
@@ -163,8 +165,8 @@ for spec in "${crates[@]}"; do
 done
 
 {
-    echo "node: $(hostname -s)"
-    echo "glibc: $(ldd --version 2>&1 | head -1)"
+    echo "node: $node"
+    echo "glibc: $glibc"
     for b in "$prefix"/bin/*; do
         [ -x "$b" ] && echo "$(basename "$b"): $("$b" --version 2>&1 | head -1)"
     done

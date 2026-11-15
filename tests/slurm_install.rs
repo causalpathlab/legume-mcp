@@ -33,14 +33,15 @@ impl Bin {
     }
 }
 
+/// The script run by bash with `bin`'s stand-ins first on PATH.
+fn script_cmd(bin: &Bin) -> Command {
+    let mut c = Command::new("bash");
+    c.arg(script()).env("PATH", bin.path());
+    c
+}
+
 fn run(bin: &Bin, args: &[&str]) -> Output {
-    Command::new("bash")
-        .arg(script())
-        .args(args)
-        .env("PATH", bin.path())
-        .env_remove("SLURM_JOB_ID")
-        .output()
-        .unwrap()
+    script_cmd(bin).args(args).output().unwrap()
 }
 
 fn text(o: &Output) -> String {
@@ -127,11 +128,9 @@ fn a_prefix_is_required_and_made_absolute() {
     assert!(text(&o).contains("--prefix"), "{}", text(&o));
 
     let cwd = tempfile::tempdir().unwrap();
-    let o = Command::new("bash")
-        .arg(script())
+    let o = script_cmd(&bin)
         .args(["--dry-run", "--prefix", "tools"])
         .current_dir(cwd.path())
-        .env("PATH", bin.path())
         .output()
         .unwrap();
     let t = text(&o);
@@ -162,10 +161,8 @@ fn submit_writes_the_job_and_its_status() {
     bin.tool("sbatch", r#"echo "$@" > "$FAKE_SBATCH_ARGS"; echo 4242"#);
     let prefix = tempfile::tempdir().unwrap();
     let args_file = prefix.path().join("sbatch-args");
-    let o = Command::new("bash")
-        .arg(script())
+    let o = script_cmd(&bin)
         .args(["--prefix", prefix.path().to_str().unwrap()])
-        .env("PATH", bin.path())
         .env("FAKE_SBATCH_ARGS", &args_file)
         .output()
         .unwrap();
@@ -197,12 +194,7 @@ fn job_run(bin: &Bin, prefix: &Path, scratch: &Path, extra: &[&str]) -> (Output,
         scratch.to_str().unwrap().into(),
     ];
     args.extend(extra.iter().map(|s| s.to_string()));
-    let o = Command::new("bash")
-        .arg(script())
-        .args(&args)
-        .env("PATH", bin.path())
-        .output()
-        .unwrap();
+    let o = script_cmd(bin).args(&args).output().unwrap();
     assert!(o.status.success(), "{}", text(&o));
     let job = String::from_utf8(o.stdout).unwrap();
     let start = job.find("#!/bin/bash").expect("a job script");
@@ -226,9 +218,10 @@ fn job_run(bin: &Bin, prefix: &Path, scratch: &Path, extra: &[&str]) -> (Output,
     (o, run)
 }
 
-fn fake_cargo(bin: &Bin) {
-    // `cargo install ... --root R ... NAME`: R/bin/<bin of NAME>, which
-    // prints a version; the arguments are kept for the test.
+/// Stand-ins for the Rust toolchain: `cargo install ... --root R ...
+/// NAME` writes R/bin/<bin of NAME>, which prints a version; `rustc`
+/// prints one; `rustup` keeps its arguments in $HOME/rustup-calls.
+fn fake_toolchain(bin: &Bin) {
     bin.tool(
         "cargo",
         r#"
@@ -244,13 +237,13 @@ chmod +x "$root/bin/$b"
 "#,
     );
     bin.tool("rustc", r#"echo "rustc 1.95.0""#);
+    bin.tool("rustup", r#"echo "$@" >> "$HOME/rustup-calls""#);
 }
 
 #[test]
 fn the_job_installs_each_crate_and_says_done() {
     let bin = Bin::new();
-    fake_cargo(&bin);
-    bin.tool("rustup", r#"echo "$@" >> "$HOME/rustup-calls""#);
+    fake_toolchain(&bin);
     let prefix = tempfile::tempdir().unwrap();
     let scratch = tempfile::tempdir().unwrap();
     let (o, run) = job_run(
@@ -291,8 +284,7 @@ fn the_job_installs_each_crate_and_says_done() {
 #[test]
 fn no_rust_update_leaves_the_toolchain() {
     let bin = Bin::new();
-    fake_cargo(&bin);
-    bin.tool("rustup", r#"echo "$@" >> "$HOME/rustup-calls""#);
+    fake_toolchain(&bin);
     let prefix = tempfile::tempdir().unwrap();
     let scratch = tempfile::tempdir().unwrap();
     let (o, _) = job_run(&bin, prefix.path(), scratch.path(), &["--no-rust-update"]);
@@ -303,7 +295,7 @@ fn no_rust_update_leaves_the_toolchain() {
 #[test]
 fn a_failed_crate_fails_the_job_and_the_rest_install() {
     let bin = Bin::new();
-    fake_cargo(&bin);
+    fake_toolchain(&bin);
     let prefix = tempfile::tempdir().unwrap();
     let scratch = tempfile::tempdir().unwrap();
     let (o, run) = job_run(
