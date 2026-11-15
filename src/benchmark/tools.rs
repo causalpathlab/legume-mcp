@@ -8,7 +8,7 @@
 //!
 //! A later plan keeps a tool's snapshot when the installed one has
 //! changed, and says so; `--retool` takes the installed one, rekeying its
-//! cells. `snapshot: false` runs the installed binary itself.
+//! tasks. `snapshot: false` runs the installed binary itself.
 
 use super::key;
 use super::plan::{base, LEGUME};
@@ -255,9 +255,9 @@ pub fn settle(dir: &Path, found: &[Found], retool: bool) -> Result<(Vec<Resolved
             let how = if kept.is_some() {
                 "planned with its snapshot, --retool plans with the one installed"
             } else if f.snapshot {
-                "planned with the one installed, which rekeys its cells"
+                "planned with the one installed, which rekeys its tasks"
             } else {
-                "snapshot false, so its cells are rekeyed"
+                "snapshot false, so its tasks are rekeyed"
             };
             drift.push(format!(
                 "{}: changed since the last plan ({from} -> {to}); {how}",
@@ -386,7 +386,7 @@ mod tests {
         closer.join().unwrap();
     }
 
-    // rebuild_mid_sweep_keeps_snapshot (the tool side): a snapshot is
+    // rebuild_mid_benchmark_keeps_snapshot (the tool side): a snapshot is
     // keyed by the bytes; a rebuild leaves the snapshot's bytes alone and
     // the next plan keeps it, saying so, unless retool.
     #[test]
@@ -443,7 +443,7 @@ mod tests {
         script(&bin, "TOOL1", "echo v2");
         let k2 = key::file_key(&t).unwrap();
         let fresh = bench.join("tools").join(&k2).join("TOOL1");
-        let rekeyed = "planned with the one installed, which rekeys its cells";
+        let rekeyed = "planned with the one installed, which rekeys its tasks";
 
         std::fs::remove_dir_all(bench.join("tools")).unwrap();
         std::fs::write(bench.join("versions.tsv"), versions_tsv(&first)).unwrap();

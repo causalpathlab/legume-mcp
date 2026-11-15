@@ -441,7 +441,7 @@ fn run(spec: &Spec, out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
     let same = spec.universe == Universe::Same;
     if same && spec.scores != spec.truth && !crate::same_file(&spec.scores, &spec.truth) {
         return Err(usage(
-            "--universe same needs --truth and --scores to be one file; give the universe as a \
+            "--universe same needs --truth and --table to be one file; give the universe as a \
              file otherwise",
         ));
     }

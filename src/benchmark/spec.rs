@@ -1,17 +1,19 @@
 //! A benchmark's spec, parsed from JSON and checked field by field: the
 //! grid (axes, tuple axes, exclude), the seeds, the declared inputs, the
-//! stages and their lanes (methods), and what each cell needs (threads,
-//! memory, GPUs, timeout, tool). A refusal names the field it is about,
-//! as a path such as `stages[2].methods.M1.threads`.
+//! stages and their methods, what each task needs (threads, memory, GPUs,
+//! timeout, tool, snapshot, max_running), the machine budget (cores,
+//! mem_gb, gpus, gpu_slots, grace_secs, max_hours, disk), what it keeps,
+//! and what gather compares and plots. A refusal names the field it is
+//! about, as a path such as `stages[2].methods.M1.threads`.
 //!
-//! What the placeholders in `run` may name, and the lane rules between
+//! What the placeholders in `run` may name, and the method rules between
 //! stages, are checked when the spec is planned ([`super::plan::check`]).
 
 use crate::command::refuse;
 use anyhow::Result;
 use serde_json::{Map, Value};
 
-/// The child environment's thread variables, each set to the cell's
+/// The child environment's thread variables, each set to the task's
 /// threads.
 pub const THREAD_VARS: [&str; 6] = [
     "RAYON_NUM_THREADS",
@@ -22,10 +24,10 @@ pub const THREAD_VARS: [&str; 6] = [
     "POLARS_MAX_THREADS",
 ];
 
-/// A cell's timeout when none is given: 4 h.
+/// A task's timeout when none is given: 4 h.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 4 * 3600;
 
-/// The placeholders every cell has; no axis, binding or stage may take
+/// The placeholders every task has; no axis, binding or stage may take
 /// these names.
 pub const RESERVED: [&str; 10] = [
     "rep", "rep_seed", "seed", "method", "threads", "gpu", "out", "legume", "inputs", "glob",
@@ -96,21 +98,22 @@ pub struct Input {
     pub dir: bool,
 }
 
-/// A stage: one lane, or one per method.
+/// A stage: its methods, or one method named after the stage when it
+/// has none.
 #[derive(Clone, Debug)]
 pub struct Stage {
     pub name: String,
-    /// Its lanes are methods: each lane's method is Some.
-    pub methods: bool,
-    pub lanes: Vec<Lane>,
+    /// It lists methods: each method's name is Some.
+    pub has_methods: bool,
+    pub methods: Vec<Method>,
 }
 
-/// What one cell of a stage, or of a method's lane in it, runs and needs,
-/// the stage's values filled in where the lane gives none.
+/// What one task of a stage, or of a method in it, runs and needs, the
+/// stage's values filled in where the method gives none.
 #[derive(Clone, Debug)]
-pub struct Lane {
-    /// The method; `None` in a stage without methods.
-    pub method: Option<String>,
+pub struct Method {
+    /// The method's name; `None` in a stage without methods.
+    pub name: Option<String>,
     /// Where it is in the spec, for refusals.
     pub at: String,
     pub run: Vec<String>,
@@ -125,7 +128,7 @@ pub struct Lane {
     pub max_running: Option<u32>,
 }
 
-impl Lane {
+impl Method {
     /// The word naming its tool: `tool`, else `run[0]`.
     pub fn tool_word(&self) -> &str {
         self.tool.as_deref().unwrap_or(&self.run[0])
@@ -382,7 +385,7 @@ fn duration(s: &str) -> Option<u64> {
     (n.is_none() && !s.is_empty() && secs > 0).then_some(secs)
 }
 
-/// What a stage gives its lanes, and a lane gives itself.
+/// What a stage gives its methods, and a method gives itself.
 #[derive(Clone, Default)]
 struct Needs {
     threads: Option<u32>,
@@ -405,7 +408,7 @@ impl Needs {
                 )
             })?),
         };
-        let threads = o.nonzero_u32("threads", "is 0; a cell needs a thread")?;
+        let threads = o.nonzero_u32("threads", "is 0; a task needs a thread")?;
         let max_running = o.nonzero_u32("max_running", "is 0, so nothing would run")?;
         let tool = o.string("tool")?;
         if tool
@@ -439,8 +442,8 @@ impl Needs {
     }
 }
 
-/// A lane's `run` and `makes`, with what it needs.
-fn lane(o: &mut Obj, method: Option<String>, needs: Needs) -> Result<Lane> {
+/// A method's `run` and `makes`, with what it needs.
+fn method(o: &mut Obj, name: Option<String>, needs: Needs) -> Result<Method> {
     let run = o
         .strings("run")?
         .ok_or_else(|| bad(&o.at("run"), "is required: the command, as a list of words"))?;
@@ -455,23 +458,23 @@ fn lane(o: &mut Obj, method: Option<String>, needs: Needs) -> Result<Lane> {
     }
     let makes = o
         .strings("makes")?
-        .ok_or_else(|| bad(&o.at("makes"), "is required: the files the cell makes"))?;
+        .ok_or_else(|| bad(&o.at("makes"), "is required: the files the task makes"))?;
     if makes.is_empty() {
         return Err(bad(
             &o.at("makes"),
-            "is empty; a cell is done when what it makes is there",
+            "is empty; a task is done when what it makes is there",
         ));
     }
     for (i, m) in makes.iter().enumerate() {
         if m.contains('{') || !is_plain_relative(m) {
             return Err(bad(
                 &o.at(&format!("makes[{i}]")),
-                format!("{m:?} is not a plain path inside the cell's folder"),
+                format!("{m:?} is not a plain path inside the task's folder"),
             ));
         }
     }
-    Ok(Lane {
-        method,
+    Ok(Method {
+        name,
         at: o.at.clone(),
         run,
         makes,
@@ -499,14 +502,14 @@ fn stage(at: String, v: &Value) -> Result<Stage> {
     if RESERVED.contains(&name.as_str()) {
         return Err(bad(
             &o.at("name"),
-            format!("{name:?} is a placeholder every cell has"),
+            format!("{name:?} is a placeholder every task has"),
         ));
     }
     let needs = Needs::take(&mut o)?;
-    let methods = o.get("methods");
+    let listed = o.get("methods");
     let has_run = o.map.contains_key("run") || o.map.contains_key("makes");
-    let lanes = match methods {
-        None => vec![lane(&mut o, None, needs)?],
+    let methods = match listed {
+        None => vec![method(&mut o, None, needs)?],
         Some(_) if has_run => {
             return Err(bad(
                 &o.at,
@@ -518,28 +521,28 @@ fn stage(at: String, v: &Value) -> Result<Stage> {
             if mo.map.is_empty() {
                 return Err(bad(&mo.at, "names no method"));
             }
-            let mut lanes = Vec::new();
-            for (method, lv) in mo.map {
-                let mut lo = Obj::new(mo.at(method), lv)?;
-                if !is_method(method) {
+            let mut methods = Vec::new();
+            for (id, mv) in mo.map {
+                let mut one = Obj::new(mo.at(id), mv)?;
+                if !is_method(id) {
                     return Err(bad(
-                        &lo.at,
-                        format!("{method:?} is no method name (letters, digits, _ and -)"),
+                        &one.at,
+                        format!("{id:?} is no method name (letters, digits, _ and -)"),
                     ));
                 }
-                let own = Needs::take(&mut lo)?;
-                let l = lane(&mut lo, Some(method.clone()), own.over(&needs))?;
-                lo.done()?;
-                lanes.push(l);
+                let own = Needs::take(&mut one)?;
+                let made = method(&mut one, Some(id.clone()), own.over(&needs))?;
+                one.done()?;
+                methods.push(made);
             }
-            lanes
+            methods
         }
     };
     o.done()?;
     Ok(Stage {
         name,
-        methods: methods.is_some(),
-        lanes,
+        has_methods: listed.is_some(),
+        methods,
     })
 }
 
@@ -691,7 +694,7 @@ fn gpu_ids(o: &mut Obj) -> Result<Vec<u32>> {
     Ok(ids.unwrap_or_default())
 }
 
-/// `disk`: the free space a cell needs before it starts, if given.
+/// `disk`: the free space a task needs before it starts, if given.
 fn disk(v: Option<&Value>) -> Result<Option<f64>> {
     let Some(v) = v else {
         return Ok(None);
@@ -840,12 +843,12 @@ fn from_value(v: &Value) -> Result<Spec> {
         None => return Err(bad("stages", "is required")),
     };
     check_stage_names(&stages, &names)?;
-    let lanes: Vec<&str> = stages
+    let methods: Vec<&str> = stages
         .iter()
-        .flat_map(|s| s.lanes.iter().filter_map(|l| l.method.as_deref()))
+        .flat_map(|s| s.methods.iter().filter_map(|m| m.name.as_deref()))
         .collect();
     let compare = o
-        .list("compare", "pairs", |at, p| compared(at, p, &lanes))?
+        .list("compare", "pairs", |at, p| compared(at, p, &methods))?
         .unwrap_or_default();
     let plot = plot(o.get("plot"), &axes)?;
     o.done()?;
@@ -893,8 +896,8 @@ fn excluded(at: &str, v: &Value, axes: &[Axis]) -> Result<Vec<(String, String)>>
         .collect()
 }
 
-/// A `compare` pair: two `method/score` names, each method a lane.
-fn compared(at: &str, v: &Value, lanes: &[&str]) -> Result<[String; 2]> {
+/// A `compare` pair: two `method/score` names, each a method of a stage.
+fn compared(at: &str, v: &Value, methods: &[&str]) -> Result<[String; 2]> {
     let pair = match v {
         Value::Array(p) if p.len() == 2 => [&p[0], &p[1]],
         _ => return Err(bad(at, "is not a pair [\"M1/score\", \"M0/score\"]")),
@@ -906,8 +909,8 @@ fn compared(at: &str, v: &Value, lanes: &[&str]) -> Result<[String; 2]> {
             .as_str()
             .ok_or_else(|| bad(&at, format!("is {}, not a string", kind(x))))?;
         match s.split_once('/') {
-            Some((m, sc)) if lanes.contains(&m) && !sc.is_empty() => out[i] = s.to_string(),
-            Some((m, _)) if !lanes.contains(&m) => {
+            Some((m, sc)) if methods.contains(&m) && !sc.is_empty() => out[i] = s.to_string(),
+            Some((m, _)) if !methods.contains(&m) => {
                 return Err(bad(&at, format!("{m:?} is no method of any stage")))
             }
             _ => return Err(bad(&at, format!("{s:?} is not method/score"))),
@@ -947,7 +950,7 @@ mod tests {
         let (s, _) = parse(&format!("{ONE}}}")).unwrap();
         assert_eq!(s.name, "N1");
         assert!(matches!(s.seeds, Seeds::Derived { n: 2, base: 0 }));
-        let l = &s.stages[0].lanes[0];
+        let l = &s.stages[0].methods[0];
         assert_eq!(
             (l.threads, l.mem_gb, l.gpus, l.timeout_secs, l.snapshot),
             (1, 0.0, 0, DEFAULT_TIMEOUT_SECS, true)
@@ -983,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn lanes_take_the_stage_values_they_do_not_override() {
+    fn methods_take_the_stage_values_they_do_not_override() {
         let (s, _) = parse(
             r#"{"name": "N1", "seeds": {"list": [7, 3]},
             "stages": [{"name": "fit", "threads": 8, "mem_gb": 12, "timeout": "3h",
@@ -995,9 +998,9 @@ mod tests {
         .unwrap();
         assert!(matches!(&s.seeds, Seeds::List(l) if l == &[7, 3]));
         let st = &s.stages[0];
-        assert!(st.methods);
-        let (m1, m2) = (&st.lanes[0], &st.lanes[1]);
-        assert_eq!(m1.method.as_deref(), Some("M1"));
+        assert!(st.has_methods);
+        let (m1, m2) = (&st.methods[0], &st.methods[1]);
+        assert_eq!(m1.name.as_deref(), Some("M1"));
         assert_eq!(
             (m1.threads, m1.mem_gb, m1.gpus, m1.timeout_secs),
             (8, 12.0, 0, 10_800)
@@ -1077,16 +1080,16 @@ mod tests {
         let stages: &[(&str, &str)] = &[
             (r#"{"name": "a-b", "run": ["T"], "makes": ["m"]}"#,
              "stages[0].name: \"a-b\" is no stage name (a letter, then letters, digits and _)"),
-            (r#"{"name": "s", "run": ["T"]}"#, "stages[0].makes: is required: the files the cell makes"),
+            (r#"{"name": "s", "run": ["T"]}"#, "stages[0].makes: is required: the files the task makes"),
             (r#"{"name": "s", "run": [], "makes": ["m"]}"#, "stages[0].run: names no command"),
             (r#"{"name": "s", "run": ["{inputs.X}"], "makes": ["m"]}"#,
              "stages[0].run[0]: \"{inputs.X}\": a command is a tool's name or {legume}"),
             (r#"{"name": "s", "run": ["T"], "makes": ["../m"]}"#,
-             "stages[0].makes[0]: \"../m\" is not a plain path inside the cell's folder"),
+             "stages[0].makes[0]: \"../m\" is not a plain path inside the task's folder"),
             (r#"{"name": "s", "timeout": "30 min", "run": ["T"], "makes": ["m"]}"#,
              "stages[0].timeout: \"30 min\" is no duration (such as 45s, 30m, 3h or 1h30m)"),
             (r#"{"name": "s", "threads": 0, "run": ["T"], "makes": ["m"]}"#,
-             "stages[0].threads: is 0; a cell needs a thread"),
+             "stages[0].threads: is 0; a task needs a thread"),
             (r#"{"name": "s", "run": ["T"], "makes": ["m"], "methods": {"M1": {}}}"#,
              "stages[0]: has both run and methods; each method gives its own run and makes"),
             (r#"{"name": "s", "methods": {"M1": {"run": ["T"], "makes": ["m"], "thread": 2}}}"#,
@@ -1095,7 +1098,7 @@ mod tests {
             (r#"{"name": "s", "methods": {"M.1": {"run": ["T"], "makes": ["m"]}}}"#,
              "stages[0].methods.M.1: \"M.1\" is no method name (letters, digits, _ and -)"),
             (r#"{"name": "out", "run": ["T"], "makes": ["m"]}"#,
-             "stages[0].name: \"out\" is a placeholder every cell has"),
+             "stages[0].name: \"out\" is a placeholder every task has"),
         ];
         for (st, want) in stages {
             assert_eq!(refused(&spec("N1", r#"{"n": 1}"#, st)), *want, "{st}");

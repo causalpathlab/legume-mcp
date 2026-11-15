@@ -197,9 +197,9 @@ impl FewLinks {
     fn args<'a>(&'a self, more: &[&'a str]) -> Vec<&'a str> {
         let mut a = vec![
             "score",
-            "--scores",
+            "--table",
             s(&self.scores),
-            "--key",
+            "--table-key",
             "gene,peak",
             "--score",
             "M1=score",
@@ -250,6 +250,40 @@ fn few_links_ap_is_0_208_through_the_cli() {
         assert_eq!(r.get("n_inf"), "0");
         near(r.num("tied_share"), 0.0);
     }
+}
+
+// --table and --table-key name the method's output and its key columns.
+#[test]
+fn the_table_and_its_key_are_named_by_table_and_table_key() {
+    let c = few_links();
+    let a = c.args(&c.universe_args());
+    assert!(a.contains(&"--table") && a.contains(&"--table-key"));
+    let o = legume(a);
+    assert!(o.status.success(), "{}", stderr(&o));
+    near(row(&rows(&c.out), "M1", "auprc").num("value"), 0.208);
+}
+
+// --scores and --key, the older names of --table and --table-key, still
+// work, and score the same.
+#[test]
+fn the_older_scores_and_key_flags_still_work() {
+    let (new, old) = (few_links(), few_links());
+    assert!(legume(new.args(&new.universe_args())).status.success());
+    let renamed: Vec<&str> = old
+        .args(&old.universe_args())
+        .into_iter()
+        .map(|a| match a {
+            "--table" => "--scores",
+            "--table-key" => "--key",
+            a => a,
+        })
+        .collect();
+    let o = legume(renamed);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(
+        std::fs::read(&old.out).unwrap(),
+        std::fs::read(&new.out).unwrap()
+    );
 }
 
 #[test]
@@ -341,7 +375,7 @@ const OUT: &str = "out.score.tsv";
 /// `key`, its truth the column `planted` above 0.5, scoring each of
 /// `scores` (`NAME=COLUMN`) into `out`.
 fn same_args<'a>(one: &'a Path, key: &'a str, scores: &[&'a str], out: &'a Path) -> Vec<&'a str> {
-    let mut a = vec!["score", "--scores", s(one), "--key", key];
+    let mut a = vec!["score", "--table", s(one), "--table-key", key];
     for sc in scores {
         a.extend(["--score", sc]);
     }
@@ -372,7 +406,7 @@ fn keyed_args(dir: &Path, score: &[&str]) -> Vec<String> {
 /// [`keyed_args`] with the scores read from the file `scores` in `dir`.
 fn keyed_args_of(dir: &Path, scores: &str, score: &[&str]) -> Vec<String> {
     let at = |f: &str| dir.join(f).to_str().unwrap().to_string();
-    let mut a: Vec<String> = ["score", "--scores", &at(scores), "--key", "key"]
+    let mut a: Vec<String> = ["score", "--table", &at(scores), "--table-key", "key"]
         .map(String::from)
         .to_vec();
     for sc in score {
@@ -869,9 +903,9 @@ fn a_chickpea_links_parquet_is_scored_over_the_cis_universe() {
     );
     let o = legume([
         "score",
-        "--scores",
+        "--table",
         s(&links),
-        "--key",
+        "--table-key",
         "gene,peak",
         "--score",
         "M1=score",
@@ -954,8 +988,8 @@ fn score_help_names_every_flag() {
     assert!(o.status.success());
     let help = String::from_utf8_lossy(&o.stdout);
     for flag in [
-        "--scores",
-        "--key",
+        "--table",
+        "--table-key",
         "--score",
         "--truth",
         "--truth-key",

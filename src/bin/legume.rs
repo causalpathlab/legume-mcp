@@ -17,7 +17,7 @@ ask: where are we? AGENTS.md tells it how to work with you. The
 agent reaches the rest through the `legume` server, which it starts itself
 (`legume mcp`).
 
-legume benchmark plan SPEC a benchmark's cells, tools and keys, planned from
+legume benchmark plan SPEC a benchmark's tasks, tools and keys, planned from
                            a spec (legume benchmark --help)
 legume score [...]         a method's scores against a truth over a universe:
                            AUROC and average precision (legume score --help)

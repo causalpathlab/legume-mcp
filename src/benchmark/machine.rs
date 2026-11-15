@@ -202,8 +202,8 @@ pub fn drift(old: &Machine, new: &Machine) -> Vec<String> {
 }
 
 /// What the spec books on `machine`: its cores and memory (GB), with what
-/// to warn of. Refused: memory above MemTotal, a cell's memory above the
-/// benchmark's, a cell's threads above its cores, a cell's GPUs above
+/// to warn of. Refused: memory above MemTotal, a task's memory above the
+/// benchmark's, a task's threads above its cores, a task's GPUs above
 /// those listed.
 pub fn fit(spec: &Spec, machine: &Machine) -> Result<(u32, f64, Vec<String>)> {
     let mut warnings = Vec::new();
@@ -238,24 +238,24 @@ pub fn fit(spec: &Spec, machine: &Machine) -> Result<(u32, f64, Vec<String>)> {
             ));
         }
     }
-    for lane in spec.stages.iter().flat_map(|s| &s.lanes) {
-        if lane.threads > cores {
+    for method in spec.stages.iter().flat_map(|s| &s.methods) {
+        if method.threads > cores {
             return Err(refuse(format!(
                 "{}.threads: {} is more than the benchmark's cores, {cores}",
-                lane.at, lane.threads
+                method.at, method.threads
             )));
         }
-        if lane.mem_gb > mem {
+        if method.mem_gb > mem {
             return Err(refuse(format!(
                 "{}.mem_gb: {} GB is more than {whose}",
-                lane.at, lane.mem_gb
+                method.at, method.mem_gb
             )));
         }
-        if lane.gpus as usize > spec.gpus.len() {
+        if method.gpus as usize > spec.gpus.len() {
             return Err(refuse(format!(
                 "{}.gpus: {} GPUs, and the benchmark lists {} (gpus: [ids])",
-                lane.at,
-                lane.gpus,
+                method.at,
+                method.gpus,
                 spec.gpus.len()
             )));
         }
@@ -301,7 +301,7 @@ mod tests {
     }
 
     // mem_over_total_refused (the rule): memory above MemTotal, and a
-    // cell's above the benchmark's, are refused; without mem_gb the
+    // task's above the benchmark's, are refused; without mem_gb the
     // benchmark books MemAvailable.
     #[test]
     fn mem_over_total_refused() {

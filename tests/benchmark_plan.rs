@@ -118,9 +118,9 @@ fn two_with(fields: &str) -> String {
     TWO.replace("\"seeds\"", &format!("{fields}, \"seeds\""))
 }
 
-/// Each cell's id and key.
+/// Each task's id and key.
 fn keys(plan: &Value) -> Vec<(String, String)> {
-    plan["cells"]
+    plan["tasks"]
         .as_array()
         .unwrap()
         .iter()
@@ -140,10 +140,10 @@ const TWO: &str = r#"{"name": "N1", "seeds": {"n": 2, "base": 1},
 
 // The first real benchmark's shape (B1c): pinto lra-simulate --one per
 // point and replicate, then legume score over the same parquet. Every
-// file plan writes is there; 100 cells; each sim argv filled and pointed
-// at its snapshot; each score cell reads its own sim.
+// file plan writes is there; 100 tasks; each sim argv filled and pointed
+// at its snapshot; each score task reads its own sim.
 #[test]
-fn the_lra_one_spec_plans_its_cells_tools_and_keys() {
+fn the_lra_one_spec_plans_its_tasks_tools_and_keys() {
     let p = Project::new();
     p.tool("pinto", "[ \"$1\" = --version ] && echo 'pinto 0.17.0'");
     std::fs::create_dir_all(p.root().join("RUN1")).unwrap();
@@ -157,9 +157,9 @@ fn the_lra_one_spec_plans_its_cells_tools_and_keys() {
     let canonical = std::fs::read(bench.join(format!("specs/{key}.json"))).unwrap();
     assert!(canonical.ends_with(b"}\n"));
     assert!(bench.join("machine.json").is_file());
-    let cells = plan["cells"].as_array().unwrap();
-    assert_eq!(cells.len(), 100);
-    // What the benchmark books comes first, the cells last.
+    let tasks = plan["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 100);
+    // What the benchmark books comes first, the tasks last.
     let text = std::fs::read_to_string(bench.join("plan.json")).unwrap();
     assert!(
         text.starts_with("{\n  \"name\": \"lra-one\",\n  \"spec_key\": "),
@@ -182,7 +182,7 @@ fn the_lra_one_spec_plans_its_cells_tools_and_keys() {
     assert!(legume[3].ends_with("/legume"), "{legume:?}");
     assert!(legume[4].starts_with("legume-mcp "), "{legume:?}");
 
-    let sim = cells
+    let sim = tasks
         .iter()
         .find(|c| {
             c["stage"] == "sim"
@@ -193,7 +193,7 @@ fn the_lra_one_spec_plans_its_cells_tools_and_keys() {
         .unwrap();
     let id = sim["id"].as_str().unwrap();
     assert!(id.ends_with(".r2.sim"), "{id}");
-    let out = bench.join("cells").join(id);
+    let out = bench.join("tasks").join(id);
     let argv: Vec<&str> = sim["argv"]
         .as_array()
         .unwrap()
@@ -232,7 +232,7 @@ fn the_lra_one_spec_plans_its_cells_tools_and_keys() {
     assert_eq!(sim["mem_gb"], 4.0);
     assert_eq!(sim["timeout_secs"], 1800);
     assert_eq!(sim["env"]["RAYON_NUM_THREADS"], "2");
-    let score = cells
+    let score = tasks
         .iter()
         .find(|c| c["stage"] == "score" && c["upstream"][0] == id)
         .unwrap();
@@ -252,7 +252,7 @@ fn the_lra_one_spec_plans_its_cells_tools_and_keys() {
         "{said}"
     );
     assert!(
-        said.contains("cells 100: 10 points x 5 reps; sim 50, score 50\n"),
+        said.contains("tasks 100: 10 points x 5 reps; sim 50, score 50\n"),
         "{said}"
     );
     assert!(said.contains("done 0 of 100 (by key)\n"), "{said}");
@@ -271,7 +271,7 @@ fn the_lra_one_spec_plans_its_cells_tools_and_keys() {
         stdout(&again)
     );
 
-    // The run input's content enters its cells' keys, and their
+    // The run input's content enters its tasks' keys, and their
     // downstream's.
     std::fs::write(p.root().join("RUN1/manifest.json"), "{\"v\": 2}\n").unwrap();
     ok(&p.plan_spec(&spec, &[]));
@@ -302,21 +302,21 @@ fn same_bytes_same_key() {
     assert_eq!(a.len(), c.len());
     for ((id, k), (id2, k2)) in a.iter().zip(&c) {
         assert_eq!(id, id2);
-        assert_ne!(k, k2, "{id}: every cell reads TOOL1's bytes");
+        assert_ne!(k, k2, "{id}: every task reads TOOL1's bytes");
     }
 }
 
-// A cell is done when its folder's done.json has its key: one of a stale
+// A task is done when its folder's done.json has its key: one of a stale
 // key, or unreadable, is not.
 #[test]
-fn done_counts_only_cells_of_their_key() {
+fn done_counts_only_tasks_of_their_key() {
     let p = Project::with_tools();
     let spec = p.spec("S1.json", TWO);
     ok(&p.plan_spec(&spec, &[]));
     let plan = p.plan("N1");
-    let cells = plan["cells"].as_array().unwrap();
-    for (c, done) in cells.iter().zip([
-        format!("{{\"key\": {}}}", cells[0]["key"]),
+    let tasks = plan["tasks"].as_array().unwrap();
+    for (c, done) in tasks.iter().zip([
+        format!("{{\"key\": {}}}", tasks[0]["key"]),
         "{\"key\": \"0\"}".to_string(),
         "{\"key\"".to_string(),
     ]) {
@@ -364,7 +364,7 @@ fn a_spec_written_another_way_is_the_same_spec() {
 }
 
 // no_version_still_keys: a tool with no --version (it exits 2) has NA
-// for its version, and its cells are keyed by its bytes all the same.
+// for its version, and its tasks are keyed by its bytes all the same.
 #[test]
 fn no_version_still_keys() {
     let p = Project::new();
@@ -390,19 +390,19 @@ fn no_version_still_keys() {
     assert_eq!(plan["tools"][0]["tool"], "TOOL1");
 }
 
-// rebuild_mid_sweep_keeps_snapshot: a tool rebuilt after the plan leaves
+// rebuild_mid_benchmark_keeps_snapshot: a tool rebuilt after the plan leaves
 // its snapshot's bytes alone; planned again, the snapshot runs and the
 // keys stay, and the change is said; --retool plans the rebuilt one,
 // with new keys, and the old snapshot is kept.
 #[test]
-fn rebuild_mid_sweep_keeps_snapshot() {
+fn rebuild_mid_benchmark_keeps_snapshot() {
     let p = Project::new();
     p.tool("TOOL1", "echo v1");
     p.tool("TOOL2", "true");
     let spec = p.spec("S1.json", TWO);
     ok(&p.plan_spec(&spec, &[]));
     let first = p.plan("N1");
-    let exec = first["cells"][0]["argv"][0].as_str().unwrap().to_string();
+    let exec = first["tasks"][0]["argv"][0].as_str().unwrap().to_string();
     assert!(
         exec.starts_with(p.bench("N1").join("tools").to_str().unwrap()),
         "{exec}"
@@ -413,7 +413,7 @@ fn rebuild_mid_sweep_keeps_snapshot() {
     ok(&o);
     let kept = p.plan("N1");
     assert_eq!(keys(&kept), keys(&first));
-    assert_eq!(kept["cells"][0]["argv"][0], exec.as_str());
+    assert_eq!(kept["tasks"][0]["argv"][0], exec.as_str());
     let ran = Command::new(&exec).output().unwrap();
     assert_eq!(stdout(&ran), "v1\n");
     let said = stdout(&o);
@@ -428,7 +428,7 @@ fn rebuild_mid_sweep_keeps_snapshot() {
 
     ok(&p.plan_spec(&spec, &["--retool"]));
     let retooled = p.plan("N1");
-    assert_ne!(retooled["cells"][0]["argv"][0], exec.as_str());
+    assert_ne!(retooled["tasks"][0]["argv"][0], exec.as_str());
     for ((id, k), (_, k2)) in keys(&first).iter().zip(&keys(&retooled)) {
         assert_ne!(k, k2, "{id}");
     }
@@ -605,14 +605,14 @@ fn a_changed_machine_is_said_and_the_first_kept() {
 }
 
 // A folder input that holds the benchmark's folder, or lies in it, would
-// list the plan's own files and every cell's output, and so rekey every
-// cell on every plan: refused, exit 3, nothing written. `..` is resolved
+// list the plan's own files and every task's output, and so rekey every
+// task on every plan: refused, exit 3, nothing written. `..` is resolved
 // first.
 #[test]
 fn a_folder_input_holding_the_benchmark_is_refused() {
     let p = Project::with_tools();
-    std::fs::create_dir_all(p.bench("N1").join("cells")).unwrap();
-    for path in [".", "bin/..", "results/benchmarks/N1/cells"] {
+    std::fs::create_dir_all(p.bench("N1").join("tasks")).unwrap();
+    for path in [".", "bin/..", "results/benchmarks/N1/tasks"] {
         let spec = two_with(&format!(
             "\"inputs\": {{\"R\": {{\"path\": \"{path}\", \"dir\": true}}}}"
         ));
