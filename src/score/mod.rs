@@ -224,6 +224,12 @@ struct Truth {
     outside_pos: usize,
 }
 
+/// Where the cell at `row` (from 0) of `column` in the file at `path` is,
+/// as a refusal names it.
+fn whence(row: usize, column: &str, path: &Path) -> String {
+    format!("row {} of {column} in {}", row + 1, path.display())
+}
+
 /// Refuses the first cell of `col` that is not a number among the rows
 /// `read` keeps, naming the row, its `column` and the file at `path`.
 fn numbers_only(
@@ -233,29 +239,26 @@ fn numbers_only(
     path: &Path,
 ) -> Result<()> {
     if let Some((row, cell)) = col.first_bad(read) {
-        bail!(
-            "row {} of {column} in {}: {cell:?} is not a number",
-            row + 1,
-            path.display()
-        );
+        bail!("{}: {cell:?} is not a number", whence(row, column, path));
     }
     Ok(())
 }
 
 /// The truth of the rows `keys`, each at its item `at` among `items`
-/// items: each row positive or, with `label` (the `--label` column's name,
-/// its cells and the value), positive when its cell is above the value.
+/// items: each row positive or, with `--label` and its column's cells
+/// `label`, positive when its cell is above the label's value.
 fn truth_of(
     spec: &Spec,
     keys: &[String],
     at: &[Option<usize>],
-    label: Option<(&str, &Numbers, f64)>,
+    label: Option<&Numbers>,
     items: usize,
 ) -> Result<Truth> {
-    if let Some((column, values, _)) = label {
+    let label = spec.label.as_ref().zip(label);
+    if let Some(((column, _), values)) = label {
         numbers_only(values, |_| true, column, &spec.truth)?;
     }
-    let label = label.map(|(_, values, above)| (&values.values, above));
+    let label = label.map(|((_, above), values)| (&values.values, *above));
     let (mut labels, mut seen) = (vec![false; items], vec![false; items]);
     // Each key outside the universe, and whether it is positive.
     let mut outside: HashMap<&str, bool> = HashMap::new();
@@ -334,14 +337,6 @@ fn score_of(
     at: &[Option<usize>],
     values: &mut [Option<f64>],
 ) -> Result<()> {
-    let whence = |row: usize| {
-        format!(
-            "row {} of {} in {}",
-            row + 1,
-            s.column,
-            spec.scores.display()
-        )
-    };
     numbers_only(col, |row| at[row].is_some(), &s.column, &spec.scores)?;
     values.fill(None);
     for (row, (&at, &x)) in at.iter().zip(&col.values).enumerate() {
@@ -349,7 +344,10 @@ fn score_of(
         let Some(at) = at.filter(|_| !x.is_nan()) else {
             continue;
         };
-        let x = s.transform.apply(x).with_context(|| whence(row))?;
+        let x = s
+            .transform
+            .apply(x)
+            .with_context(|| whence(row, &s.column, &spec.scores))?;
         values[at] = higher(values[at], Some(x));
     }
     Ok(())
@@ -407,16 +405,11 @@ fn over_universe(
 
     let at = own.unwrap_or_else(|| items.find(&keys));
     let found = (!same).then(|| items.find(truth_keys));
-    let label = spec
-        .label
-        .as_ref()
-        .zip(truth_label)
-        .map(|((col, above), values)| (col.as_str(), values, *above));
     let truth = truth_of(
         spec,
         truth_keys,
         found.as_deref().unwrap_or(&at),
-        label,
+        truth_label,
         items.len(),
     )?;
     let positives = truth.labels.iter().filter(|&&p| p).count();
