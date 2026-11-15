@@ -532,7 +532,7 @@ fn unresolved_tools_are_listed() {
 // spec file exits 1; a declared input that is not there exits 3.
 #[test]
 fn the_command_line_exits_by_what_went_wrong() {
-    let p = Project::new();
+    let p = Project::with_tools();
     let usage = legume_mcp::benchmark::USAGE;
     for (args, said) in [
         (&["plan"][..], "plan needs SPEC, the spec's JSON file"),
@@ -563,8 +563,6 @@ fn the_command_line_exits_by_what_went_wrong() {
     assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
     assert!(stderr(&o).starts_with("legume benchmark: reading missing.json: "));
 
-    p.tool("TOOL1", "true");
-    p.tool("TOOL2", "true");
     let spec = two_with("\"inputs\": {\"RUN1\": {\"path\": \"RUN1\", \"dir\": true}}");
     let o = p.plan_spec(&p.spec("S1.json", &spec), &[]);
     let e = refused(&o);

@@ -7,7 +7,7 @@ use anyhow::Result;
 use legume_mcp::{command_line, free_prefix, parse_args, serve_in, shown_path};
 use legume_mcp::{Call, Content, Handler};
 use legume_mcp::{ServerInfo, ToolSpec};
-use mcp::{call, Sink};
+use mcp::{call, input, Sink};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::Cursor;
@@ -64,19 +64,21 @@ impl Handler for Tools {
 
 /// The replies of a session of `lines`, by id, keeping records at `project`.
 fn session(project: Option<PathBuf>, lines: &[Value]) -> Vec<Value> {
-    let input: String = lines.iter().map(|l| format!("{l}\n")).collect();
     let sink = Sink::default();
     let info = ServerInfo {
         name: "t".into(),
         version: "0".into(),
         instructions: None,
     };
-    serve_in(Cursor::new(input), sink.clone(), info, project, Tools).unwrap();
-    let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-    let mut replies: Vec<Value> = text
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
+    serve_in(
+        Cursor::new(input(lines)),
+        sink.clone(),
+        info,
+        project,
+        Tools,
+    )
+    .unwrap();
+    let mut replies = sink.messages();
     replies.sort_by_key(|r| r["id"].as_u64());
     replies
 }

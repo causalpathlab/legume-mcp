@@ -2,7 +2,7 @@ mod mcp;
 
 use anyhow::Result;
 use legume_mcp::{serve_on, Call, Content, Fact, Handler, ServerInfo, Step, ToolSpec};
-use mcp::{call, Sink};
+use mcp::{call, input, Sink};
 use serde_json::{json, Value};
 use std::io::Cursor;
 use std::process::Command;
@@ -75,18 +75,20 @@ impl Handler for Tools {
 
 /// Serve `lines` to the end and return every message written, in order.
 fn session(lines: &[Value]) -> Vec<Value> {
-    let input: String = lines.iter().map(|l| format!("{l}\n")).collect();
     let sink = Sink::default();
     let info = ServerInfo {
         name: "test".into(),
         version: "0.0.0".into(),
         instructions: Some("read me".into()),
     };
-    serve_on(Cursor::new(input), sink.clone(), info, Tools { calls: 0 }).unwrap();
-    let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-    text.lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect()
+    serve_on(
+        Cursor::new(input(lines)),
+        sink.clone(),
+        info,
+        Tools { calls: 0 },
+    )
+    .unwrap();
+    sink.messages()
 }
 
 fn by_id(msgs: &[Value], id: u64) -> &Value {
@@ -179,11 +181,7 @@ fn bad_lines_and_pings() {
         Tools { calls: 0 },
     )
     .unwrap();
-    let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-    let msgs: Vec<Value> = text
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
+    let msgs = sink.messages();
     assert_eq!(msgs[0]["error"]["code"], -32700);
     assert_eq!(msgs[0]["id"], Value::Null);
     assert_eq!(
@@ -257,7 +255,7 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
     std::fs::create_dir_all(proj.join("data")).unwrap();
     let at = |p: &str| proj.join(p).to_string_lossy().into_owned();
     let made = at("data/made.txt");
-    let input: String = [
+    let ask = input(&[
         json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
         json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
         call(4, "echo", json!({ "a": 1 })),
@@ -270,10 +268,7 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
         call(7, "make", json!({ "out": made, "from": at("in.tsv") })),
         call(8, "child", json!({ "script": "exit 2" })),
         call(10, "peek", json!({})),
-    ]
-    .iter()
-    .map(|l| format!("{l}\n"))
-    .collect();
+    ]);
     let sink = Sink::default();
     let info = ServerInfo {
         name: "t".into(),
@@ -281,18 +276,14 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
         instructions: None,
     };
     legume_mcp::serve_in(
-        Cursor::new(input),
+        Cursor::new(ask),
         sink.clone(),
         info,
         Some(proj.clone()),
         Tools { calls: 0 },
     )
     .unwrap();
-    let reply = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-    let msgs: Vec<Value> = reply
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
+    let msgs = sink.messages();
     let told = by_id(&msgs, 1)["result"]["instructions"].as_str().unwrap();
     assert!(told.contains("results/<today>/runall.sh"));
     let b = legume_mcp::FIGURE_BOX;
@@ -359,17 +350,12 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
     );
     // The legume server shows them, the flagged ones apart.
     let sink = Sink::default();
-    let ask = format!(
-        "{}\n{}\n",
+    let ask = input(&[
         json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
-        call(2, "status", json!({}))
-    );
+        call(2, "status", json!({})),
+    ]);
     legume_mcp::brain::serve_in(Cursor::new(ask), sink.clone(), Some(proj.clone())).unwrap();
-    let reply = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-    let status: Vec<Value> = reply
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
+    let status = sink.messages();
     let status = by_id(&status, 2)["result"]["content"][0]["text"]
         .as_str()
         .unwrap();
@@ -429,15 +415,14 @@ fn the_records_redo_the_work_in_a_copy_of_the_project() {
 
 /// The `legume` server's answers to `calls`, made in `proj`.
 fn brain(proj: &std::path::Path, calls: &[Value]) -> Vec<Value> {
-    let input: String = calls.iter().map(|l| format!("{l}\n")).collect();
     let sink = Sink::default();
-    legume_mcp::brain::serve_in(Cursor::new(input), sink.clone(), Some(proj.to_path_buf()))
-        .unwrap();
-    let reply = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-    reply
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect()
+    legume_mcp::brain::serve_in(
+        Cursor::new(input(calls)),
+        sink.clone(),
+        Some(proj.to_path_buf()),
+    )
+    .unwrap();
+    sink.messages()
 }
 
 /// The text of call `id`'s result.
@@ -762,14 +747,11 @@ fn the_notebook_is_the_legume_servers_alone() {
     let list = json!({ "jsonrpc": "2.0", "id": 99, "method": "tools/list" });
 
     // A tool's server: no notebook of its own.
-    let tool: String = [
+    let tool = input(&[
         init.clone(),
         call(1, "notebook", json!({ "kind": "plan", "words": "w" })),
         list.clone(),
-    ]
-    .iter()
-    .map(|l| format!("{l}\n"))
-    .collect();
+    ]);
     let sink = Sink::default();
     let info = ServerInfo {
         name: "t".into(),
@@ -784,11 +766,7 @@ fn the_notebook_is_the_legume_servers_alone() {
         Tools { calls: 0 },
     )
     .unwrap();
-    let msgs: Vec<Value> = String::from_utf8(sink.0.lock().unwrap().clone())
-        .unwrap()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
+    let msgs = sink.messages();
     let instructions = by_id(&msgs, 0)["result"]["instructions"].as_str().unwrap();
     assert!(
         instructions.contains("The notebook is the `legume` server's")
