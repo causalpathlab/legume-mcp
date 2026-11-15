@@ -286,6 +286,32 @@ fn the_older_scores_and_key_flags_still_work() {
     );
 }
 
+// A flag that takes one value is refused when given twice, an old name
+// counting as its new one, so neither silently wins.
+#[test]
+fn a_flag_given_twice_is_refused() {
+    let c = few_links();
+    let base = c.args(&c.universe_args());
+    let table = base[base.iter().position(|a| *a == "--table").unwrap() + 1];
+    for twice in [["--scores", table], ["--truth", table]] {
+        let mut a = base.clone();
+        a.extend(twice);
+        let o = legume(a);
+        assert_eq!(o.status.code(), Some(2), "{twice:?}: {}", stderr(&o));
+        let one = if twice[0] == "--scores" {
+            "--table"
+        } else {
+            twice[0]
+        };
+        assert!(
+            stderr(&o).contains(&format!("{one} is given twice")),
+            "{}",
+            stderr(&o)
+        );
+        assert!(!c.out.exists());
+    }
+}
+
 #[test]
 fn the_universe_flag_is_required() {
     let c = few_links();

@@ -128,10 +128,11 @@ fn segments(token: &str) -> std::result::Result<Vec<Seg<'_>>, String> {
     Ok(out)
 }
 
-/// Another tool's argv names `{legume}`.
+/// Another tool's argv names `{legume}`: `run[1..]`, since `run[0]` is
+/// replaced by the tool's own path.
 fn embeds_legume(method: &Method) -> bool {
     method.tool_word() != LEGUME
-        && method.run.iter().any(|t| {
+        && method.run[1..].iter().any(|t| {
             segments(t)
                 .unwrap_or_default()
                 .contains(&Seg::Name("legume"))
@@ -1530,6 +1531,15 @@ mod tests {
             r#""M1": {"snapshot": false, "run": ["{legume}", "score"], "makes": ["m.score.tsv"]},"#;
         assert_eq!(embedded(m1), Some(false));
         assert_eq!(embedded(""), Some(true));
+        // run[0] is replaced by the tool's own path: under another tool's
+        // name, a {legume} there runs no legume.
+        let named = spec(
+            r#"{"name": "N1", "seeds": {"n": 1}, "stages": [
+            {"name": "fit", "tool": "T", "run": ["{legume}", "x"], "makes": ["m.score.tsv"]}]}"#,
+        );
+        let words = tool_words(&named).unwrap();
+        assert!(words.iter().all(|w| w.0 != LEGUME), "{words:?}");
+        assert_eq!(expand(&named).remove(0).argv[0], "/T/T");
     }
 
     // glob_natural_sort_fails_empty: matches are natural-sorted and

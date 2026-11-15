@@ -179,10 +179,23 @@ struct Items<'a> {
 impl<'a> Items<'a> {
     /// The items of the rows `keys`.
     fn new(keys: &'a [String]) -> Self {
+        Self::build(keys, |_| {})
+    }
+
+    /// The items of the rows `keys`, and each row's item, found in the one
+    /// pass that makes them.
+    fn of_rows(keys: &'a [String]) -> (Self, Vec<Option<usize>>) {
+        let mut at = Vec::with_capacity(keys.len());
+        let items = Self::build(keys, |i| at.push(Some(i)));
+        (items, at)
+    }
+
+    /// The items of the rows `keys`, telling `each` every row's item.
+    fn build(keys: &'a [String], mut each: impl FnMut(usize)) -> Self {
         let mut index = HashMap::with_capacity(keys.len());
         for k in keys {
             let next = index.len();
-            index.entry(k.as_str()).or_insert(next);
+            each(*index.entry(k.as_str()).or_insert(next));
         }
         Items {
             index,
@@ -368,14 +381,18 @@ fn over_universe(
     let same_label = numbers.split_off(spec.score.len());
     let same = spec.universe == Universe::Same;
     let (universe_keys, truth_table);
-    let (items, truth_keys, truth_label) = match &spec.universe {
-        Universe::Same => (Items::new(&keys), &keys, same_label.first()),
+    let (items, own, truth_keys, truth_label) = match &spec.universe {
+        Universe::Same => {
+            let (items, own) = Items::of_rows(&keys);
+            (items, Some(own), &keys, same_label.first())
+        }
         Universe::File { path, key } => {
             universe_keys = table::read_keyed(path, key, &[])?.keys;
             truth_table =
                 table::read_keyed(&spec.truth, &spec.truth_key, spec.label_column().as_slice())?;
             (
                 Items::new(&universe_keys),
+                None,
                 &truth_table.keys,
                 truth_table.numbers.first(),
             )
@@ -388,7 +405,7 @@ fn over_universe(
         items.rows - items.len()
     )?;
 
-    let at = items.find(&keys);
+    let at = own.unwrap_or_else(|| items.find(&keys));
     let found = (!same).then(|| items.find(truth_keys));
     let label = spec
         .label

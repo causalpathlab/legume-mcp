@@ -98,7 +98,22 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
     let Some(pairs) = flag_pairs(args)? else {
         return Ok(None);
     };
+    let mut given: Vec<&str> = Vec::new();
     for (flag, v) in pairs {
+        // A flag that takes one value, given twice (an old name counting as
+        // its new one), is refused rather than one silently winning.
+        let one = match flag {
+            "--scores" => "--table",
+            "--key" => "--table-key",
+            "--score" => "",
+            f => f,
+        };
+        if !one.is_empty() {
+            if given.contains(&one) {
+                return Err(usage(format!("{one} is given twice")));
+            }
+            given.push(one);
+        }
         match flag {
             "--table" | "--scores" => scores = Some(PathBuf::from(v)),
             "--table-key" | "--key" => key = Some(columns(flag, v)?),
