@@ -10,7 +10,7 @@
 //! of the TSS, bounds included. With `--max-per-gene K`, a gene keeps its
 //! K nearest by (distance, peak index), listed by peak index.
 
-use crate::command::{flag_pairs, required, usage};
+use crate::command::{canonical_flags, flag_pairs, required, usage, Flag};
 use crate::table;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -201,6 +201,15 @@ struct Spec {
     out: PathBuf,
 }
 
+/// The flags `legume universe cis` takes.
+const FLAGS: &[Flag] = &[
+    Flag::once(&["--gene-coords"]),
+    Flag::once(&["--peaks"]),
+    Flag::once(&["--window"]),
+    Flag::once(&["--max-per-gene"]),
+    Flag::once(&["-o", "--out"]),
+];
+
 fn parse(args: &[String]) -> Result<Option<Spec>> {
     match args.first().map(String::as_str) {
         Some("cis") => {}
@@ -212,7 +221,7 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
     let Some(pairs) = flag_pairs(&args[1..])? else {
         return Ok(None);
     };
-    for (flag, v) in pairs {
+    for (flag, v) in canonical_flags(FLAGS, pairs)? {
         match flag {
             "--gene-coords" => genes = Some(PathBuf::from(v)),
             "--peaks" => peaks = Some(PathBuf::from(v)),
@@ -224,8 +233,8 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
                 Ok(k) if k > 0 => max_per_gene = Some(k),
                 _ => return Err(usage(format!("--max-per-gene {v:?} is not a count"))),
             },
-            "-o" | "--out" => out = Some(PathBuf::from(v)),
-            _ => return Err(usage(format!("unknown argument {flag}"))),
+            "-o" => out = Some(PathBuf::from(v)),
+            _ => unreachable!("{flag} is in FLAGS"),
         }
     }
     Ok(Some(Spec {

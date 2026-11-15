@@ -1,7 +1,7 @@
 //! `legume score`'s command line.
 
 use super::{run, Dup, Outside, Score, Spec, Transform, Universe};
-use crate::command::{flag_pairs, one_of, required, usage};
+use crate::command::{canonical_flags, flag_pairs, one_of, required, usage, Flag};
 use anyhow::Result;
 use std::io::Write;
 use std::path::PathBuf;
@@ -56,6 +56,24 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
 /// What `--truth-outside` and `--scored-outside` take.
 const OUTSIDE: &[(&str, Outside)] = &[("fail", Outside::Fail), ("drop", Outside::Drop)];
 
+/// The flags `legume score` takes, `--scores` and `--key` the older names
+/// of `--table` and `--table-key`.
+const FLAGS: &[Flag] = &[
+    Flag::once(&["--table", "--scores"]),
+    Flag::once(&["--table-key", "--key"]),
+    Flag::many(&["--score"]),
+    Flag::once(&["--truth"]),
+    Flag::once(&["--truth-key"]),
+    Flag::once(&["--label"]),
+    Flag::once(&["--above"]),
+    Flag::once(&["--universe"]),
+    Flag::once(&["--universe-key"]),
+    Flag::once(&["--truth-outside"]),
+    Flag::once(&["--scored-outside"]),
+    Flag::once(&["--dup"]),
+    Flag::once(&["-o", "--out"]),
+];
+
 /// A comma-separated list of column names.
 fn columns(flag: &str, s: &str) -> Result<Vec<String>> {
     let cols: Vec<String> = s.split(',').map(str::to_string).collect();
@@ -98,25 +116,10 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
     let Some(pairs) = flag_pairs(args)? else {
         return Ok(None);
     };
-    let mut given: Vec<&str> = Vec::new();
-    for (flag, v) in pairs {
-        // A flag that takes one value, given twice (an old name counting as
-        // its new one), is refused rather than one silently winning.
-        let one = match flag {
-            "--scores" => "--table",
-            "--key" => "--table-key",
-            "--score" => "",
-            f => f,
-        };
-        if !one.is_empty() {
-            if given.contains(&one) {
-                return Err(usage(format!("{one} is given twice")));
-            }
-            given.push(one);
-        }
+    for (flag, v) in canonical_flags(FLAGS, pairs)? {
         match flag {
-            "--table" | "--scores" => scores = Some(PathBuf::from(v)),
-            "--table-key" | "--key" => key = Some(columns(flag, v)?),
+            "--table" => scores = Some(PathBuf::from(v)),
+            "--table-key" => key = Some(columns(flag, v)?),
             "--score" => list.push(score(v)?),
             "--truth" => truth = Some(PathBuf::from(v)),
             "--truth-key" => truth_key = Some(columns(flag, v)?),
@@ -130,8 +133,8 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
             "--truth-outside" => truth_outside = one_of(flag, v, OUTSIDE)?,
             "--scored-outside" => scored_outside = one_of(flag, v, OUTSIDE)?,
             "--dup" => dup = one_of(flag, v, &[("fail", Dup::Fail), ("max", Dup::Max)])?,
-            "-o" | "--out" => out = Some(PathBuf::from(v)),
-            _ => return Err(usage(format!("unknown argument {flag}"))),
+            "-o" => out = Some(PathBuf::from(v)),
+            _ => unreachable!("{flag} is in FLAGS"),
         }
     }
     let universe = match (required(universe, "--universe")?.as_str(), universe_key) {

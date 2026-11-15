@@ -218,6 +218,25 @@ fn universe_cis_needs_a_window() {
 }
 
 #[test]
+fn a_universe_flag_given_twice_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let genes = dir.path().join("g.tsv");
+    let peaks = dir.path().join("p.txt");
+    tsv(&genes, "gene\tchr\ttss", &["GENE1\tchr1\t1000"]);
+    std::fs::write(&peaks, "chr1:990-1010\n").unwrap();
+    let out = dir.path().join("cis.tsv");
+    let more = ["--window", "100", "--window", "200"];
+    let o = legume(cis_args(&genes, &peaks, &out, &more));
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains("--window is given twice"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!out.exists());
+}
+
+#[test]
 fn universe_help_names_every_flag() {
     let o = legume(["universe", "--help"]);
     assert!(o.status.success());

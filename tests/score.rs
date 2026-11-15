@@ -312,6 +312,19 @@ fn a_flag_given_twice_is_refused() {
     }
 }
 
+// -o and --out are one flag, so both together are given twice.
+#[test]
+fn o_and_out_together_are_refused() {
+    let c = few_links();
+    let mut a = c.args(&c.universe_args());
+    let out = a[a.iter().position(|a| *a == "-o").unwrap() + 1];
+    a.extend(["--out", out]);
+    let o = legume(a);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(stderr(&o).contains("-o is given twice"), "{}", stderr(&o));
+    assert!(!c.out.exists());
+}
+
 #[test]
 fn the_universe_flag_is_required() {
     let c = few_links();
