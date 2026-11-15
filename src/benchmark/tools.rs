@@ -3,12 +3,12 @@
 //! benchmark's folder, from where it runs. A reinstall cannot change the
 //! bytes under a key, and two builds of one tool (CPU and CUDA) sit side
 //! by side. `versions.tsv` says what each one is: its source, content
-//! key, what runs, and `ABS --version` (5 s at most, the tool's whole
-//! process group killed after; informational only).
+//! key, what runs, and `exec --version` (within [`VERSION_TIMEOUT`], the
+//! tool's whole process group killed after; informational only).
 //!
 //! A later plan keeps a tool's snapshot when the installed one has
 //! changed, and says so; `--retool` takes the installed one, rekeying its
-//! cells. `snapshot: false` runs the installed binary itself.
+//! tasks. `snapshot: false` runs the installed binary itself.
 
 use super::key;
 use super::plan::{base, LEGUME};
@@ -131,7 +131,8 @@ pub fn snapshot(dir: &Path, source: &Path, content_key: &str, name: &str) -> Res
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("setting permissions on {}", tmp.display()))?;
         }
         std::fs::rename(&tmp, &target).with_context(|| format!("placing {}", target.display()))
     })();
@@ -224,15 +225,10 @@ pub fn short(key: &str) -> &str {
     &key[..key.len().min(16)]
 }
 
-/// Each found tool keyed, snapshot into `dir` and asked its version, as
-/// the plan runs it; with what changed since the plan before (its
+/// Each found tool keyed, snapshot into `dir` and asked its version
+/// (within [`VERSION_TIMEOUT`]), as the plan runs it; with what changed since the plan before (its
 /// `versions.tsv`). A changed tool keeps its snapshot unless `retool`.
-pub fn settle(
-    dir: &Path,
-    found: &[Found],
-    retool: bool,
-    timeout: Duration,
-) -> Result<(Vec<Resolved>, Vec<String>)> {
+pub fn settle(dir: &Path, found: &[Found], retool: bool) -> Result<(Vec<Resolved>, Vec<String>)> {
     let before = read_versions(dir);
     let mut tools = Vec::new();
     let mut drift = Vec::new();
@@ -259,9 +255,9 @@ pub fn settle(
             let how = if kept.is_some() {
                 "planned with its snapshot, --retool plans with the one installed"
             } else if f.snapshot {
-                "planned with the one installed, which rekeys its cells"
+                "planned with the one installed, which rekeys its tasks"
             } else {
-                "snapshot false, so its cells are rekeyed"
+                "snapshot false, so its tasks are rekeyed"
             };
             drift.push(format!(
                 "{}: changed since the last plan ({from} -> {to}); {how}",
@@ -276,7 +272,7 @@ pub fn settle(
             }
             None => (now, f.source.clone()),
         };
-        let version = version(&exec, timeout);
+        let version = version(&exec, VERSION_TIMEOUT);
         tools.push(Resolved {
             word: f.word.clone(),
             source: f.source.clone(),
@@ -299,6 +295,15 @@ mod tests {
         std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         p
+    }
+
+    /// TOOL1 found at `source`, snapshot.
+    fn found(source: PathBuf) -> [Found; 1] {
+        [Found {
+            word: "TOOL1".into(),
+            source,
+            snapshot: true,
+        }]
     }
 
     #[test]
@@ -381,10 +386,9 @@ mod tests {
         closer.join().unwrap();
     }
 
-    // same_bytes_same_key, rebuild_mid_sweep_keeps_snapshot (the tool
-    // side): a snapshot is keyed by the bytes, so two copies share it; a
-    // rebuild leaves the snapshot's bytes alone and the next plan keeps
-    // it, saying so, unless retool.
+    // rebuild_mid_benchmark_keeps_snapshot (the tool side): a snapshot is
+    // keyed by the bytes; a rebuild leaves the snapshot's bytes alone and
+    // the next plan keeps it, saying so, unless retool.
     #[test]
     fn a_snapshot_keeps_its_bytes_through_a_rebuild() {
         let d = tempfile::tempdir().unwrap();
@@ -392,12 +396,8 @@ mod tests {
         let bench = d.path().join("bench");
         std::fs::create_dir_all(&bin).unwrap();
         let t = script(&bin, "TOOL1", "echo v1");
-        let found = [Found {
-            word: "TOOL1".into(),
-            source: t.clone(),
-            snapshot: true,
-        }];
-        let (first, drift) = settle(&bench, &found, false, VERSION_TIMEOUT).unwrap();
+        let found = found(t.clone());
+        let (first, drift) = settle(&bench, &found, false).unwrap();
         assert!(drift.is_empty(), "{drift:?}");
         let k1 = key::file_key(&t).unwrap();
         assert_eq!(first[0].content_key, k1);
@@ -405,11 +405,8 @@ mod tests {
         assert_eq!(first[0].version.as_deref(), Some("v1"));
         std::fs::write(bench.join("versions.tsv"), versions_tsv(&first)).unwrap();
 
-        let copy = script(&d.path().join("bench"), "TOOL1-copy", "echo v1");
-        assert_eq!(key::file_key(&copy).unwrap(), k1, "same bytes, same key");
-
         script(&bin, "TOOL1", "echo v2");
-        let (kept, drift) = settle(&bench, &found, false, VERSION_TIMEOUT).unwrap();
+        let (kept, drift) = settle(&bench, &found, false).unwrap();
         assert_eq!(kept[0].exec, first[0].exec);
         assert_eq!(kept[0].content_key, k1);
         assert_eq!(kept[0].version.as_deref(), Some("v1"));
@@ -422,7 +419,7 @@ mod tests {
             drift[0].ends_with("planned with its snapshot, --retool plans with the one installed")
         );
 
-        let (retooled, _) = settle(&bench, &found, true, VERSION_TIMEOUT).unwrap();
+        let (retooled, _) = settle(&bench, &found, true).unwrap();
         assert_ne!(retooled[0].content_key, k1);
         assert_eq!(retooled[0].version.as_deref(), Some("v2"));
         assert_eq!(
@@ -441,20 +438,16 @@ mod tests {
         let bench = d.path().join("bench");
         std::fs::create_dir_all(&bin).unwrap();
         let t = script(&bin, "TOOL1", "echo v1");
-        let found = [Found {
-            word: "TOOL1".into(),
-            source: t.clone(),
-            snapshot: true,
-        }];
-        let (first, _) = settle(&bench, &found, false, VERSION_TIMEOUT).unwrap();
+        let found = found(t.clone());
+        let (first, _) = settle(&bench, &found, false).unwrap();
         script(&bin, "TOOL1", "echo v2");
         let k2 = key::file_key(&t).unwrap();
         let fresh = bench.join("tools").join(&k2).join("TOOL1");
-        let rekeyed = "planned with the one installed, which rekeys its cells";
+        let rekeyed = "planned with the one installed, which rekeys its tasks";
 
         std::fs::remove_dir_all(bench.join("tools")).unwrap();
         std::fs::write(bench.join("versions.tsv"), versions_tsv(&first)).unwrap();
-        let (lost, drift) = settle(&bench, &found, false, VERSION_TIMEOUT).unwrap();
+        let (lost, drift) = settle(&bench, &found, false).unwrap();
         assert_eq!((&lost[0].content_key, &lost[0].exec), (&k2, &fresh));
         assert!(drift[0].ends_with(rekeyed), "{drift:?}");
 
@@ -463,7 +456,7 @@ mod tests {
         let mut row = first.clone();
         row[0].exec = outside;
         std::fs::write(bench.join("versions.tsv"), versions_tsv(&row)).unwrap();
-        let (moved, drift) = settle(&bench, &found, false, VERSION_TIMEOUT).unwrap();
+        let (moved, drift) = settle(&bench, &found, false).unwrap();
         assert_eq!((&moved[0].content_key, &moved[0].exec), (&k2, &fresh));
         assert!(drift[0].ends_with(rekeyed), "{drift:?}");
     }
@@ -477,17 +470,10 @@ mod tests {
         let (a, b) = (d.path().join("a"), d.path().join("b"));
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
-        let found = |source: PathBuf| {
-            [Found {
-                word: "TOOL1".into(),
-                source,
-                snapshot: true,
-            }]
-        };
         let (ta, tb) = (script(&a, "TOOL1", "true"), script(&b, "TOOL1", "true"));
-        let (first, _) = settle(&bench, &found(ta.clone()), false, VERSION_TIMEOUT).unwrap();
+        let (first, _) = settle(&bench, &found(ta.clone()), false).unwrap();
         std::fs::write(bench.join("versions.tsv"), versions_tsv(&first)).unwrap();
-        let (_, drift) = settle(&bench, &found(tb.clone()), false, VERSION_TIMEOUT).unwrap();
+        let (_, drift) = settle(&bench, &found(tb.clone()), false).unwrap();
         assert_eq!(
             drift,
             [format!("TOOL1: now {}, was {}", tb.display(), ta.display())]

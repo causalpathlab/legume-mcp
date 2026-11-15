@@ -1,17 +1,19 @@
 //! A benchmark's spec, parsed from JSON and checked field by field: the
 //! grid (axes, tuple axes, exclude), the seeds, the declared inputs, the
-//! stages and their lanes (methods), and what each cell needs (threads,
-//! memory, GPUs, timeout, tool). A refusal names the field it is about,
-//! as a path such as `stages[2].methods.M1.threads`.
+//! stages and their methods, what each task needs (threads, memory, GPUs,
+//! timeout, tool, snapshot, max_running), the machine budget (cores,
+//! mem_gb, gpus, gpu_slots, grace_secs, max_hours, disk), what it keeps,
+//! and what gather compares and plots. A refusal names the field it is
+//! about, as a path such as `stages[2].methods.M1.threads`.
 //!
-//! What the placeholders in `run` may name, and the lane rules between
+//! What the placeholders in `run` may name, and the method rules between
 //! stages, are checked when the spec is planned ([`super::plan::check`]).
 
 use crate::command::refuse;
 use anyhow::Result;
 use serde_json::{Map, Value};
 
-/// The child environment's thread variables, each set to the cell's
+/// The child environment's thread variables, each set to the task's
 /// threads.
 pub const THREAD_VARS: [&str; 6] = [
     "RAYON_NUM_THREADS",
@@ -22,10 +24,10 @@ pub const THREAD_VARS: [&str; 6] = [
     "POLARS_MAX_THREADS",
 ];
 
-/// A cell's timeout when none is given: 4 h.
+/// A task's timeout when none is given: 4 h.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 4 * 3600;
 
-/// The placeholders every cell has; no axis, binding or stage may take
+/// The placeholders every task has; no axis, binding or stage may take
 /// these names.
 pub const RESERVED: [&str; 10] = [
     "rep", "rep_seed", "seed", "method", "threads", "gpu", "out", "legume", "inputs", "glob",
@@ -37,7 +39,8 @@ pub struct Spec {
     pub name: String,
     /// Cores to book; the machine's logical CPUs when not given.
     pub cores: Option<u32>,
-    /// Memory to book, in GB; MemAvailable at plan time when not given.
+    /// Memory to book, in GB (GiB, 2^30 bytes); MemAvailable at plan time
+    /// when not given.
     pub mem_gb: Option<f64>,
     pub gpus: Vec<u32>,
     pub gpu_slots: u32,
@@ -52,7 +55,10 @@ pub struct Spec {
     /// By name.
     pub inputs: Vec<Input>,
     pub stages: Vec<Stage>,
+    /// Method/score pairs gather compares; checked here, not read until
+    /// gather is built.
     pub compare: Vec<[String; 2]>,
+    /// What gather plots; checked here, not read until gather is built.
     pub plot: Option<Plot>,
 }
 
@@ -92,20 +98,27 @@ pub struct Input {
     pub dir: bool,
 }
 
-/// A stage: one lane, or one per method.
+/// A stage: its methods, or one unnamed method of its own when it lists
+/// none. It always has at least one.
 #[derive(Clone, Debug)]
 pub struct Stage {
     pub name: String,
-    pub methods: bool,
-    pub lanes: Vec<Lane>,
+    pub methods: Vec<Method>,
 }
 
-/// What one cell of a stage, or of a method's lane in it, runs and needs,
-/// the stage's values filled in where the lane gives none.
+impl Stage {
+    /// It lists methods: each method's name is Some.
+    pub fn has_methods(&self) -> bool {
+        self.methods[0].name.is_some()
+    }
+}
+
+/// What one task of a stage, or of a method in it, runs and needs, the
+/// stage's values filled in where the method gives none.
 #[derive(Clone, Debug)]
-pub struct Lane {
-    /// The method; `None` in a stage without methods.
-    pub method: Option<String>,
+pub struct Method {
+    /// The method's name; `None` in a stage without methods.
+    pub name: Option<String>,
     /// Where it is in the spec, for refusals.
     pub at: String,
     pub run: Vec<String>,
@@ -120,7 +133,7 @@ pub struct Lane {
     pub max_running: Option<u32>,
 }
 
-impl Lane {
+impl Method {
     /// The word naming its tool: `tool`, else `run[0]`.
     pub fn tool_word(&self) -> &str {
         self.tool.as_deref().unwrap_or(&self.run[0])
@@ -265,6 +278,15 @@ impl<'a> Obj<'a> {
         }
     }
 
+    /// Reads a u32 like `u32`, and refuses 0 with `why`, the whole message after the key.
+    fn nonzero_u32(&mut self, k: &'static str, why: &str) -> Result<Option<u32>> {
+        let n = self.u32(k)?;
+        if n == Some(0) {
+            return Err(bad(&self.at(k), why));
+        }
+        Ok(n)
+    }
+
     fn number(&mut self, k: &'static str) -> Result<Option<f64>> {
         match self.get(k) {
             None => Ok(None),
@@ -290,23 +312,31 @@ impl<'a> Obj<'a> {
     }
 
     fn strings(&mut self, k: &'static str) -> Result<Option<Vec<String>>> {
+        self.list(k, "strings", |at, x| match x {
+            Value::String(s) => Ok(s.clone()),
+            _ => Err(bad(at, format!("is {}, not a string", kind(x)))),
+        })
+    }
+
+    /// Reads a list, each item through `f` with its path (`k[i]`); refuses
+    /// what is not a list, saying it should be a list of `of`.
+    fn list<T>(
+        &mut self,
+        k: &'static str,
+        of: &str,
+        mut f: impl FnMut(&str, &Value) -> Result<T>,
+    ) -> Result<Option<Vec<T>>> {
         let Some(v) = self.get(k) else {
             return Ok(None);
         };
         let at = self.at(k);
         let Value::Array(items) = v else {
-            return Err(bad(&at, format!("is {}, not a list of strings", kind(v))));
+            return Err(bad(&at, format!("is {}, not a list of {of}", kind(v))));
         };
         items
             .iter()
             .enumerate()
-            .map(|(i, x)| match x {
-                Value::String(s) => Ok(s.clone()),
-                _ => Err(bad(
-                    &format!("{at}[{i}]"),
-                    format!("is {}, not a string", kind(x)),
-                )),
-            })
+            .map(|(i, x)| f(&format!("{at}[{i}]"), x))
             .collect::<Result<_>>()
             .map(Some)
     }
@@ -340,7 +370,7 @@ fn kind(v: &Value) -> &'static str {
 
 /// A duration: whole numbers each with a unit, s, m, h or d (`30m`,
 /// `1h30m`), in seconds.
-pub fn duration(s: &str) -> Option<u64> {
+fn duration(s: &str) -> Option<u64> {
     let mut secs = 0u64;
     let mut n: Option<u64> = None;
     for c in s.chars() {
@@ -360,7 +390,7 @@ pub fn duration(s: &str) -> Option<u64> {
     (n.is_none() && !s.is_empty() && secs > 0).then_some(secs)
 }
 
-/// What a stage gives its lanes, and a lane gives itself.
+/// What a stage gives its methods, and a method gives itself.
 #[derive(Clone, Default)]
 struct Needs {
     threads: Option<u32>,
@@ -383,14 +413,8 @@ impl Needs {
                 )
             })?),
         };
-        let threads = o.u32("threads")?;
-        if threads == Some(0) {
-            return Err(bad(&o.at("threads"), "is 0; a cell needs a thread"));
-        }
-        let max_running = o.u32("max_running")?;
-        if max_running == Some(0) {
-            return Err(bad(&o.at("max_running"), "is 0, so nothing would run"));
-        }
+        let threads = o.nonzero_u32("threads", "is 0; a task needs a thread")?;
+        let max_running = o.nonzero_u32("max_running", "is 0, so nothing would run")?;
         let tool = o.string("tool")?;
         if tool
             .as_deref()
@@ -423,8 +447,8 @@ impl Needs {
     }
 }
 
-/// A lane's `run` and `makes`, with what it needs.
-fn lane(o: &mut Obj, method: Option<String>, needs: Needs) -> Result<Lane> {
+/// A method's `run` and `makes`, with what it needs.
+fn parse_method(o: &mut Obj, name: Option<String>, needs: Needs) -> Result<Method> {
     let run = o
         .strings("run")?
         .ok_or_else(|| bad(&o.at("run"), "is required: the command, as a list of words"))?;
@@ -439,23 +463,23 @@ fn lane(o: &mut Obj, method: Option<String>, needs: Needs) -> Result<Lane> {
     }
     let makes = o
         .strings("makes")?
-        .ok_or_else(|| bad(&o.at("makes"), "is required: the files the cell makes"))?;
+        .ok_or_else(|| bad(&o.at("makes"), "is required: the files the task makes"))?;
     if makes.is_empty() {
         return Err(bad(
             &o.at("makes"),
-            "is empty; a cell is done when what it makes is there",
+            "is empty; a task is done when what it makes is there",
         ));
     }
     for (i, m) in makes.iter().enumerate() {
         if m.contains('{') || !is_plain_relative(m) {
             return Err(bad(
                 &o.at(&format!("makes[{i}]")),
-                format!("{m:?} is not a plain path inside the cell's folder"),
+                format!("{m:?} is not a plain path inside the task's folder"),
             ));
         }
     }
-    Ok(Lane {
-        method,
+    Ok(Method {
+        name,
         at: o.at.clone(),
         run,
         makes,
@@ -480,45 +504,47 @@ fn stage(at: String, v: &Value) -> Result<Stage> {
             format!("{name:?} is no stage name (a letter, then letters, digits and _)"),
         ));
     }
+    if RESERVED.contains(&name.as_str()) {
+        return Err(bad(
+            &o.at("name"),
+            format!("{name:?} is a placeholder every task has"),
+        ));
+    }
     let needs = Needs::take(&mut o)?;
-    let methods = o.get("methods");
+    let listed = o.get("methods");
     let has_run = o.map.contains_key("run") || o.map.contains_key("makes");
-    let lanes = match methods {
-        None => vec![lane(&mut o, None, needs)?],
+    let methods = match listed {
+        None => vec![parse_method(&mut o, None, needs)?],
         Some(_) if has_run => {
             return Err(bad(
                 &o.at,
                 "has both run and methods; each method gives its own run and makes",
             ))
         }
-        Some(m) => {
-            let mo = Obj::new(o.at("methods"), m)?;
+        Some(listed) => {
+            let mo = Obj::new(o.at("methods"), listed)?;
             if mo.map.is_empty() {
                 return Err(bad(&mo.at, "names no method"));
             }
-            let mut lanes = Vec::new();
-            for (method, lv) in mo.map {
-                let mut lo = Obj::new(mo.at(method), lv)?;
-                if !is_method(method) {
+            let mut methods = Vec::new();
+            for (name, v) in mo.map {
+                let mut obj = Obj::new(mo.at(name), v)?;
+                if !is_method(name) {
                     return Err(bad(
-                        &lo.at,
-                        format!("{method:?} is no method name (letters, digits, _ and -)"),
+                        &obj.at,
+                        format!("{name:?} is no method name (letters, digits, _ and -)"),
                     ));
                 }
-                let own = Needs::take(&mut lo)?;
-                let l = lane(&mut lo, Some(method.clone()), own.over(&needs))?;
-                lo.done()?;
-                lanes.push(l);
+                let own = Needs::take(&mut obj)?;
+                let m = parse_method(&mut obj, Some(name.clone()), own.over(&needs))?;
+                obj.done()?;
+                methods.push(m);
             }
-            lanes
+            methods
         }
     };
     o.done()?;
-    Ok(Stage {
-        name,
-        methods: methods.is_some(),
-        lanes,
-    })
+    Ok(Stage { name, methods })
 }
 
 fn axis(at: String, name: &str, v: &Value) -> Result<Axis> {
@@ -533,8 +559,11 @@ fn axis(at: String, name: &str, v: &Value) -> Result<Axis> {
     }
     let tuple = items[0].is_object();
     let mut values: Vec<AxisValue> = Vec::new();
+    let first_at = format!("{at}[0]");
+    fn names(v: &AxisValue) -> Vec<&str> {
+        v.bindings.iter().map(|b| b.0.as_str()).collect()
+    }
     for (i, x) in items.iter().enumerate() {
-        let first_at = format!("{at}[0]");
         let at = format!("{at}[{i}]");
         let value = match x {
             Value::String(s) if !tuple => AxisValue {
@@ -557,15 +586,15 @@ fn axis(at: String, name: &str, v: &Value) -> Result<Axis> {
             return Err(bad(&at, format!("{:?} is listed twice", value.label)));
         }
         if let Some(first) = values.first() {
-            let names = |v: &AxisValue| v.bindings.iter().map(|b| b.0.clone()).collect::<Vec<_>>();
-            if names(first) != names(&value) {
+            let (want, got) = (names(first), names(&value));
+            if want != got {
                 return Err(bad(
                     &at,
                     format!(
                         "binds {}, but {first_at} binds {}; each value of an axis binds \
                          the same names",
-                        names(&value).join(", "),
-                        names(first).join(", "),
+                        got.join(", "),
+                        want.join(", "),
                     ),
                 ));
             }
@@ -627,7 +656,7 @@ fn seeds(v: Option<&Value>) -> Result<Seeds> {
         )),
         (Some(l), None) => {
             let Value::Array(items) = l else {
-                return Err(bad("seeds.list", "is not a list"));
+                return Err(bad("seeds.list", format!("is {}, not a list", kind(l))));
             };
             if items.is_empty() {
                 return Err(bad("seeds.list", "is empty, so nothing would run"));
@@ -649,6 +678,119 @@ fn seeds(v: Option<&Value>) -> Result<Seeds> {
     }
 }
 
+/// `gpus`: the GPU ids the benchmark may hand out, each once.
+fn gpu_ids(o: &mut Obj) -> Result<Vec<u32>> {
+    let mut seen: Vec<u32> = Vec::new();
+    let ids = o.list("gpus", "GPU ids (a stage's gpus is a count)", |at, x| {
+        let id = x
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| bad(at, format!("{x} is no GPU id")))?;
+        if seen.contains(&id) {
+            return Err(bad(at, format!("GPU {id} is listed twice")));
+        }
+        seen.push(id);
+        Ok(id)
+    })?;
+    Ok(ids.unwrap_or_default())
+}
+
+/// `disk`: the free space a task needs before it starts, if given.
+fn disk(v: Option<&Value>) -> Result<Option<f64>> {
+    let Some(v) = v else {
+        return Ok(None);
+    };
+    let mut d = Obj::new("disk", v)?;
+    let f = d.number("min_free_gb")?;
+    d.done()?;
+    Ok(f)
+}
+
+/// The placeholders the axes make, each with where it is named: an axis
+/// and the names its values bind. Refuses a name made twice.
+fn placeholders(axes: &[Axis]) -> Result<Vec<(&str, String)>> {
+    let mut names: Vec<(&str, String)> = Vec::new();
+    for a in axes {
+        names.push((&a.name, format!("axes.{}", a.name)));
+        for (b, _) in a.values.first().map_or(&[][..], |v| &v.bindings) {
+            names.push((b, format!("axes.{}[0].{b}", a.name)));
+        }
+    }
+    for (i, (n, at)) in names.iter().enumerate() {
+        if let Some((_, first)) = names[..i].iter().find(|(m, _)| m == n) {
+            return Err(bad(
+                at,
+                format!("{n:?} is already a placeholder, at {first}"),
+            ));
+        }
+    }
+    Ok(names)
+}
+
+/// `inputs`: name to `{"path": P, "dir": D}`.
+fn inputs(o: &mut Obj) -> Result<Vec<Input>> {
+    let mut inputs = Vec::new();
+    let Some(i) = o.get("inputs") else {
+        return Ok(inputs);
+    };
+    let io = Obj::new(o.at("inputs"), i)?;
+    for (name, v) in io.map {
+        let mut x = Obj::new(io.at(name), v)?;
+        if !is_ident(name) {
+            return Err(bad(&x.at, format!("{name:?} cannot name an input")));
+        }
+        let path = x
+            .string("path")?
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| bad(&x.at("path"), "is required"))?;
+        let dir = x.bool("dir")?.unwrap_or(false);
+        x.done()?;
+        inputs.push(Input {
+            name: name.clone(),
+            path,
+            dir,
+        });
+    }
+    Ok(inputs)
+}
+
+/// Refuses a stage named like a placeholder or like an earlier stage.
+fn check_stage_names(stages: &[Stage], names: &[(&str, String)]) -> Result<()> {
+    for (i, s) in stages.iter().enumerate() {
+        let at = format!("stages[{i}].name");
+        if let Some((_, first)) = names.iter().find(|(n, _)| *n == s.name) {
+            return Err(bad(
+                &at,
+                format!("{:?} is already a placeholder, at {first}", s.name),
+            ));
+        }
+        if let Some(j) = stages[..i].iter().position(|t| t.name == s.name) {
+            return Err(bad(&at, format!("{:?} is also stages[{j}]", s.name)));
+        }
+    }
+    Ok(())
+}
+
+/// `plot`: an axis for x, maybe one to facet by, and the metrics to draw.
+fn plot(v: Option<&Value>, axes: &[Axis]) -> Result<Option<Plot>> {
+    let Some(v) = v else {
+        return Ok(None);
+    };
+    let mut po = Obj::new("plot", v)?;
+    let x = po
+        .string("x")?
+        .ok_or_else(|| bad(&po.at("x"), "is required"))?;
+    let facet = po.string("facet")?;
+    let metrics = po.strings("metrics")?.unwrap_or_default();
+    po.done()?;
+    for (k, a) in [("x", Some(&x)), ("facet", facet.as_ref())] {
+        if let Some(a) = a.filter(|a| !axes.iter().any(|ax| &ax.name == *a)) {
+            return Err(bad(&format!("plot.{k}"), format!("{a:?} is no axis")));
+        }
+    }
+    Ok(Some(Plot { x, facet, metrics }))
+}
+
 fn from_value(v: &Value) -> Result<Spec> {
     let mut o = Obj::new("", v).map_err(|_| refuse("the spec is not a JSON object"))?;
     let name = o
@@ -661,55 +803,15 @@ fn from_value(v: &Value) -> Result<Spec> {
             format!("{name:?} starts with a dot; a benchmark's folder is not hidden"),
         ));
     }
-    let cores = o.u32("cores")?;
-    if cores == Some(0) {
-        return Err(bad("cores", "is 0"));
-    }
+    let cores = o.nonzero_u32("cores", "is 0, so nothing could run")?;
     let mem_gb = o.number("mem_gb")?;
-    let gpus = match o.get("gpus") {
-        None => Vec::new(),
-        Some(Value::Array(ids)) => {
-            let mut out: Vec<u32> = Vec::new();
-            for (i, x) in ids.iter().enumerate() {
-                let id = x
-                    .as_u64()
-                    .and_then(|n| u32::try_from(n).ok())
-                    .ok_or_else(|| bad(&format!("gpus[{i}]"), format!("{x} is no GPU id")))?;
-                if out.contains(&id) {
-                    return Err(bad(
-                        &format!("gpus[{i}]"),
-                        format!("GPU {id} is listed twice"),
-                    ));
-                }
-                out.push(id);
-            }
-            out
-        }
-        Some(x) => {
-            return Err(bad(
-                "gpus",
-                format!(
-                    "is {}, not a list of GPU ids (a stage's gpus is a count)",
-                    kind(x)
-                ),
-            ))
-        }
-    };
-    let gpu_slots = o.u32("gpu_slots")?.unwrap_or(1);
-    if gpu_slots == 0 {
-        return Err(bad("gpu_slots", "is 0, so no GPU could be given"));
-    }
+    let gpus = gpu_ids(&mut o)?;
+    let gpu_slots = o
+        .nonzero_u32("gpu_slots", "is 0, so no GPU could be given")?
+        .unwrap_or(1);
     let grace_secs = o.uint("grace_secs")?.unwrap_or(10);
     let max_hours = o.number("max_hours")?;
-    let min_free_gb = match o.get("disk") {
-        None => 10.0,
-        Some(d) => {
-            let mut d = Obj::new("disk", d)?;
-            let f = d.number("min_free_gb")?.unwrap_or(10.0);
-            d.done()?;
-            f
-        }
-    };
+    let min_free_gb = disk(o.get("disk"))?.unwrap_or(10.0);
     if let Some(k) = o.string("keep")? {
         if k != "all" {
             return Err(bad(
@@ -725,58 +827,12 @@ fn from_value(v: &Value) -> Result<Spec> {
             axes.push(axis(ao.at(name), name, v)?);
         }
     }
-    // Bindings are placeholders beside the axes: no name twice.
-    let mut names: Vec<(&str, String)> = Vec::new();
-    for a in &axes {
-        names.push((&a.name, format!("axes.{}", a.name)));
-        for (b, _) in a.values.first().map_or(&[][..], |v| &v.bindings) {
-            names.push((b, format!("axes.{}[0].{b}", a.name)));
-        }
-    }
-    for (i, (n, at)) in names.iter().enumerate() {
-        if let Some((_, first)) = names[..i].iter().find(|(m, _)| m == n) {
-            return Err(bad(
-                at,
-                format!("{n:?} is already a placeholder, at {first}"),
-            ));
-        }
-    }
-    let exclude = match o.get("exclude") {
-        None => Vec::new(),
-        Some(Value::Array(items)) => items
-            .iter()
-            .enumerate()
-            .map(|(i, x)| excluded(&format!("exclude[{i}]"), x, &axes))
-            .collect::<Result<_>>()?,
-        Some(x) => {
-            return Err(bad(
-                "exclude",
-                format!("is {}, not a list of points", kind(x)),
-            ))
-        }
-    };
+    let names = placeholders(&axes)?;
+    let exclude = o
+        .list("exclude", "points", |at, x| excluded(at, x, &axes))?
+        .unwrap_or_default();
     let seeds = seeds(o.get("seeds"))?;
-    let mut inputs = Vec::new();
-    if let Some(i) = o.get("inputs") {
-        let io = Obj::new("inputs", i)?;
-        for (name, v) in io.map {
-            let mut x = Obj::new(io.at(name), v)?;
-            if !is_ident(name) {
-                return Err(bad(&x.at, format!("{name:?} cannot name an input")));
-            }
-            let path = x
-                .string("path")?
-                .filter(|p| !p.is_empty())
-                .ok_or_else(|| bad(&x.at("path"), "is required"))?;
-            let dir = x.bool("dir")?.unwrap_or(false);
-            x.done()?;
-            inputs.push(Input {
-                name: name.clone(),
-                path,
-                dir,
-            });
-        }
-    }
+    let inputs = inputs(&mut o)?;
     let stages = match o.get("stages") {
         Some(Value::Array(items)) if !items.is_empty() => items
             .iter()
@@ -787,60 +843,15 @@ fn from_value(v: &Value) -> Result<Spec> {
         Some(x) => return Err(bad("stages", format!("is {}, not a list", kind(x)))),
         None => return Err(bad("stages", "is required")),
     };
-    for (i, s) in stages.iter().enumerate() {
-        let at = format!("stages[{i}].name");
-        if RESERVED.contains(&s.name.as_str()) {
-            return Err(bad(
-                &at,
-                format!("{:?} is a placeholder every cell has", s.name),
-            ));
-        }
-        if let Some((_, first)) = names.iter().find(|(n, _)| *n == s.name) {
-            return Err(bad(
-                &at,
-                format!("{:?} is already a placeholder, at {first}", s.name),
-            ));
-        }
-        if let Some(j) = stages[..i].iter().position(|t| t.name == s.name) {
-            return Err(bad(&at, format!("{:?} is also stages[{j}]", s.name)));
-        }
-    }
-    let lanes: Vec<&str> = stages
+    check_stage_names(&stages, &names)?;
+    let method_names: Vec<&str> = stages
         .iter()
-        .flat_map(|s| s.lanes.iter().filter_map(|l| l.method.as_deref()))
+        .flat_map(|s| s.methods.iter().filter_map(|m| m.name.as_deref()))
         .collect();
-    let compare = match o.get("compare") {
-        None => Vec::new(),
-        Some(Value::Array(pairs)) => pairs
-            .iter()
-            .enumerate()
-            .map(|(i, p)| compared(&format!("compare[{i}]"), p, &lanes))
-            .collect::<Result<_>>()?,
-        Some(x) => {
-            return Err(bad(
-                "compare",
-                format!("is {}, not a list of pairs", kind(x)),
-            ))
-        }
-    };
-    let plot = match o.get("plot") {
-        None => None,
-        Some(p) => {
-            let mut po = Obj::new("plot", p)?;
-            let x = po
-                .string("x")?
-                .ok_or_else(|| bad("plot.x", "is required"))?;
-            let facet = po.string("facet")?;
-            let metrics = po.strings("metrics")?.unwrap_or_default();
-            po.done()?;
-            for (k, a) in [("x", Some(&x)), ("facet", facet.as_ref())] {
-                if let Some(a) = a.filter(|a| !axes.iter().any(|ax| &ax.name == *a)) {
-                    return Err(bad(&format!("plot.{k}"), format!("{a:?} is no axis")));
-                }
-            }
-            Some(Plot { x, facet, metrics })
-        }
-    };
+    let compare = o
+        .list("compare", "pairs", |at, p| compared(at, p, &method_names))?
+        .unwrap_or_default();
+    let plot = plot(o.get("plot"), &axes)?;
     o.done()?;
     Ok(Spec {
         name,
@@ -886,8 +897,8 @@ fn excluded(at: &str, v: &Value, axes: &[Axis]) -> Result<Vec<(String, String)>>
         .collect()
 }
 
-/// A `compare` pair: two `method/score` names, each method a lane.
-fn compared(at: &str, v: &Value, lanes: &[&str]) -> Result<[String; 2]> {
+/// A `compare` pair: two `method/score` names, each a method of a stage.
+fn compared(at: &str, v: &Value, methods: &[&str]) -> Result<[String; 2]> {
     let pair = match v {
         Value::Array(p) if p.len() == 2 => [&p[0], &p[1]],
         _ => return Err(bad(at, "is not a pair [\"M1/score\", \"M0/score\"]")),
@@ -895,10 +906,12 @@ fn compared(at: &str, v: &Value, lanes: &[&str]) -> Result<[String; 2]> {
     let mut out = [String::new(), String::new()];
     for (i, x) in pair.into_iter().enumerate() {
         let at = format!("{at}[{i}]");
-        let s = x.as_str().ok_or_else(|| bad(&at, "is not a string"))?;
+        let s = x
+            .as_str()
+            .ok_or_else(|| bad(&at, format!("is {}, not a string", kind(x))))?;
         match s.split_once('/') {
-            Some((m, sc)) if lanes.contains(&m) && !sc.is_empty() => out[i] = s.to_string(),
-            Some((m, _)) if !lanes.contains(&m) => {
+            Some((m, sc)) if methods.contains(&m) && !sc.is_empty() => out[i] = s.to_string(),
+            Some((m, _)) if !methods.contains(&m) => {
                 return Err(bad(&at, format!("{m:?} is no method of any stage")))
             }
             _ => return Err(bad(&at, format!("{s:?} is not method/score"))),
@@ -925,12 +938,20 @@ mod tests {
         format!("{ONE}, {extra}}}")
     }
 
+    /// The smallest stage, for specs that vary something else.
+    const STAGE: &str = r#"{"name": "s", "run": ["T"], "makes": ["m"]}"#;
+
+    /// A spec of just `name`, `seeds` and one `stage`.
+    fn spec(name: &str, seeds: &str, stage: &str) -> String {
+        format!(r#"{{"name": "{name}", "seeds": {seeds}, "stages": [{stage}]}}"#)
+    }
+
     #[test]
     fn a_small_spec_takes_its_defaults() {
         let (s, _) = parse(&format!("{ONE}}}")).unwrap();
         assert_eq!(s.name, "N1");
         assert!(matches!(s.seeds, Seeds::Derived { n: 2, base: 0 }));
-        let l = &s.stages[0].lanes[0];
+        let l = &s.stages[0].methods[0];
         assert_eq!(
             (l.threads, l.mem_gb, l.gpus, l.timeout_secs, l.snapshot),
             (1, 0.0, 0, DEFAULT_TIMEOUT_SECS, true)
@@ -966,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn lanes_take_the_stage_values_they_do_not_override() {
+    fn methods_take_the_stage_values_they_do_not_override() {
         let (s, _) = parse(
             r#"{"name": "N1", "seeds": {"list": [7, 3]},
             "stages": [{"name": "fit", "threads": 8, "mem_gb": 12, "timeout": "3h",
@@ -978,9 +999,9 @@ mod tests {
         .unwrap();
         assert!(matches!(&s.seeds, Seeds::List(l) if l == &[7, 3]));
         let st = &s.stages[0];
-        assert!(st.methods);
-        let (m1, m2) = (&st.lanes[0], &st.lanes[1]);
-        assert_eq!(m1.method.as_deref(), Some("M1"));
+        assert!(st.has_methods());
+        let (m1, m2) = (&st.methods[0], &st.methods[1]);
+        assert_eq!(m1.name.as_deref(), Some("M1"));
         assert_eq!(
             (m1.threads, m1.mem_gb, m1.gpus, m1.timeout_secs),
             (8, 12.0, 0, 10_800)
@@ -1050,30 +1071,26 @@ mod tests {
             assert_eq!(refused(&with(extra)), *want, "{extra}");
         }
         assert_eq!(
-            refused(
-                r#"{"name": ".N1", "seeds": {"n": 1}, "stages": [{"name": "s", "run": ["T"], "makes": ["m"]}]}"#
-            ),
+            refused(&spec(".N1", r#"{"n": 1}"#, STAGE)),
             "name: \".N1\" starts with a dot; a benchmark's folder is not hidden"
         );
         assert_eq!(
-            refused(
-                r#"{"name": "N 1", "seeds": {"n": 1}, "stages": [{"name": "s", "run": ["T"], "makes": ["m"]}]}"#
-            ),
+            refused(&spec("N 1", r#"{"n": 1}"#, STAGE)),
             "name: \"N 1\" is not 1 to 40 of A-Z a-z 0-9 . _ -"
         );
         let stages: &[(&str, &str)] = &[
             (r#"{"name": "a-b", "run": ["T"], "makes": ["m"]}"#,
              "stages[0].name: \"a-b\" is no stage name (a letter, then letters, digits and _)"),
-            (r#"{"name": "s", "run": ["T"]}"#, "stages[0].makes: is required: the files the cell makes"),
+            (r#"{"name": "s", "run": ["T"]}"#, "stages[0].makes: is required: the files the task makes"),
             (r#"{"name": "s", "run": [], "makes": ["m"]}"#, "stages[0].run: names no command"),
             (r#"{"name": "s", "run": ["{inputs.X}"], "makes": ["m"]}"#,
              "stages[0].run[0]: \"{inputs.X}\": a command is a tool's name or {legume}"),
             (r#"{"name": "s", "run": ["T"], "makes": ["../m"]}"#,
-             "stages[0].makes[0]: \"../m\" is not a plain path inside the cell's folder"),
+             "stages[0].makes[0]: \"../m\" is not a plain path inside the task's folder"),
             (r#"{"name": "s", "timeout": "30 min", "run": ["T"], "makes": ["m"]}"#,
              "stages[0].timeout: \"30 min\" is no duration (such as 45s, 30m, 3h or 1h30m)"),
             (r#"{"name": "s", "threads": 0, "run": ["T"], "makes": ["m"]}"#,
-             "stages[0].threads: is 0; a cell needs a thread"),
+             "stages[0].threads: is 0; a task needs a thread"),
             (r#"{"name": "s", "run": ["T"], "makes": ["m"], "methods": {"M1": {}}}"#,
              "stages[0]: has both run and methods; each method gives its own run and makes"),
             (r#"{"name": "s", "methods": {"M1": {"run": ["T"], "makes": ["m"], "thread": 2}}}"#,
@@ -1082,11 +1099,10 @@ mod tests {
             (r#"{"name": "s", "methods": {"M.1": {"run": ["T"], "makes": ["m"]}}}"#,
              "stages[0].methods.M.1: \"M.1\" is no method name (letters, digits, _ and -)"),
             (r#"{"name": "out", "run": ["T"], "makes": ["m"]}"#,
-             "stages[0].name: \"out\" is a placeholder every cell has"),
+             "stages[0].name: \"out\" is a placeholder every task has"),
         ];
         for (st, want) in stages {
-            let text = format!(r#"{{"name": "N1", "seeds": {{"n": 1}}, "stages": [{st}]}}"#);
-            assert_eq!(refused(&text), *want, "{st}");
+            assert_eq!(refused(&spec("N1", r#"{"n": 1}"#, st)), *want, "{st}");
         }
         let seeds: &[(&str, &str)] = &[
             (r#"{"n": 0}"#, "seeds.n: is 0, so nothing would run"),
@@ -1105,10 +1121,7 @@ mod tests {
             ),
         ];
         for (sd, want) in seeds {
-            let text = format!(
-                r#"{{"name": "N1", "seeds": {sd}, "stages": [{{"name": "s", "run": ["T"], "makes": ["m"]}}]}}"#
-            );
-            assert_eq!(refused(&text), *want, "{sd}");
+            assert_eq!(refused(&spec("N1", sd, STAGE)), *want, "{sd}");
         }
         assert!(refused("{").starts_with("the spec is not JSON: "));
         assert_eq!(

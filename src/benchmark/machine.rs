@@ -8,7 +8,8 @@ use crate::command::refuse;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-/// What is known of this machine; `None` where it cannot say.
+/// What is known of this machine; `None` where it cannot say. Memory is in
+/// GB (GiB, 2^30 bytes).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Machine {
     pub host: Option<String>,
@@ -16,9 +17,8 @@ pub struct Machine {
     pub kernel: Option<String>,
     pub cores_logical: u32,
     pub cores_physical: Option<u32>,
-    /// GiB.
     pub mem_total_gb: f64,
-    /// GiB, at plan time; not compared between plans.
+    /// At plan time; not compared between plans.
     pub mem_available_gb: Option<f64>,
     pub gpus: Vec<String>,
     pub gpu_driver: Option<String>,
@@ -33,7 +33,8 @@ fn gib(bytes: f64) -> f64 {
     (bytes / GIB * 10.0).round() / 10.0
 }
 
-fn read(path: &str) -> Option<String> {
+/// The text of `path`, if it can be read.
+fn read(path: impl AsRef<std::path::Path>) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
@@ -57,29 +58,14 @@ pub fn here() -> Machine {
     ];
     Machine {
         host,
-        os: read("/etc/os-release").and_then(|t| {
-            t.lines()
-                .find_map(|l| l.strip_prefix("PRETTY_NAME="))
-                .map(|v| v.trim_matches('"').to_string())
-        }),
+        os: os(),
         kernel,
         cores_logical: u32::try_from(cpus).unwrap_or(1).max(1),
         cores_physical: physical_cores(),
         mem_total_gb: gib(pages.max(0) as f64 * page.max(0) as f64),
-        mem_available_gb: read("/proc/meminfo").and_then(|t| {
-            let kb: f64 = t
-                .lines()
-                .find_map(|l| l.strip_prefix("MemAvailable:"))?
-                .trim()
-                .trim_end_matches("kB")
-                .trim()
-                .parse()
-                .ok()?;
-            Some(gib(kb * 1024.0))
-        }),
+        mem_available_gb: mem_available_gb(),
         gpus: gpus(),
-        gpu_driver: read("/proc/driver/nvidia/version")
-            .and_then(|t| t.lines().next().map(|l| l.trim().to_string())),
+        gpu_driver: gpu_driver(),
         legume: env!("CARGO_PKG_VERSION").to_string(),
         features: features
             .iter()
@@ -111,6 +97,35 @@ fn uname() -> (Option<String>, Option<String>) {
     )
 }
 
+/// The OS's PRETTY_NAME in `/etc/os-release`.
+fn os() -> Option<String> {
+    read("/etc/os-release")?
+        .lines()
+        .find_map(|l| l.strip_prefix("PRETTY_NAME="))
+        .map(|v| v.trim_matches('"').to_string())
+}
+
+/// MemAvailable in `/proc/meminfo`, in GB.
+fn mem_available_gb() -> Option<f64> {
+    let kb: f64 = read("/proc/meminfo")?
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .ok()?;
+    Some(gib(kb * 1024.0))
+}
+
+/// The first line of the NVIDIA driver's version file.
+fn gpu_driver() -> Option<String> {
+    read("/proc/driver/nvidia/version")?
+        .lines()
+        .next()
+        .map(|l| l.trim().to_string())
+}
+
 /// Distinct (physical id, core id) pairs in `/proc/cpuinfo`.
 fn physical_cores() -> Option<u32> {
     let text = read("/proc/cpuinfo")?;
@@ -139,7 +154,7 @@ fn gpus() -> Vec<String> {
     let mut found: Vec<(String, String)> = entries
         .flatten()
         .filter_map(|e| {
-            let info = std::fs::read_to_string(e.path().join("information")).ok()?;
+            let info = read(e.path().join("information"))?;
             let model = info
                 .lines()
                 .find_map(|l| l.strip_prefix("Model:"))
@@ -171,8 +186,10 @@ pub fn drift(old: &Machine, new: &Machine) -> Vec<String> {
     );
     diff(
         "physical cores",
-        format!("{:?}", old.cores_physical),
-        format!("{:?}", new.cores_physical),
+        old.cores_physical
+            .map_or("unknown".into(), |n| n.to_string()),
+        new.cores_physical
+            .map_or("unknown".into(), |n| n.to_string()),
     );
     diff(
         "memory",
@@ -187,8 +204,8 @@ pub fn drift(old: &Machine, new: &Machine) -> Vec<String> {
 }
 
 /// What the spec books on `machine`: its cores and memory (GB), with what
-/// to warn of. Refused: memory above MemTotal, a cell's memory above the
-/// benchmark's, a cell's threads above its cores, a cell's GPUs above
+/// to warn of. Refused: memory above MemTotal, a task's memory above the
+/// benchmark's, a task's threads above its cores, a task's GPUs above
 /// those listed.
 pub fn fit(spec: &Spec, machine: &Machine) -> Result<(u32, f64, Vec<String>)> {
     let mut warnings = Vec::new();
@@ -223,24 +240,24 @@ pub fn fit(spec: &Spec, machine: &Machine) -> Result<(u32, f64, Vec<String>)> {
             ));
         }
     }
-    for lane in spec.stages.iter().flat_map(|s| &s.lanes) {
-        if lane.threads > cores {
+    for method in spec.stages.iter().flat_map(|s| &s.methods) {
+        if method.threads > cores {
             return Err(refuse(format!(
                 "{}.threads: {} is more than the benchmark's cores, {cores}",
-                lane.at, lane.threads
+                method.at, method.threads
             )));
         }
-        if lane.mem_gb > mem {
+        if method.mem_gb > mem {
             return Err(refuse(format!(
                 "{}.mem_gb: {} GB is more than {whose}",
-                lane.at, lane.mem_gb
+                method.at, method.mem_gb
             )));
         }
-        if lane.gpus as usize > spec.gpus.len() {
+        if method.gpus as usize > spec.gpus.len() {
             return Err(refuse(format!(
                 "{}.gpus: {} GPUs, and the benchmark lists {} (gpus: [ids])",
-                lane.at,
-                lane.gpus,
+                method.at,
+                method.gpus,
                 spec.gpus.len()
             )));
         }
@@ -286,7 +303,7 @@ mod tests {
     }
 
     // mem_over_total_refused (the rule): memory above MemTotal, and a
-    // cell's above the benchmark's, are refused; without mem_gb the
+    // task's above the benchmark's, are refused; without mem_gb the
     // benchmark books MemAvailable.
     #[test]
     fn mem_over_total_refused() {
@@ -341,6 +358,10 @@ mod tests {
         b.cores_logical = 4;
         b.legume = "1".into();
         assert_eq!(drift(&a, &b), ["cores: 8 -> 4", "legume: 0 -> 1"]);
+    }
+
+    #[test]
+    fn here_sees_cores_memory_and_this_build() {
         let here = here();
         assert!(
             here.cores_logical >= 1 && here.mem_total_gb > 0.0,

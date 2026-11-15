@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{legume, legume_fed, tsv};
+use common::{cis_args, legume, legume_fed, s, stderr, tsv};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, FloatType, Int32Type, Int64Type};
 use parquet::file::properties::WriterProperties;
@@ -14,10 +14,6 @@ use parquet::schema::parser::parse_message_type;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::Arc;
-
-fn stderr(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stderr).into_owned()
-}
 
 /// The definition levels of an OPTIONAL column: 0 for a null.
 fn levels<T>(v: &[Option<T>]) -> Vec<i16> {
@@ -149,10 +145,6 @@ fn near(got: f64, want: f64) {
     assert!((got - want).abs() <= 1e-12, "got {got}, want {want}");
 }
 
-fn s(p: &Path) -> &str {
-    p.to_str().unwrap()
-}
-
 /// A universe of 1000 pairs (GENE{g}, PEAK{p}) with 10 truth pairs, of
 /// which a method scores only two, both true.
 struct FewLinks {
@@ -167,6 +159,16 @@ fn pair(i: usize) -> String {
     format!("GENE{}\tPEAK{i}", i / 10)
 }
 
+/// The truth of the few-links case: ten pairs, one in each hundred.
+fn truth_pairs() -> Vec<String> {
+    (0..10).map(|k| pair(k * 100 + 7)).collect()
+}
+
+/// The scored rows of the few-links case: two of its true pairs.
+fn scored_pairs() -> Vec<String> {
+    vec![format!("{}\t0.9", pair(7)), format!("{}\t0.8", pair(107))]
+}
+
 fn few_links() -> FewLinks {
     let dir = tempfile::tempdir().unwrap();
     let universe = dir.path().join("universe.tsv.gz");
@@ -178,17 +180,8 @@ fn few_links() -> FewLinks {
         "gene\tpeak",
         &(0..1000).map(pair).collect::<Vec<_>>(),
     );
-    let pos: Vec<usize> = (0..10).map(|k| k * 100 + 7).collect();
-    tsv(
-        &truth,
-        "gene\tpeak",
-        &pos.iter().map(|&i| pair(i)).collect::<Vec<_>>(),
-    );
-    tsv(
-        &scores,
-        "gene\tpeak\tscore",
-        &[format!("{}\t0.9", pair(7)), format!("{}\t0.8", pair(107))],
-    );
+    tsv(&truth, "gene\tpeak", &truth_pairs());
+    tsv(&scores, "gene\tpeak\tscore", &scored_pairs());
     FewLinks {
         _dir: dir,
         universe,
@@ -204,9 +197,9 @@ impl FewLinks {
     fn args<'a>(&'a self, more: &[&'a str]) -> Vec<&'a str> {
         let mut a = vec![
             "score",
-            "--scores",
+            "--table",
             s(&self.scores),
-            "--key",
+            "--table-key",
             "gene,peak",
             "--score",
             "M1=score",
@@ -259,6 +252,79 @@ fn few_links_ap_is_0_208_through_the_cli() {
     }
 }
 
+// --table and --table-key name the method's output and its key columns.
+#[test]
+fn the_table_and_its_key_are_named_by_table_and_table_key() {
+    let c = few_links();
+    let a = c.args(&c.universe_args());
+    assert!(a.contains(&"--table") && a.contains(&"--table-key"));
+    let o = legume(a);
+    assert!(o.status.success(), "{}", stderr(&o));
+    near(row(&rows(&c.out), "M1", "auprc").num("value"), 0.208);
+}
+
+// --scores and --key, the older names of --table and --table-key, still
+// work, and score the same.
+#[test]
+fn the_older_scores_and_key_flags_still_work() {
+    let (new, old) = (few_links(), few_links());
+    assert!(legume(new.args(&new.universe_args())).status.success());
+    let renamed: Vec<&str> = old
+        .args(&old.universe_args())
+        .into_iter()
+        .map(|a| match a {
+            "--table" => "--scores",
+            "--table-key" => "--key",
+            a => a,
+        })
+        .collect();
+    let o = legume(renamed);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(
+        std::fs::read(&old.out).unwrap(),
+        std::fs::read(&new.out).unwrap()
+    );
+}
+
+// A flag that takes one value is refused when given twice, an old name
+// counting as its new one, so neither silently wins.
+#[test]
+fn a_flag_given_twice_is_refused() {
+    let c = few_links();
+    let base = c.args(&c.universe_args());
+    let table = base[base.iter().position(|a| *a == "--table").unwrap() + 1];
+    for twice in [["--scores", table], ["--truth", table]] {
+        let mut a = base.clone();
+        a.extend(twice);
+        let o = legume(a);
+        assert_eq!(o.status.code(), Some(2), "{twice:?}: {}", stderr(&o));
+        let one = if twice[0] == "--scores" {
+            "--table"
+        } else {
+            twice[0]
+        };
+        assert!(
+            stderr(&o).contains(&format!("{one} is given twice")),
+            "{}",
+            stderr(&o)
+        );
+        assert!(!c.out.exists());
+    }
+}
+
+// -o and --out are one flag, so both together are given twice.
+#[test]
+fn o_and_out_together_are_refused() {
+    let c = few_links();
+    let mut a = c.args(&c.universe_args());
+    let out = a[a.iter().position(|a| *a == "-o").unwrap() + 1];
+    a.extend(["--out", out]);
+    let o = legume(a);
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(stderr(&o).contains("-o is given twice"), "{}", stderr(&o));
+    assert!(!c.out.exists());
+}
+
 #[test]
 fn the_universe_flag_is_required() {
     let c = few_links();
@@ -285,7 +351,7 @@ fn universe_same_needs_the_truth_and_the_scores_in_one_file() {
 fn truth_outside_the_universe_exits_3_with_a_count_or_is_dropped_and_counted() {
     let c = few_links();
     // Two more truth pairs, outside the universe, one listed twice.
-    let mut pos: Vec<String> = (0..10).map(|k| pair(k * 100 + 7)).collect();
+    let mut pos = truth_pairs();
     pos.push("GENE1000\tPEAK10000".into());
     pos.push("GENE1001\tPEAK10010".into());
     pos.push("GENE1000\tPEAK10000".into());
@@ -312,19 +378,18 @@ fn truth_outside_the_universe_exits_3_with_a_count_or_is_dropped_and_counted() {
 #[test]
 fn scored_rows_outside_the_universe_are_dropped_and_counted() {
     let c = few_links();
-    tsv(
-        &c.scores,
-        "gene\tpeak\tscore",
-        &[
-            format!("{}\t0.9", pair(7)),
-            format!("{}\t0.8", pair(107)),
-            "GENE2000\tPEAK1\t5".into(),
-            "GENE2001\tPEAK2\t5".into(),
-            "GENE2002\tPEAK3\tNaN".into(),
+    let mut scored = scored_pairs();
+    scored.extend(
+        [
+            "GENE2000\tPEAK1\t5",
+            "GENE2001\tPEAK2\t5",
+            "GENE2002\tPEAK3\tNaN",
             // Outside, so never read as a score.
-            "GENE2003\tPEAK4\tnot-a-score".into(),
-        ],
+            "GENE2003\tPEAK4\tnot-a-score",
+        ]
+        .map(String::from),
     );
+    tsv(&c.scores, "gene\tpeak\tscore", &scored);
     let o = legume(c.args(&c.universe_args()));
     assert!(o.status.success(), "{}", stderr(&o));
     let rows = rows(&c.out);
@@ -342,11 +407,45 @@ fn scored_rows_outside_the_universe_are_dropped_and_counted() {
     assert!(!c.out.exists());
 }
 
-/// The arguments of a run over the files in `dir`, keyed `key`, scoring
-/// each of `score` (`NAME=COLUMN`).
-fn keyed_args<'a>(dir: &'a Path, score: &[&'a str]) -> Vec<String> {
+/// The output a run of [`keyed_args`] writes in its folder.
+const OUT: &str = "out.score.tsv";
+
+/// The arguments of a `--universe same` run over the one file `one`, keyed
+/// `key`, its truth the column `planted` above 0.5, scoring each of
+/// `scores` (`NAME=COLUMN`) into `out`.
+fn same_args<'a>(one: &'a Path, key: &'a str, scores: &[&'a str], out: &'a Path) -> Vec<&'a str> {
+    let mut a = vec!["score", "--table", s(one), "--table-key", key];
+    for sc in scores {
+        a.extend(["--score", sc]);
+    }
+    a.extend([
+        "--truth",
+        s(one),
+        "--truth-key",
+        key,
+        "--label",
+        "planted",
+        "--above",
+        "0.5",
+        "--universe",
+        "same",
+        "-o",
+        s(out),
+    ]);
+    a
+}
+
+/// The arguments of a run over `scores.tsv`, `truth.tsv` and `universe.tsv`
+/// in `dir`, each keyed by its column `key`, scoring each of `score`
+/// (`NAME=COLUMN`), into `out.score.tsv`.
+fn keyed_args(dir: &Path, score: &[&str]) -> Vec<String> {
+    keyed_args_of(dir, "scores.tsv", score)
+}
+
+/// [`keyed_args`] with the scores read from the file `scores` in `dir`.
+fn keyed_args_of(dir: &Path, scores: &str, score: &[&str]) -> Vec<String> {
     let at = |f: &str| dir.join(f).to_str().unwrap().to_string();
-    let mut a: Vec<String> = ["score", "--scores", &at("scores.tsv"), "--key", "key"]
+    let mut a: Vec<String> = ["score", "--table", &at(scores), "--table-key", "key"]
         .map(String::from)
         .to_vec();
     for sc in score {
@@ -363,7 +462,7 @@ fn keyed_args<'a>(dir: &'a Path, score: &[&'a str]) -> Vec<String> {
             "--universe-key",
             "key",
             "-o",
-            &at("out.score.tsv"),
+            &at(OUT),
         ]
         .map(String::from),
     );
@@ -384,7 +483,7 @@ fn a_duplicate_score_key_fails_and_dup_max_keeps_the_max() {
         "K1\t0.9", "K2\t0.15", "K3\t0.2", "K1\t0.1", "K2\t0.95", "K3\tNaN",
     ];
     tsv(&d.join("scores.tsv"), "key\tv", &scores);
-    let out = d.join("out.score.tsv");
+    let out = d.join(OUT);
     let mut a = keyed_args(d, &["M1=v"]);
     let o = legume(&a);
     assert!(!o.status.success());
@@ -424,7 +523,7 @@ fn above_is_strict() {
     let said = String::from_utf8_lossy(&o.stdout);
     let truth = "truth: 4 rows, 4 keys, 1 positive in the universe, 0 outside it";
     assert!(said.contains(truth), "{said}");
-    let rows = rows(&d.join("out.score.tsv"));
+    let rows = rows(&d.join(OUT));
     let roc = row(&rows, "M1", "auroc");
     assert_eq!(roc.get("n_pos"), "1");
     assert_eq!(roc.get("n_neg"), "3");
@@ -460,7 +559,7 @@ fn neglog10_of_a_p_outside_0_1_is_an_error() {
         let o = neglog10(dir.path(), &["0.01", bad, "0.5", "1"]);
         assert!(!o.status.success(), "p = {bad} was taken");
         assert!(stderr(&o).contains(bad), "{}", stderr(&o));
-        assert!(!dir.path().join("out.score.tsv").exists());
+        assert!(!dir.path().join(OUT).exists());
     }
 }
 
@@ -476,7 +575,7 @@ fn neglog10_never_turns_a_row_outside_the_universe() {
     std::fs::write(d.join("scores.tsv"), scores).unwrap();
     let o = legume(keyed_args(d, &["M1=neglog10:p"]));
     assert!(o.status.success(), "{}", stderr(&o));
-    let rows = rows(&d.join("out.score.tsv"));
+    let rows = rows(&d.join(OUT));
     let roc = row(&rows, "M1", "auroc");
     assert_eq!(roc.get("outside_scored"), "1");
     near(roc.num("value"), 1.0);
@@ -497,7 +596,7 @@ fn a_label_that_is_not_a_number_is_refused() {
     assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
     assert!(stderr(&o).contains("row 2 of w"), "{}", stderr(&o));
     assert!(stderr(&o).contains("\"yes\""), "{}", stderr(&o));
-    assert!(!d.join("out.score.tsv").exists());
+    assert!(!d.join(OUT).exists());
 }
 
 // p = 0 is +inf: K1 alone at the top, one of four (over 1%), so a warning.
@@ -507,7 +606,7 @@ fn a_p_of_0_is_inf_and_warned_of() {
     let o = neglog10(dir.path(), &["0", "0.5", "1", "NaN"]);
     assert!(o.status.success(), "{}", stderr(&o));
     assert!(stderr(&o).contains("+inf"), "{}", stderr(&o));
-    let rows = rows(&dir.path().join("out.score.tsv"));
+    let rows = rows(&dir.path().join(OUT));
     let ap = row(&rows, "M1", "auprc");
     assert_eq!(ap.get("n_inf"), "1");
     assert_eq!(ap.get("unscored"), "1");
@@ -548,7 +647,7 @@ fn inf_is_warned_of_only_above_1_percent_of_the_scored() {
             "{zeros} of 200 at p = 0: {}",
             stderr(&o)
         );
-        let rows = rows(&dir.path().join("out.score.tsv"));
+        let rows = rows(&dir.path().join(OUT));
         assert_eq!(row(&rows, "M1", "auroc").get("n_inf"), zeros.to_string());
     }
 }
@@ -569,7 +668,7 @@ fn abs_ranks_by_magnitude() {
     let a = keyed_args(d, &["M1=v", "M2=neg:v", "M3=abs:v"]);
     let o = legume(&a);
     assert!(o.status.success(), "{}", stderr(&o));
-    let rows = rows(&d.join("out.score.tsv"));
+    let rows = rows(&d.join(OUT));
     near(row(&rows, "M1", "auroc").num("value"), 0.0);
     near(row(&rows, "M2", "auroc").num("value"), 1.0);
     near(row(&rows, "M3", "auroc").num("value"), 0.5);
@@ -601,7 +700,7 @@ fn a_piped_truth_or_scores_file_is_read_whole() {
         let a = keyed_args(d, &["M1=v"]);
         let o = legume_fed(&a, &d.join(arg), std::fs::read(d.join(fed)).unwrap());
         assert!(o.status.success(), "{fed} piped: {}", stderr(&o));
-        let rows = rows(&d.join("out.score.tsv"));
+        let rows = rows(&d.join(OUT));
         let roc = row(&rows, "M1", "auroc");
         assert_eq!(roc.get("n_pos"), "1", "{fed} piped");
         assert_eq!(roc.get("unscored"), "0", "{fed} piped");
@@ -617,38 +716,18 @@ fn universe_same_reads_its_one_file_once_so_a_pipe_works() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     let one = d.join("one.tsv");
-    let out = d.join("out.score.tsv");
+    let out = d.join(OUT);
     tsv(
         &one,
         "key\tplanted\tv",
         &["K1\t1\t3", "K2\t0\t2", "K3\t1\tNA", "K4\t0\t1"],
     );
-    let a = [
-        "score",
-        "--scores",
-        s(&one),
-        "--key",
-        "key",
-        "--score",
-        "M1=v",
-        "--truth",
-        s(&one),
-        "--truth-key",
-        "key",
-        "--label",
-        "planted",
-        "--above",
-        "0.5",
-        "--universe",
-        "same",
-        "-o",
-        s(&out),
-    ];
+    let a = same_args(&one, "key", &["M1=v"], &out);
     for piped in [false, true] {
         let o = if piped {
-            legume_fed(a, &one, std::fs::read(&one).unwrap())
+            legume_fed(&a, &one, std::fs::read(&one).unwrap())
         } else {
-            legume(a)
+            legume(&a)
         };
         assert!(o.status.success(), "piped {piped}: {}", stderr(&o));
         let said = String::from_utf8_lossy(&o.stdout);
@@ -668,35 +747,15 @@ fn universe_same_reads_its_one_file_once_so_a_pipe_works() {
 fn universe_same_finds_a_key_listed_twice_as_one_item() {
     let dir = tempfile::tempdir().unwrap();
     let one = dir.path().join("one.tsv");
-    let out = dir.path().join("out.score.tsv");
+    let out = dir.path().join(OUT);
     tsv(
         &one,
         "key\tplanted\tv",
         &["K1\t0\t1", "K2\t0\t2", "K1\t1\t3"],
     );
-    let o = legume([
-        "score",
-        "--scores",
-        s(&one),
-        "--key",
-        "key",
-        "--score",
-        "M1=v",
-        "--truth",
-        s(&one),
-        "--truth-key",
-        "key",
-        "--label",
-        "planted",
-        "--above",
-        "0.5",
-        "--universe",
-        "same",
-        "--dup",
-        "max",
-        "-o",
-        s(&out),
-    ]);
+    let mut a = same_args(&one, "key", &["M1=v"], &out);
+    a.extend(["--dup", "max"]);
+    let o = legume(&a);
     assert!(o.status.success(), "{}", stderr(&o));
     let said = String::from_utf8_lossy(&o.stdout);
     for line in [
@@ -738,7 +797,7 @@ fn a_piped_parquet_is_refused_with_the_reason() {
         e.contains("parquet") && e.contains("not a regular file"),
         "{e}"
     );
-    assert!(!d.join("out.score.tsv").exists());
+    assert!(!d.join(OUT).exists());
 }
 
 // pinto `lra-simulate --one`: one parquet holds the pairs (ligand and
@@ -782,29 +841,12 @@ fn an_lra_one_parquet_is_scored_over_its_own_rows() {
         ],
         Compression::SNAPPY,
     );
-    let o = legume([
-        "score",
-        "--scores",
-        s(&one),
-        "--key",
+    let o = legume(same_args(
+        &one,
         "ligand,receptor",
-        "--score",
-        "estimate=t",
-        "--score",
-        "estimate_p=neglog10:p",
-        "--truth",
-        s(&one),
-        "--truth-key",
-        "ligand,receptor",
-        "--label",
-        "planted",
-        "--above",
-        "0.5",
-        "--universe",
-        "same",
-        "-o",
-        s(&out),
-    ]);
+        &["estimate=t", "estimate_p=neglog10:p"],
+        &out,
+    ));
     assert!(o.status.success(), "{}", stderr(&o));
     let rows = rows(&out);
     assert_eq!(rows.len(), 4);
@@ -864,18 +906,7 @@ fn a_chickpea_links_parquet_is_scored_over_the_cis_universe() {
         "chr3:1000-1001",
     ];
     std::fs::write(&peaks, names.join("\n") + "\n").unwrap();
-    let o = legume([
-        "universe",
-        "cis",
-        "--gene-coords",
-        s(&genes),
-        "--peaks",
-        s(&peaks),
-        "--window",
-        "100",
-        "-o",
-        s(&universe),
-    ]);
+    let o = legume(cis_args(&genes, &peaks, &universe, &["--window", "100"]));
     assert!(o.status.success(), "{}", stderr(&o));
 
     tsv(
@@ -911,9 +942,9 @@ fn a_chickpea_links_parquet_is_scored_over_the_cis_universe() {
     );
     let o = legume([
         "score",
-        "--scores",
+        "--table",
         s(&links),
-        "--key",
+        "--table-key",
         "gene,peak",
         "--score",
         "M1=score",
@@ -954,9 +985,7 @@ fn a_null_parquet_score_is_unscored_and_a_null_key_is_refused() {
     tsv(&d.join("universe.tsv"), "key", &["K1", "K2", "K3"]);
     tsv(&d.join("truth.tsv"), "key", &["K1"]);
     let scores = d.join("scores.parquet");
-    let mut a = keyed_args(d, &["M1=v"]);
-    let at = a.iter().position(|x| x.ends_with("scores.tsv")).unwrap();
-    a[at] = s(&scores).to_string();
+    let a = keyed_args_of(d, "scores.parquet", &["M1=v"]);
     let some = |k: &[&str]| k.iter().map(|k| Some(k.to_string())).collect();
     parquet(
         &scores,
@@ -968,13 +997,13 @@ fn a_null_parquet_score_is_unscored_and_a_null_key_is_refused() {
     );
     let o = legume(&a);
     assert!(o.status.success(), "{}", stderr(&o));
-    let rows = rows(&d.join("out.score.tsv"));
+    let rows = rows(&d.join(OUT));
     let roc = row(&rows, "M1", "auroc");
     near(roc.num("value"), 0.0);
     assert_eq!(roc.get("unscored"), "1");
     assert_eq!(roc.get("unscored_pos"), "1");
 
-    std::fs::remove_file(d.join("out.score.tsv")).unwrap();
+    std::fs::remove_file(d.join(OUT)).unwrap();
     let mut keys: Vec<Option<String>> = some(&["K1", "K2", "K3"]);
     keys[1] = None;
     parquet(
@@ -989,7 +1018,7 @@ fn a_null_parquet_score_is_unscored_and_a_null_key_is_refused() {
     assert!(!o.status.success());
     let e = stderr(&o);
     assert!(e.contains("row 2 of key"), "{e}");
-    assert!(!d.join("out.score.tsv").exists());
+    assert!(!d.join(OUT).exists());
 }
 
 #[test]
@@ -998,8 +1027,8 @@ fn score_help_names_every_flag() {
     assert!(o.status.success());
     let help = String::from_utf8_lossy(&o.stdout);
     for flag in [
-        "--scores",
-        "--key",
+        "--table",
+        "--table-key",
         "--score",
         "--truth",
         "--truth-key",

@@ -1,14 +1,15 @@
 //! `legume score`'s command line.
 
 use super::{run, Dup, Outside, Score, Spec, Transform, Universe};
-use crate::command::{flag_pairs, one_of, required, usage};
+use crate::command::{canonical_flags, flag_pairs, one_of, required, usage, Flag};
 use anyhow::Result;
 use std::io::Write;
 use std::path::PathBuf;
 
 /// `legume score`'s usage.
 pub const USAGE: &str = "\
-legume score --scores F --key C1[,C2] --score NAME=[neg:|abs:|neglog10:]COL ...
+legume score --table F --table-key C1[,C2]
+             --score NAME=[neg:|abs:|neglog10:]COL ...
              --truth F --truth-key C1[,C2] [--label COL --above X]
              (--universe F --universe-key C1[,C2] | --universe same)
              [--truth-outside fail|drop] [--scored-outside drop|fail] [--dup fail|max]
@@ -18,7 +19,8 @@ A method's scores against a truth over a universe: AUROC and average
 precision for each --score, with the counts beside them. Tables are TSV
 with a header (gzipped or not) or parquet.
 
-  --scores F         the method's output; --key names its key columns
+  --table F          the method's output; --table-key names its key columns
+                     (--scores and --key, their older names, still work)
   --score NAME=COL   a score: higher is more likely true. neg:COL, abs:COL and
                      neglog10:COL (a p value in [0, 1]; p = 0 is +inf) turn a
                      column into one. Repeat for more scores
@@ -26,17 +28,17 @@ with a header (gzipped or not) or parquet.
                      or, with --label COL --above X, the rows whose COL is
                      strictly above X
   --universe F       every item the method could have scored, keyed by
-                     --universe-key; `same` when the scores file is also the
-                     truth, keyed by --key as --truth-key, and lists every
-                     item. Required: an item the method left unscored ranks
-                     last, it is never dropped
+                     --universe-key; `same` when the table is also the
+                     truth, keyed by --table-key as --truth-key, and lists
+                     every item. Required: an item the method left unscored
+                     ranks last, it is never dropped
   --truth-outside    a true item outside the universe: fail (exit 3, the
                      default) or drop (counted as outside_pos)
   --scored-outside   a scored row outside the universe: drop (the default,
                      counted as outside_scored) or fail (exit 3)
   --dup              a key scored twice: fail (the default) or max (its
                      highest score)
-  -o OUT             the table: score metric value part n_pos n_neg n_universe
+  -o OUT             the output: score metric value part n_pos n_neg n_universe
                      pos_rate tied_share unscored unscored_pos outside_pos
                      outside_scored n_inf, a row for each score's auroc and
                      auprc";
@@ -53,6 +55,24 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
 
 /// What `--truth-outside` and `--scored-outside` take.
 const OUTSIDE: &[(&str, Outside)] = &[("fail", Outside::Fail), ("drop", Outside::Drop)];
+
+/// The flags `legume score` takes, `--scores` and `--key` the older names
+/// of `--table` and `--table-key`.
+const FLAGS: &[Flag] = &[
+    Flag::once(&["--table", "--scores"]),
+    Flag::once(&["--table-key", "--key"]),
+    Flag::many(&["--score"]),
+    Flag::once(&["--truth"]),
+    Flag::once(&["--truth-key"]),
+    Flag::once(&["--label"]),
+    Flag::once(&["--above"]),
+    Flag::once(&["--universe"]),
+    Flag::once(&["--universe-key"]),
+    Flag::once(&["--truth-outside"]),
+    Flag::once(&["--scored-outside"]),
+    Flag::once(&["--dup"]),
+    Flag::once(&["-o", "--out"]),
+];
 
 /// A comma-separated list of column names.
 fn columns(flag: &str, s: &str) -> Result<Vec<String>> {
@@ -96,10 +116,10 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
     let Some(pairs) = flag_pairs(args)? else {
         return Ok(None);
     };
-    for (flag, v) in pairs {
+    for (flag, v) in canonical_flags(FLAGS, pairs)? {
         match flag {
-            "--scores" => scores = Some(PathBuf::from(v)),
-            "--key" => key = Some(columns(flag, v)?),
+            "--table" => scores = Some(PathBuf::from(v)),
+            "--table-key" => key = Some(columns(flag, v)?),
             "--score" => list.push(score(v)?),
             "--truth" => truth = Some(PathBuf::from(v)),
             "--truth-key" => truth_key = Some(columns(flag, v)?),
@@ -113,15 +133,15 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
             "--truth-outside" => truth_outside = one_of(flag, v, OUTSIDE)?,
             "--scored-outside" => scored_outside = one_of(flag, v, OUTSIDE)?,
             "--dup" => dup = one_of(flag, v, &[("fail", Dup::Fail), ("max", Dup::Max)])?,
-            "-o" | "--out" => out = Some(PathBuf::from(v)),
-            _ => return Err(usage(format!("unknown argument {flag}"))),
+            "-o" => out = Some(PathBuf::from(v)),
+            _ => unreachable!("{flag} is in FLAGS"),
         }
     }
     let universe = match (required(universe, "--universe")?.as_str(), universe_key) {
         ("same", None) => Universe::Same,
         ("same", Some(_)) => {
             return Err(usage(
-                "--universe same takes no --universe-key: it is the scores' own keys",
+                "--universe same takes no --universe-key: it is the table's own keys",
             ))
         }
         (path, Some(key)) => Universe::File {
@@ -144,8 +164,8 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
         }
     }
     let spec = Spec {
-        scores: required(scores, "--scores")?,
-        key: required(key, "--key")?,
+        scores: required(scores, "--table")?,
+        key: required(key, "--table-key")?,
         score: list,
         truth: required(truth, "--truth")?,
         truth_key: required(truth_key, "--truth-key")?,
@@ -158,7 +178,7 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
     };
     if spec.universe == Universe::Same && spec.truth_key != spec.key {
         return Err(usage(
-            "--universe same takes --truth-key as --key: the one file is read by its keys once",
+            "--universe same takes --truth-key as --table-key: the one file is read by its keys once",
         ));
     }
     let arity = spec.key.len();
@@ -168,7 +188,7 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
     };
     if spec.truth_key.len() != arity || other != arity {
         return Err(usage(
-            "--key, --truth-key and --universe-key name as many columns each",
+            "--table-key, --truth-key and --universe-key name as many columns each",
         ));
     }
     Ok(Some(spec))
@@ -177,16 +197,13 @@ fn parse(args: &[String]) -> Result<Option<Spec>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::code;
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_string).collect()
     }
 
-    fn code(e: anyhow::Error) -> i32 {
-        crate::command::code(&e)
-    }
-
-    const BASE: &str = "--scores s.tsv --key K --truth t.tsv --truth-key K -o o.tsv";
+    const BASE: &str = "--table s.tsv --table-key K --truth t.tsv --truth-key K -o o.tsv";
 
     #[test]
     fn a_score_takes_its_transform_before_the_column() {
@@ -199,7 +216,7 @@ mod tests {
         assert_eq!(score("M3=abs:t").unwrap().transform, Transform::Abs);
         assert_eq!(score("M4=t").unwrap().transform, Transform::Plain);
         for bad in ["M1", "=t", "M1=", "M1=neg:", "M 1=t"] {
-            assert_eq!(code(score(bad).unwrap_err()), 2, "{bad}");
+            assert_eq!(code(&score(bad).unwrap_err()), 2, "{bad}");
         }
     }
 
@@ -220,12 +237,13 @@ mod tests {
             format!("{BASE} --score M1=v --universe same --truth-outside keep"),
             format!("{BASE} --score M1=v --universe u.tsv --universe-key K,L"),
             format!("{BASE} --score M1=v --universe same --bogus 1"),
-            format!("{BASE} --score M1=v --universe same --key"),
-            // The one file is read by --key alone, so --truth-key must be it.
+            format!("{BASE} --score M1=v --universe same --table-key"),
+            // The one file is read by --table-key alone, so --truth-key must
+            // be it.
             format!("{BASE} --score M1=v --universe same --truth-key L"),
-            format!("{BASE} --key K,L --truth-key L,K --score M1=v --universe same"),
+            format!("{BASE} --table-key K,L --truth-key L,K --score M1=v --universe same"),
         ] {
-            assert_eq!(code(parse(&args(&bad)).unwrap_err()), 2, "{bad}");
+            assert_eq!(code(&parse(&args(&bad)).unwrap_err()), 2, "{bad}");
         }
     }
 }

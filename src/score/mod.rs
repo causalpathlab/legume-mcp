@@ -19,7 +19,7 @@ use crate::table::{self, Keyed, Numbers};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The output's columns, in order: the header, and the cells of each
 /// [`ScoreRow`].
@@ -96,13 +96,15 @@ enum Transform {
 }
 
 impl Transform {
+    /// `x` transformed. Never given NaN: a NaN cell is no score and is
+    /// skipped before this.
     fn apply(self, x: f64) -> Result<f64> {
         Ok(match self {
             Transform::Plain => x,
             Transform::Neg => -x,
             Transform::Abs => x.abs(),
             Transform::NegLog10 => {
-                if !(0.0..=1.0).contains(&x) && !x.is_nan() {
+                if !(0.0..=1.0).contains(&x) {
                     bail!("neglog10 of {x}: a p value is in [0, 1]");
                 }
                 -x.log10()
@@ -175,16 +177,25 @@ struct Items<'a> {
 }
 
 impl<'a> Items<'a> {
-    /// The items of the rows `keys`; with `rows`, each row's item pushed
-    /// onto it as it is found.
-    fn new(keys: &'a [String], mut rows: Option<&mut Vec<Option<usize>>>) -> Self {
+    /// The items of the rows `keys`.
+    fn new(keys: &'a [String]) -> Self {
+        Self::build(keys, |_| {})
+    }
+
+    /// The items of the rows `keys`, and each row's item, found in the one
+    /// pass that makes them.
+    fn of_rows(keys: &'a [String]) -> (Self, Vec<Option<usize>>) {
+        let mut at = Vec::with_capacity(keys.len());
+        let items = Self::build(keys, |i| at.push(Some(i)));
+        (items, at)
+    }
+
+    /// The items of the rows `keys`, telling `each` every row's item.
+    fn build(keys: &'a [String], mut each: impl FnMut(usize)) -> Self {
         let mut index = HashMap::with_capacity(keys.len());
         for k in keys {
             let next = index.len();
-            let at = *index.entry(k.as_str()).or_insert(next);
-            if let Some(rows) = rows.as_deref_mut() {
-                rows.push(Some(at));
-            }
+            each(*index.entry(k.as_str()).or_insert(next));
         }
         Items {
             index,
@@ -213,9 +224,29 @@ struct Truth {
     outside_pos: usize,
 }
 
+/// Where the cell at `row` (from 0) of `column` in the file at `path` is,
+/// as a refusal names it.
+fn whence(row: usize, column: &str, path: &Path) -> String {
+    format!("row {} of {column} in {}", row + 1, path.display())
+}
+
+/// Refuses the first cell of `col` that is not a number among the rows
+/// `read` keeps, naming the row, its `column` and the file at `path`.
+fn numbers_only(
+    col: &Numbers,
+    read: impl Fn(usize) -> bool,
+    column: &str,
+    path: &Path,
+) -> Result<()> {
+    if let Some((row, cell)) = col.first_bad(read) {
+        bail!("{}: {cell:?} is not a number", whence(row, column, path));
+    }
+    Ok(())
+}
+
 /// The truth of the rows `keys`, each at its item `at` among `items`
-/// items: each row positive or, with `--label`, positive when its cell of
-/// `label` is above the value.
+/// items: each row positive or, with `--label` and its column's cells
+/// `label`, positive when its cell is above the label's value.
 fn truth_of(
     spec: &Spec,
     keys: &[String],
@@ -223,19 +254,11 @@ fn truth_of(
     label: Option<&Numbers>,
     items: usize,
 ) -> Result<Truth> {
-    let label = match (&spec.label, label) {
-        (Some((col, above)), Some(values)) => {
-            if let Some((row, cell)) = values.first_bad(|_| true) {
-                bail!(
-                    "row {} of {col} in {}: {cell:?} is not a number",
-                    row + 1,
-                    spec.truth.display()
-                );
-            }
-            Some((&values.values, *above))
-        }
-        _ => None,
-    };
+    let label = spec.label.as_ref().zip(label);
+    if let Some(((column, _), values)) = label {
+        numbers_only(values, |_| true, column, &spec.truth)?;
+    }
+    let label = label.map(|((_, above), values)| (&values.values, *above));
     let (mut labels, mut seen) = (vec![false; items], vec![false; items]);
     // Each key outside the universe, and whether it is positive.
     let mut outside: HashMap<&str, bool> = HashMap::new();
@@ -314,24 +337,17 @@ fn score_of(
     at: &[Option<usize>],
     values: &mut [Option<f64>],
 ) -> Result<()> {
-    let whence = |row: usize| {
-        format!(
-            "row {} of {} in {}",
-            row + 1,
-            s.column,
-            spec.scores.display()
-        )
-    };
-    if let Some((row, cell)) = col.first_bad(|row| at[row].is_some()) {
-        bail!("{}: {cell:?} is not a number", whence(row));
-    }
+    numbers_only(col, |row| at[row].is_some(), &s.column, &spec.scores)?;
     values.fill(None);
     for (row, (&at, &x)) in at.iter().zip(&col.values).enumerate() {
         // NaN is no score, so leaves the item as it was.
         let Some(at) = at.filter(|_| !x.is_nan()) else {
             continue;
         };
-        let x = s.transform.apply(x).with_context(|| whence(row))?;
+        let x = s
+            .transform
+            .apply(x)
+            .with_context(|| whence(row, &s.column, &spec.scores))?;
         values[at] = higher(values[at], Some(x));
     }
     Ok(())
@@ -349,10 +365,11 @@ fn outside(count: usize, policy: Outside, what: &str, flag: &str, column: &str) 
     Ok(())
 }
 
-/// The universe `spec` names, the truth over it and the score rows' items,
-/// from the scores read, saying what it counted on `out`: the score
-/// columns, the truth and the rows. The keys are left here, so only those
-/// are held while the scores are ranked.
+/// The universe `spec` names, read with the truth over it: says on `out`
+/// how many universe items, truth rows and score rows it counted, and
+/// returns the score columns, the truth and each score row's item. The
+/// keys are dropped here, so only the number columns are held while the
+/// scores are ranked.
 fn over_universe(
     spec: &Spec,
     scores: Keyed,
@@ -362,18 +379,18 @@ fn over_universe(
     let same_label = numbers.split_off(spec.score.len());
     let same = spec.universe == Universe::Same;
     let (universe_keys, truth_table);
-    let mut own = Vec::new();
-    let (items, truth_keys, truth_label) = match &spec.universe {
+    let (items, own, truth_keys, truth_label) = match &spec.universe {
         Universe::Same => {
-            own.reserve(keys.len());
-            (Items::new(&keys, Some(&mut own)), &keys, same_label.first())
+            let (items, own) = Items::of_rows(&keys);
+            (items, Some(own), &keys, same_label.first())
         }
         Universe::File { path, key } => {
             universe_keys = table::read_keyed(path, key, &[])?.keys;
             truth_table =
                 table::read_keyed(&spec.truth, &spec.truth_key, spec.label_column().as_slice())?;
             (
-                Items::new(&universe_keys, None),
+                Items::new(&universe_keys),
+                None,
                 &truth_table.keys,
                 truth_table.numbers.first(),
             )
@@ -386,15 +403,15 @@ fn over_universe(
         items.rows - items.len()
     )?;
 
-    let at = if same { own } else { items.find(&keys) };
-    let found;
-    let truth_at = if same {
-        &at
-    } else {
-        found = items.find(truth_keys);
-        &found
-    };
-    let truth = truth_of(spec, truth_keys, truth_at, truth_label, items.len())?;
+    let at = own.unwrap_or_else(|| items.find(&keys));
+    let found = (!same).then(|| items.find(truth_keys));
+    let truth = truth_of(
+        spec,
+        truth_keys,
+        found.as_deref().unwrap_or(&at),
+        truth_label,
+        items.len(),
+    )?;
     let positives = truth.labels.iter().filter(|&&p| p).count();
     writeln!(
         out,
@@ -434,7 +451,7 @@ fn run(spec: &Spec, out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
     let same = spec.universe == Universe::Same;
     if same && spec.scores != spec.truth && !crate::same_file(&spec.scores, &spec.truth) {
         return Err(usage(
-            "--universe same needs --truth and --scores to be one file; give the universe as a \
+            "--universe same needs --truth and --table to be one file; give the universe as a \
              file otherwise",
         ));
     }

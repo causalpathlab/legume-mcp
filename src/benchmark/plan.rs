@@ -1,24 +1,24 @@
-//! A spec expanded to its cells: the grid (plain axes times tuple axes,
+//! A spec expanded to its tasks: the grid (plain axes times tuple axes,
 //! less `exclude`), times the replicates, times the stages and their
-//! lanes. Each cell gets its id, its seeds, its argv with the placeholders
-//! filled, and its run key.
+//! methods. Each task gets its id, its seeds, its argv with the
+//! placeholders filled, and its task key.
 //!
-//! - **Cell id.** `<8 hex of the canonical point>.r<rep>.<stage>[-<method>]`.
+//! - **Task id.** `<8 hex of the canonical point>.r<rep>.<stage>[-<method>]`.
 //!   The point is its axes' labels, so an id stays when values are added.
 //! - **Seeds.** `rep_seed = splitmix64(base ^ splitmix64(rep)) & 0x7fffffff`
 //!   (or the listed seed), shared by every point of a replicate, and
 //!   `seed = splitmix64(rep_seed ^ fnv64("<stage>/<method>")) & 0x7fffffff`,
 //!   the method empty in a stage without methods, so no two stages share
 //!   a stream.
-//! - **Lanes.** In a later stage, a lane sees `{<stage>}` as the folder of
-//!   that stage's lane of the same name. A lane the upstream stage does not
-//!   have may not use its placeholder, nor may a stage without methods use
-//!   one with.
+//! - **Methods.** In a later stage, a method sees `{<stage>}` as the
+//!   folder of that stage's method of the same name. A method the
+//!   upstream stage does not have may not use its placeholder, nor may a
+//!   stage without methods use one with.
 //! - **Key.** FNV-1a 128 over the canonical JSON of the stage, the method,
 //!   the argv template, the thread variables as templates, the tool's
 //!   content key (and legume's, when another tool's argv embeds
 //!   `{legume}`), the declared inputs it reads (by content, named by
-//!   `{inputs.NAME}` or by a path under one) and the keys of the cells it
+//!   `{inputs.NAME}` or by a path under one) and the keys of the tasks it
 //!   reads. The template keeps every path placeholder
 //!   (`{out}`, `{<stage>}`, `{glob:...}`, `{inputs.NAME}`, `{legume}`) and
 //!   `{threads}` and `{gpu}` as written: what they name is keyed by
@@ -26,13 +26,14 @@
 //! - **Braces.** `{{` and `}}` write one brace (an awk program, a JSON
 //!   value); the key's template keeps them doubled, apart from a
 //!   placeholder.
-//! - **Globs.** `{glob:<stage>/<pattern>}` matches in the upstream cell's
-//!   folder when the cell starts ([`glob`]); the plan's argv holds it with
-//!   the folder made absolute.
+//! - **Globs.** `{glob:<stage>/<pattern>}` names files in the upstream
+//!   task's folder; the plan's argv holds it with the folder made
+//!   absolute. [`glob`] is what expands it when the task starts, once
+//!   tasks run; nothing calls it yet.
 
 use super::key;
 use super::spec::{
-    bad, is_plain_relative, AxisValue, Lane, Seeds, Spec, Stage, RESERVED, THREAD_VARS,
+    bad, is_plain_relative, AxisValue, Method, Seeds, Spec, Stage, RESERVED, THREAD_VARS,
 };
 use super::tools::Resolved;
 use crate::command::refuse;
@@ -42,6 +43,7 @@ use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 /// The tool word of `{legume}`, this program.
 pub const LEGUME: &str = "{legume}";
@@ -63,9 +65,9 @@ impl Context<'_> {
     }
 }
 
-/// One cell, as `plan.json` lists it.
+/// One task, as `plan.json` lists it.
 #[derive(Clone, Debug, Serialize)]
-pub struct Cell {
+pub struct Task {
     pub id: String,
     pub point: BTreeMap<String, String>,
     pub rep: u32,
@@ -127,17 +129,21 @@ fn segments(token: &str) -> std::result::Result<Vec<Seg<'_>>, String> {
     Ok(out)
 }
 
-/// `token` names `{legume}`.
-fn uses_legume(token: &str) -> bool {
-    segments(token)
-        .unwrap_or_default()
-        .contains(&Seg::Name("legume"))
+/// Another tool's argv names `{legume}`: `run[1..]`, since `run[0]` is
+/// replaced by the tool's own path.
+fn embeds_legume(method: &Method) -> bool {
+    method.tool_word() != LEGUME
+        && method.run[1..].iter().any(|t| {
+            segments(t)
+                .unwrap_or_default()
+                .contains(&Seg::Name("legume"))
+        })
 }
 
 /// What a placeholder names.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Ph<'a> {
-    /// An axis, a binding, `rep`, `rep_seed` or `seed`: a value of the cell.
+    /// An axis, a binding, `rep`, `rep_seed` or `seed`: a value of the task.
     Value(&'a str),
     Method,
     Threads,
@@ -182,12 +188,12 @@ fn classify<'a>(name: &'a str, spec: &Spec) -> Option<Ph<'a>> {
         .then_some(Ph::Stage(name))
 }
 
-/// Each word of `lane`'s argv, with where it is, as its parts; refused
+/// Each word of `method`'s argv, with where it is, as its parts; refused
 /// when one does not parse or a placeholder names nothing.
-fn words<'a>(spec: &Spec, lane: &'a Lane) -> Result<Vec<(String, Vec<Part<'a>>)>> {
+fn words<'a>(spec: &Spec, method: &'a Method) -> Result<Vec<(String, Vec<Part<'a>>)>> {
     let mut out = Vec::new();
-    for (i, token) in lane.run.iter().enumerate() {
-        let at = format!("{}.run[{i}]", lane.at);
+    for (i, token) in method.run.iter().enumerate() {
+        let at = format!("{}.run[{i}]", method.at);
         let mut parts = Vec::new();
         for seg in segments(token).map_err(|e| bad(&at, e))? {
             let name = match seg {
@@ -222,22 +228,22 @@ fn words<'a>(spec: &Spec, lane: &'a Lane) -> Result<Vec<(String, Vec<Part<'a>>)>
 // refuses and `warnings` warns of for them.
 
 /// A pinto `lra-*` run, which sizes itself to the memory it sees free.
-fn is_pinto_lra(lane: &Lane) -> bool {
-    base(lane.tool_word()).starts_with("pinto")
-        && lane.run.get(1).is_some_and(|s| s.starts_with("lra-"))
+fn is_pinto_lra(method: &Method) -> bool {
+    base(method.tool_word()).starts_with("pinto")
+        && method.run.get(1).is_some_and(|s| s.starts_with("lra-"))
 }
 
 /// A data-beans run, whose per-cell streams are `rseed + offset + j`.
-fn is_data_beans(lane: &Lane) -> bool {
-    base(lane.tool_word()).starts_with("data-beans")
+fn is_data_beans(method: &Method) -> bool {
+    base(method.tool_word()).starts_with("data-beans")
 }
 
 /// A data-beans multiome run with `--reference-atac`, whose pair truth no
 /// universe holds.
-fn is_reference_multiome(lane: &Lane) -> bool {
-    is_data_beans(lane)
-        && lane.run.iter().any(|t| t == "multiome")
-        && lane
+fn is_reference_multiome(method: &Method) -> bool {
+    is_data_beans(method)
+        && method.run.iter().any(|t| t == "multiome")
+        && method
             .run
             .iter()
             .any(|t| t == "--reference-atac" || t.starts_with("--reference-atac="))
@@ -249,49 +255,50 @@ pub(super) fn base(word: &str) -> &str {
 }
 
 /// The spec's rules between its parts: every placeholder names something,
-/// each in a place it may be used (the lane rules), the last stage of each
-/// lane makes one score, pinto `lra-*` books its memory, and no score reads
+/// each in a place it may be used (the method rules), the last stage of each
+/// method makes one score, pinto `lra-*` books its memory, and no score reads
 /// the pair truth of a reference-ATAC multiome.
 pub fn check(spec: &Spec) -> Result<()> {
-    for (si, stage) in spec.stages.iter().enumerate() {
-        for lane in &stage.lanes {
-            let placeholders = words(spec, lane)?.into_iter().flat_map(|(at, parts)| {
-                parts.into_iter().filter_map(move |p| match p {
-                    Part::Ph(name, ph) => Some((at.clone(), name, ph)),
-                    Part::Text(_) => None,
-                })
-            });
-            for (at, name, ph) in placeholders {
-                match ph {
-                    Ph::Method if lane.method.is_none() => {
-                        return Err(bad(&at, "{method} is for a stage with methods"))
-                    }
-                    Ph::Gpu if lane.gpus == 0 => {
-                        return Err(bad(&at, "{gpu} names a GPU, and this cell asks for none"))
-                    }
-                    Ph::Input(n) if !spec.inputs.iter().any(|i| i.name == n) => {
-                        return Err(bad(&at, format!("{{{name}}}: {n:?} is no declared input")))
-                    }
-                    Ph::Stage(t) => upstream(spec, si, lane, t, &at, name)?,
-                    Ph::Glob(t, pattern) => {
-                        if !is_plain_relative(pattern) {
-                            return Err(bad(
-                                &at,
-                                format!("{{{name}}}: a glob is {{glob:STAGE/PATTERN}}, the pattern inside the stage's folder"),
-                            ));
-                        }
-                        upstream(spec, si, lane, t, &at, name)?;
-                    }
-                    _ => {}
+    let methods = spec.stages.iter().enumerate();
+    let methods = methods.flat_map(|(si, s)| s.methods.iter().map(move |m| (si, m)));
+    for (si, method) in methods {
+        let words = words(spec, method)?;
+        let placeholders = words.iter().flat_map(|(at, parts)| {
+            parts.iter().filter_map(move |part| match *part {
+                Part::Ph(name, ph) => Some((at, name, ph)),
+                Part::Text(_) => None,
+            })
+        });
+        for (at, name, ph) in placeholders {
+            match ph {
+                Ph::Method if method.name.is_none() => {
+                    return Err(bad(at, "{method} is for a stage with methods"))
                 }
+                Ph::Gpu if method.gpus == 0 => {
+                    return Err(bad(at, "{gpu} names a GPU, and this task asks for none"))
+                }
+                Ph::Input(n) if !spec.inputs.iter().any(|i| i.name == n) => {
+                    return Err(bad(at, format!("{{{name}}}: {n:?} is no declared input")))
+                }
+                Ph::Stage(t) => upstream(spec, si, method, t, at, name)?,
+                Ph::Glob(t, pattern) => {
+                    if !is_plain_relative(pattern) {
+                        return Err(bad(
+                            at,
+                            format!("{{{name}}}: a glob is {{glob:STAGE/PATTERN}}, the pattern inside the stage's folder"),
+                        ));
+                    }
+                    upstream(spec, si, method, t, at, name)?;
+                }
+                _ => {}
             }
-            if is_pinto_lra(lane) && lane.mem_gb <= 0.0 {
-                return Err(bad(
-                    &format!("{}.mem_gb", lane.at),
-                    "is required for pinto lra-*: it sizes itself to the memory it sees free, \
-                     so each cell books what it takes",
-                ));
-            }
+        }
+        if is_pinto_lra(method) && method.mem_gb <= 0.0 {
+            return Err(bad(
+                &format!("{}.mem_gb", method.at),
+                "is required for pinto lra-*: it sizes itself to the memory it sees free, \
+                 so each task books what it takes",
+            ));
         }
     }
     scores_made(spec)?;
@@ -300,7 +307,7 @@ pub fn check(spec: &Spec) -> Result<()> {
 }
 
 /// The grid has a point, and each point an id of its own (two of one id
-/// would share their cells' folders).
+/// would share their tasks' folders).
 fn grid(spec: &Spec) -> Result<()> {
     let points = points(spec);
     if points.is_empty() {
@@ -326,9 +333,9 @@ fn grid(spec: &Spec) -> Result<()> {
     Ok(())
 }
 
-/// `{<t>}` (or a glob in `t`) used at `at`, by `lane` of stage `si`: `t` is
-/// an earlier stage, and a lane of it this lane may read.
-fn upstream(spec: &Spec, si: usize, lane: &Lane, t: &str, at: &str, name: &str) -> Result<()> {
+/// `{<t>}` (or a glob in `t`) used at `at`, by `method` of stage `si`: `t` is
+/// an earlier stage, and a method of it this method may read.
+fn upstream(spec: &Spec, si: usize, method: &Method, t: &str, at: &str, name: &str) -> Result<()> {
     let Some(ti) = spec.stages.iter().position(|s| s.name == t) else {
         return Err(bad(at, format!("{{{name}}}: {t:?} is no stage")));
     };
@@ -345,65 +352,66 @@ fn upstream(spec: &Spec, si: usize, lane: &Lane, t: &str, at: &str, name: &str) 
         ));
     }
     let up = &spec.stages[ti];
-    if !up.methods {
+    if !up.has_methods() {
         return Ok(());
     }
-    let lanes = || lane_names(up).join(", ");
-    match &lane.method {
+    let names = || method_names(up).join(", ");
+    match &method.name {
         None => Err(bad(
             at,
             format!(
-                "{{{name}}}: stage {t} has a lane per method ({}), and this stage has none, \
+                "{{{name}}}: stage {t} has methods ({}), and this stage has none, \
                  so it names no one of them",
-                lanes()
+                names()
             ),
         )),
-        Some(m) if !up.lanes.iter().any(|l| l.method.as_ref() == Some(m)) => Err(bad(
+        Some(m) if !up.methods.iter().any(|o| o.name.as_ref() == Some(m)) => Err(bad(
             at,
             format!(
-                "{{{name}}}: stage {t} has no lane {m} (its lanes: {}); \
-                 a lane that skips {t} may not use {{{t}}}",
-                lanes()
+                "{{{name}}}: stage {t} has no method {m} (its methods: {}); \
+                 a method that skips {t} may not use {{{t}}}",
+                names()
             ),
         )),
         Some(_) => Ok(()),
     }
 }
 
-fn lane_names(stage: &Stage) -> Vec<&str> {
+/// The names of `stage`'s methods.
+fn method_names(stage: &Stage) -> Vec<&str> {
     stage
-        .lanes
+        .methods
         .iter()
-        .filter_map(|l| l.method.as_deref())
+        .filter_map(|m| m.name.as_deref())
         .collect()
 }
 
-/// The last stage of each lane (and the last stage) makes exactly one
+/// The last stage of each method (and the last stage) makes exactly one
 /// `*.score.tsv`.
 fn scores_made(spec: &Spec) -> Result<()> {
     let last = spec.stages.len() - 1;
     for (si, stage) in spec.stages.iter().enumerate() {
-        for lane in &stage.lanes {
+        for method in &stage.methods {
             let ends = si == last
-                || lane.method.as_ref().is_some_and(|m| {
+                || method.name.as_ref().is_some_and(|m| {
                     !spec.stages[si + 1..]
                         .iter()
-                        .any(|s| s.lanes.iter().any(|l| l.method.as_ref() == Some(m)))
+                        .any(|s| s.methods.iter().any(|o| o.name.as_ref() == Some(m)))
                 });
             if !ends {
                 continue;
             }
-            let n = scores(lane);
+            let n = scores(method);
             if n != 1 {
-                let what = lane
-                    .method
+                let what = method
+                    .name
                     .as_ref()
-                    .map_or(format!("stage {}", stage.name), |m| format!("lane {m}"));
+                    .map_or(format!("stage {}", stage.name), |m| format!("method {m}"));
                 return Err(bad(
-                    &format!("{}.makes", lane.at),
+                    &format!("{}.makes", method.at),
                     format!(
                         "lists {n} *.score.tsv; {what} ends here, and the last stage of each \
-                         lane makes exactly one"
+                         method makes exactly one"
                     ),
                 ));
             }
@@ -412,9 +420,10 @@ fn scores_made(spec: &Spec) -> Result<()> {
     Ok(())
 }
 
-/// How many `*.score.tsv` `lane` makes.
-fn scores(lane: &Lane) -> usize {
-    lane.makes
+/// How many `*.score.tsv` `method` makes.
+fn scores(method: &Method) -> usize {
+    method
+        .makes
         .iter()
         .filter(|m| m.ends_with(".score.tsv"))
         .count()
@@ -422,22 +431,21 @@ fn scores(lane: &Lane) -> usize {
 
 /// A data-beans multiome run with `--reference-atac` writes its pair truth
 /// in synthetic index space against real peak names: no universe holds
-/// those pairs, so no lane that makes a score may read it.
+/// those pairs, so no method that makes a score may read it.
 fn reference_truth(spec: &Spec) -> Result<()> {
     for (si, stage) in spec.stages.iter().enumerate() {
-        if !stage.lanes.iter().any(is_reference_multiome) {
+        if !stage.methods.iter().any(is_reference_multiome) {
             continue;
         }
         for later in &spec.stages[si + 1..] {
-            for lane in later.lanes.iter().filter(|l| scores(l) > 0) {
-                for (i, token) in lane.run.iter().enumerate() {
-                    let reads = segments(token).unwrap_or_default().iter().any(|seg| {
-                        let Seg::Name(n) = seg else { return false };
-                        matches!(classify(n, spec), Some(Ph::Stage(t) | Ph::Glob(t, _)) if t == stage.name)
+            for method in later.methods.iter().filter(|m| scores(m) > 0) {
+                for (i, (at, parts)) in words(spec, method)?.into_iter().enumerate() {
+                    let reads = parts.iter().any(|p| {
+                        matches!(p, Part::Ph(_, Ph::Stage(t) | Ph::Glob(t, _)) if *t == stage.name)
                     });
-                    if reads && token.contains("ground_truth") {
+                    if reads && method.run[i].contains("ground_truth") {
                         return Err(bad(
-                            &format!("{}.run[{i}]", lane.at),
+                            &at,
                             format!(
                                 "reads the pair truth of stage {}, a data-beans multiome run \
                                  with --reference-atac: those pairs index synthetic peaks \
@@ -466,11 +474,11 @@ pub fn rep_seed(base: u64, rep: u32) -> u64 {
     key::splitmix64(base ^ key::splitmix64(u64::from(rep))) & 0x7fff_ffff
 }
 
-/// A cell's `{seed}`: `splitmix64(rep_seed ^ fnv64("<stage>/<method>")) &
+/// A task's `{seed}`: `splitmix64(rep_seed ^ fnv64("<stage>/<method>")) &
 /// 0x7fffffff`, `method` empty in a stage without methods.
 pub fn stage_seed(rep_seed: u64, stage: &str, method: &str) -> u64 {
-    let lane = format!("{stage}/{method}");
-    key::splitmix64(rep_seed ^ key::fnv64(lane.as_bytes())) & 0x7fff_ffff
+    let stream = format!("{stage}/{method}");
+    key::splitmix64(rep_seed ^ key::fnv64(stream.as_bytes())) & 0x7fff_ffff
 }
 
 /// A point of the grid: each axis and its value there.
@@ -514,8 +522,8 @@ pub fn point_id(labels: &BTreeMap<String, String>) -> String {
     key::key_of(&v)[..8].to_string()
 }
 
-/// A cell's id.
-pub fn cell_id(point: &str, rep: u32, stage: &str, method: Option<&str>) -> String {
+/// A task's id.
+pub fn task_id(point: &str, rep: u32, stage: &str, method: Option<&str>) -> String {
     match method {
         Some(m) => format!("{point}.r{rep}.{stage}-{m}"),
         None => format!("{point}.r{rep}.{stage}"),
@@ -523,29 +531,29 @@ pub fn cell_id(point: &str, rep: u32, stage: &str, method: Option<&str>) -> Stri
 }
 
 /// Each tool word the spec runs, with whether it is snapshot, and the
-/// first lane that names it; [`LEGUME`] also when an argv word uses
-/// `{legume}`, snapshot as the lanes that run it are, and when none does,
-/// snapshot. A tool snapshot in one lane and not in another is refused.
+/// first method that names it; [`LEGUME`] also when an argv word uses
+/// `{legume}`, snapshot as the methods that run it are, and when none does,
+/// snapshot. A tool snapshot in one method and not in another is refused.
 pub fn tool_words(spec: &Spec) -> Result<Vec<(String, bool, String)>> {
     let mut out: Vec<(String, bool, String)> = Vec::new();
     let mut embeds: Option<&str> = None;
-    for lane in spec.stages.iter().flat_map(|s| &s.lanes) {
-        let word = lane.tool_word();
-        if word != LEGUME && embeds.is_none() && lane.run.iter().any(|t| uses_legume(t)) {
-            embeds = Some(&lane.at);
+    for method in spec.stages.iter().flat_map(|s| &s.methods) {
+        let word = method.tool_word();
+        if embeds.is_none() && embeds_legume(method) {
+            embeds = Some(&method.at);
         }
         match out.iter().find(|(w, _, _)| w == word) {
-            Some((_, s, first)) if *s != lane.snapshot => {
+            Some((_, s, first)) if *s != method.snapshot => {
                 return Err(bad(
-                    &format!("{}.snapshot", lane.at),
+                    &format!("{}.snapshot", method.at),
                     format!(
                         "is {}, but {first} runs {word} with snapshot {s}",
-                        lane.snapshot
+                        method.snapshot
                     ),
                 ))
             }
             Some(_) => {}
-            None => out.push((word.to_string(), lane.snapshot, lane.at.clone())),
+            None => out.push((word.to_string(), method.snapshot, method.at.clone())),
         }
     }
     if let Some(at) = embeds.filter(|_| !out.iter().any(|(w, _, _)| w == LEGUME)) {
@@ -561,11 +569,11 @@ enum Part<'a> {
     Ph(&'a str, Ph<'a>),
 }
 
-/// What a lane's cells share: its words parsed, what they read, its tool
+/// What a method's tasks share: its words parsed, what they read, its tool
 /// and its environment.
 struct Prepared<'a> {
     stage: &'a Stage,
-    lane: &'a Lane,
+    method: &'a Method,
     /// `run[1..]`, each word's parts.
     words: Vec<Vec<Part<'a>>>,
     /// Each stage it reads, and whether that stage has methods.
@@ -578,30 +586,32 @@ struct Prepared<'a> {
 }
 
 impl<'a> Prepared<'a> {
-    fn new(spec: &'a Spec, stage: &'a Stage, lane: &'a Lane, ctx: &'a Context) -> Result<Self> {
-        let word = lane.tool_word();
+    fn new(spec: &'a Spec, stage: &'a Stage, method: &'a Method, ctx: &'a Context) -> Result<Self> {
+        let word = method.tool_word();
         let tool = ctx.tool(word).ok_or_else(|| {
             bad(
-                &format!("{}.run[0]", lane.at),
+                &format!("{}.run[0]", method.at),
                 format!("{word} is not resolved"),
             )
         })?;
-        let words: Vec<Vec<Part>> = words(spec, lane)?
+        let words: Vec<Vec<Part>> = words(spec, method)?
             .into_iter()
             .skip(1)
             .map(|w| w.1)
             .collect();
-        let (mut upstream, mut inputs, mut embeds) = (Vec::new(), Vec::new(), false);
+        let (mut upstream, mut inputs) = (Vec::new(), Vec::new());
+        // Another tool's argv names `{legume}`, as [`embeds_legume`] says.
+        let mut embeds = false;
         for part in words.iter().flatten() {
             match *part {
-                Part::Ph(_, Ph::Legume) => embeds = word != LEGUME,
                 Part::Ph(_, Ph::Stage(t) | Ph::Glob(t, _))
                     if !upstream.iter().any(|u: &(&str, bool)| u.0 == t) =>
                 {
-                    let methods = spec.stages.iter().any(|s| s.name == t && s.methods);
-                    upstream.push((t, methods));
+                    let has_methods = spec.stages.iter().any(|s| s.name == t && s.has_methods());
+                    upstream.push((t, has_methods));
                 }
                 Part::Ph(_, Ph::Input(n)) if !inputs.contains(&n) => inputs.push(n),
+                Part::Ph(_, Ph::Legume) if word != LEGUME => embeds = true,
                 _ => {}
             }
         }
@@ -610,11 +620,11 @@ impl<'a> Prepared<'a> {
             .flatten();
         let env = THREAD_VARS
             .iter()
-            .map(|v| (v.to_string(), lane.threads.to_string()))
+            .map(|v| (v.to_string(), method.threads.to_string()))
             .collect();
         Ok(Self {
             stage,
-            lane,
+            method,
             words,
             upstream,
             inputs,
@@ -623,9 +633,73 @@ impl<'a> Prepared<'a> {
             env,
         })
     }
+
+    /// The task key of a task of this method that runs `argv`, from
+    /// `template`, and reads the tasks keyed `upstream_keys`.
+    fn key(
+        &self,
+        template: &[String],
+        argv: &[String],
+        upstream_keys: &[&String],
+        ctx: &Context,
+    ) -> String {
+        // A declared input named by its path is read as well.
+        let mut inputs = self.inputs.clone();
+        for t in &argv[1..] {
+            let p = named_path(t);
+            if !p.is_absolute() {
+                continue;
+            }
+            for n in inputs_under(p, ctx.inputs) {
+                if !inputs.contains(&n) {
+                    inputs.push(n);
+                }
+            }
+        }
+        inputs.sort_unstable();
+        let input_keys: Vec<Value> = inputs
+            .iter()
+            .map(|n| json!({"name": n, "hash": ctx.inputs.get(*n).map(|i| &i.1)}))
+            .collect();
+        let mut keyed = json!({
+            "stage": self.stage.name,
+            "method": self.method.name,
+            "argv": template,
+            "env": *THREADS_ENV,
+            "tool": self.tool.content_key,
+            "inputs": input_keys,
+            "upstream": upstream_keys,
+        });
+        if let Some(k) = self.legume {
+            keyed["legume"] = json!(k);
+        }
+        key::key_of(&keyed)
+    }
 }
 
-/// What fills one cell's placeholders.
+/// The environment a task key records: each thread variable as
+/// `{threads}`, the same for every task.
+static THREADS_ENV: LazyLock<Value> = LazyLock::new(|| {
+    let env: BTreeMap<&str, &str> = THREAD_VARS.iter().map(|v| (*v, "{threads}")).collect();
+    json!(env)
+});
+
+/// The values a task of `point` in replicate `rep` shares with the other
+/// tasks there: each axis's label, its bindings, `rep` and `rep_seed`.
+fn values<'a>(point: &Point<'a>, rep: u32, rep_seed: u64) -> HashMap<&'a str, String> {
+    let mut values: HashMap<&str, String> = HashMap::new();
+    for &(axis, v) in point {
+        values.insert(axis, v.label.clone());
+        for (b, x) in &v.bindings {
+            values.insert(b, x.clone());
+        }
+    }
+    values.insert("rep", rep.to_string());
+    values.insert("rep_seed", rep_seed.to_string());
+    values
+}
+
+/// What fills one task's placeholders.
 struct Fill<'a> {
     values: &'a HashMap<&'a str, String>,
     method: Option<&'a str>,
@@ -636,7 +710,7 @@ struct Fill<'a> {
 }
 
 impl Fill<'_> {
-    /// `word` filled: with `template`, only the cell's values and method,
+    /// `word` filled: with `template`, only the task's values and method,
     /// every path, `{threads}` and `{gpu}` left as written; else all but
     /// `{gpu}` (given at launch), a glob's stage made its folder.
     fn word(&self, word: &[Part], template: bool) -> String {
@@ -685,126 +759,81 @@ impl Fill<'_> {
     }
 }
 
-/// Every cell of `spec`, a spec [`check`] passed, replicate by replicate,
+/// Every task of `spec`, a spec [`check`] passed, replicate by replicate,
 /// point by point, stage by stage.
-pub fn cells(spec: &Spec, ctx: &Context) -> Result<Vec<Cell>> {
+pub fn tasks(spec: &Spec, ctx: &Context) -> Result<Vec<Task>> {
     let points = points(spec);
-    let threads_env: BTreeMap<String, String> = THREAD_VARS
-        .iter()
-        .map(|v| (v.to_string(), "{threads}".to_string()))
-        .collect();
-    let lanes: Vec<Prepared> = spec
+    let prepared: Vec<Prepared> = spec
         .stages
         .iter()
-        .flat_map(|stage| stage.lanes.iter().map(move |lane| (stage, lane)))
-        .map(|(stage, lane)| Prepared::new(spec, stage, lane, ctx))
+        .flat_map(|stage| stage.methods.iter().map(move |method| (stage, method)))
+        .map(|(stage, method)| Prepared::new(spec, stage, method, ctx))
         .collect::<Result<_>>()?;
-    let cells_dir = ctx.dir.join("cells");
+    let tasks_dir = ctx.dir.join("tasks");
     let mut keys: HashMap<String, String> = HashMap::new();
-    let mut cells = Vec::new();
+    let mut tasks = Vec::new();
     for (rep, rep_seed) in reps(&spec.seeds) {
         for point in &points {
             let labels = labels(point);
             let pid = point_id(&labels);
-            let mut shared: HashMap<&str, String> = HashMap::new();
-            for (axis, v) in point {
-                shared.insert(axis, v.label.clone());
-                for (b, x) in &v.bindings {
-                    shared.insert(b, x.clone());
-                }
-            }
-            shared.insert("rep", rep.to_string());
-            shared.insert("rep_seed", rep_seed.to_string());
-            for p in &lanes {
-                let (stage, lane) = (p.stage, p.lane);
-                let method = lane.method.as_deref();
-                let id = cell_id(&pid, rep, &stage.name, method);
-                let seed = stage_seed(rep_seed, &stage.name, method.unwrap_or(""));
+            let shared = values(point, rep, rep_seed);
+            for p in &prepared {
+                let (stage, method) = (p.stage, p.method);
+                let name = method.name.as_deref();
+                let id = task_id(&pid, rep, &stage.name, name);
+                let seed = stage_seed(rep_seed, &stage.name, name.unwrap_or(""));
                 let mut values = shared.clone();
                 values.insert("seed", seed.to_string());
                 let mut upstream: Vec<String> = Vec::new();
                 let mut stages: HashMap<&str, PathBuf> = HashMap::new();
-                for &(t, methods) in &p.upstream {
-                    let uid = cell_id(&pid, rep, t, method.filter(|_| methods));
-                    stages.insert(t, cells_dir.join(&uid));
-                    if !upstream.contains(&uid) {
-                        upstream.push(uid);
-                    }
+                for &(t, has_methods) in &p.upstream {
+                    let uid = task_id(&pid, rep, t, name.filter(|_| has_methods));
+                    stages.insert(t, tasks_dir.join(&uid));
+                    upstream.push(uid);
                 }
-                let dir = cells_dir.join(&id);
+                let dir = tasks_dir.join(&id);
                 let fill = Fill {
                     values: &values,
-                    method,
-                    threads: lane.threads,
+                    method: name,
+                    threads: method.threads,
                     out: &dir,
                     stages: &stages,
                     ctx,
                 };
-                let mut template = vec![lane.run[0].clone()];
+                let mut template = vec![method.run[0].clone()];
                 let mut argv = vec![p.tool.exec.display().to_string()];
                 for w in &p.words {
                     template.push(fill.word(w, true));
                     argv.push(fill.word(w, false));
                 }
-                // A declared input named by its path is read as well.
-                let mut inputs = p.inputs.clone();
-                for t in &argv[1..] {
-                    let path = named_path(t);
-                    if !path.is_absolute() {
-                        continue;
-                    }
-                    let real = path.canonicalize().ok();
-                    for (n, (i, _)) in ctx.inputs {
-                        if is_under(path, real.as_deref(), i) && !inputs.contains(&n.as_str()) {
-                            inputs.push(n);
-                        }
-                    }
-                }
-                inputs.sort_unstable();
-                let input_keys: Vec<Value> = inputs
-                    .iter()
-                    .map(|n| json!({"name": n, "hash": ctx.inputs.get(*n).map(|i| &i.1)}))
-                    .collect();
                 let upstream_keys: Vec<&String> =
                     upstream.iter().filter_map(|u| keys.get(u)).collect();
-                let mut keyed = json!({
-                    "stage": stage.name,
-                    "method": method,
-                    "argv": template,
-                    "env": threads_env,
-                    "tool": p.tool.content_key,
-                    "inputs": input_keys,
-                    "upstream": upstream_keys,
-                });
-                if let Some(k) = p.legume {
-                    keyed["legume"] = json!(k);
-                }
-                let key = key::key_of(&keyed);
+                let key = p.key(&template, &argv, &upstream_keys, ctx);
                 keys.insert(id.clone(), key.clone());
-                cells.push(Cell {
+                tasks.push(Task {
                     id,
                     point: labels.clone(),
                     rep,
                     rep_seed,
                     seed,
                     stage: stage.name.clone(),
-                    method: method.map(str::to_string),
+                    method: name.map(str::to_string),
                     argv,
                     env: p.env.clone(),
-                    threads: lane.threads,
-                    mem_gb: lane.mem_gb,
-                    gpus: lane.gpus,
-                    timeout_secs: lane.timeout_secs,
-                    max_running: lane.max_running,
+                    threads: method.threads,
+                    mem_gb: method.mem_gb,
+                    gpus: method.gpus,
+                    timeout_secs: method.timeout_secs,
+                    max_running: method.max_running,
                     dir,
-                    makes: lane.makes.clone(),
+                    makes: method.makes.clone(),
                     upstream,
                     key,
                 });
             }
         }
     }
-    Ok(cells)
+    Ok(tasks)
 }
 
 /// What the plan warns of, though it runs: listed seeds close together
@@ -812,11 +841,15 @@ pub fn cells(spec: &Spec, ctx: &Context) -> Result<Vec<Cell>> {
 /// nearby seeds share most of them), and an argv path to an existing file
 /// outside the benchmark that is no declared input (its content is not
 /// keyed), not under a declared one.
-pub fn warnings(spec: &Spec, cells: &[Cell], ctx: &Context) -> Vec<String> {
+pub fn warnings(spec: &Spec, tasks: &[Task], ctx: &Context) -> Vec<String> {
     let dir = ctx.dir.as_path();
     let mut out = Vec::new();
     if let Seeds::List(list) = &spec.seeds {
-        let data_beans = spec.stages.iter().flat_map(|s| &s.lanes).any(is_data_beans);
+        let data_beans = spec
+            .stages
+            .iter()
+            .flat_map(|s| &s.methods)
+            .any(is_data_beans);
         let mut sorted = list.clone();
         sorted.sort_unstable();
         let close = sorted.windows(2).any(|w| w[1] - w[0] < CLOSE_SEEDS);
@@ -828,23 +861,19 @@ pub fn warnings(spec: &Spec, cells: &[Cell], ctx: &Context) -> Vec<String> {
         }
     }
     let mut seen: HashSet<&Path> = HashSet::new();
-    for cell in cells {
-        for token in &cell.argv[1..] {
+    for task in tasks {
+        for token in &task.argv[1..] {
             let p = named_path(token);
             if !p.is_absolute() || p.starts_with(dir) || !seen.insert(p) {
                 continue;
             }
-            let real = p.canonicalize().ok();
-            let declared = ctx
-                .inputs
-                .values()
-                .any(|(i, _)| is_under(p, real.as_deref(), i));
+            let declared = inputs_under(p, ctx.inputs).next().is_some();
             if !declared && p.is_file() {
                 let path = p.display();
                 out.push(format!(
-                    "cell {}: {path} is a file outside the benchmark; declare it in inputs, \
+                    "task {}: {path} is a file outside the benchmark; declare it in inputs, \
                      so its content enters the key",
-                    cell.id
+                    task.id
                 ));
             }
         }
@@ -852,10 +881,19 @@ pub fn warnings(spec: &Spec, cells: &[Cell], ctx: &Context) -> Vec<String> {
     out
 }
 
-/// Whether the path `p`, `real` once resolved, is at or under the input
-/// at `input` (a resolved path).
-fn is_under(p: &Path, real: Option<&Path>, input: &Path) -> bool {
-    p.starts_with(input) || real.is_some_and(|r| r.starts_with(input))
+/// The declared inputs at or above the absolute path `p`, as written or
+/// once resolved.
+fn inputs_under<'a>(
+    p: &'a Path,
+    inputs: &'a HashMap<String, (PathBuf, String)>,
+) -> impl Iterator<Item = &'a str> {
+    let real = p.canonicalize().ok();
+    inputs
+        .iter()
+        .filter(move |(_, (i, _))| {
+            p.starts_with(i) || real.as_deref().is_some_and(|r| r.starts_with(i))
+        })
+        .map(|(n, _)| n.as_str())
 }
 
 /// The path an argv word names: all of it, or what follows its last `=`
@@ -867,7 +905,7 @@ fn named_path(token: &str) -> &Path {
 /// Listed seeds nearer than this overlap in data-beans' streams.
 const CLOSE_SEEDS: u64 = 1 << 20;
 
-/// What `{glob:<folder>/<pattern>}` gives when a cell starts: every path
+/// What `{glob:<folder>/<pattern>}` gives when a task starts: every path
 /// under `folder` that `pattern` matches (`*` and `?` within a part of
 /// the path, a hidden name only by a part that starts with `.`, as in a
 /// shell), natural-sorted, joined by commas; refused when none does.
@@ -958,6 +996,7 @@ fn natural(a: &str, b: &str) -> Ordering {
     }
 }
 
+/// A run of digits less its leading zeros, keeping one digit.
 fn trim_zeros(d: &[u8]) -> &[u8] {
     let z = d.iter().take_while(|&&c| c == b'0').count();
     &d[z.min(d.len().saturating_sub(1))..]
@@ -999,7 +1038,7 @@ mod tests {
         tools.iter_mut().find(|t| t.word == word).unwrap()
     }
 
-    fn expand(spec: &Spec) -> Vec<Cell> {
+    fn expand(spec: &Spec) -> Vec<Task> {
         check(spec).unwrap();
         let tools = tools(spec);
         let inputs: HashMap<String, (PathBuf, String)> = spec
@@ -1015,22 +1054,45 @@ mod tests {
                 )
             })
             .collect();
-        let ctx = Context {
-            dir: PathBuf::from("/B"),
-            tools: &tools,
-            inputs: &inputs,
-        };
-        cells(spec, &ctx).unwrap()
+        plan_at(spec, "/B", &tools, &inputs)
     }
 
-    fn cell<'a>(cells: &'a [Cell], id_end: &str, rep: u32) -> &'a Cell {
-        cells
+    /// The context of a benchmark at `dir`.
+    fn context<'a>(
+        dir: &Path,
+        tools: &'a [Resolved],
+        inputs: &'a HashMap<String, (PathBuf, String)>,
+    ) -> Context<'a> {
+        Context {
+            dir: dir.to_path_buf(),
+            tools,
+            inputs,
+        }
+    }
+
+    /// The tasks of `s` at `dir`.
+    fn plan_at(
+        s: &Spec,
+        dir: &str,
+        tools: &[Resolved],
+        inputs: &HashMap<String, (PathBuf, String)>,
+    ) -> Vec<Task> {
+        tasks(s, &context(Path::new(dir), tools, inputs)).unwrap()
+    }
+
+    /// One declared input, `name` at `path` keyed `hash`.
+    fn input(name: &str, path: &str, hash: &str) -> HashMap<String, (PathBuf, String)> {
+        [(name.to_string(), (PathBuf::from(path), hash.to_string()))].into()
+    }
+
+    fn task<'a>(tasks: &'a [Task], id_end: &str, rep: u32) -> &'a Task {
+        tasks
             .iter()
             .find(|c| c.id.ends_with(id_end) && c.rep == rep)
-            .unwrap_or_else(|| panic!("no cell {id_end} r{rep}"))
+            .unwrap_or_else(|| panic!("no task {id_end} r{rep}"))
     }
 
-    const LANES: &str = r#"{"name": "N1", "seeds": {"n": 1},
+    const METHODS: &str = r#"{"name": "N1", "seeds": {"n": 1},
       "stages": [
         {"name": "sim", "run": ["TOOL1", "-o", "{out}/sim"], "makes": ["sim.tsv"]},
         {"name": "fit", "methods": {
@@ -1039,37 +1101,37 @@ mod tests {
           "M0": {"run": ["{legume}", "score", "{sim}/sim.tsv", "-o", "{out}/m.score.tsv"], "makes": ["m.score.tsv"]},
           "M1": {"run": ["{legume}", "score", "{fit}/fit.tsv", "-o", "{out}/m.score.tsv"], "makes": ["m.score.tsv"]}}}]}"#;
 
-    // A lane that an upstream methods stage lacks (M0 skips fit) may not
+    // A method that an upstream methods stage lacks (M0 skips fit) may not
     // use that stage's placeholder; one it has may; a stage without
-    // methods names no one lane of one with.
+    // methods names no one method of one with.
     #[test]
-    fn lanes_must_match() {
-        let cells = expand(&spec(LANES));
-        let m1 = cell(&cells, ".score-M1", 1);
-        let fit = cell(&cells, ".fit-M1", 1);
+    fn methods_must_match() {
+        let tasks = expand(&spec(METHODS));
+        let m1 = task(&tasks, ".score-M1", 1);
+        let fit = task(&tasks, ".fit-M1", 1);
         assert_eq!(m1.upstream, [fit.id.as_str()]);
-        assert_eq!(m1.argv[2], format!("/B/cells/{}/fit.tsv", fit.id));
-        let m0 = cell(&cells, ".score-M0", 1);
-        assert_eq!(m0.upstream, [cell(&cells, ".sim", 1).id.as_str()]);
+        assert_eq!(m1.argv[2], format!("/B/tasks/{}/fit.tsv", fit.id));
+        let m0 = task(&tasks, ".score-M0", 1);
+        assert_eq!(m0.upstream, [task(&tasks, ".sim", 1).id.as_str()]);
 
-        let skipped = LANES.replace("\"{sim}/sim.tsv\", \"-o\"", "\"{fit}/fit.tsv\", \"-o\"");
+        let skipped = METHODS.replace("\"{sim}/sim.tsv\", \"-o\"", "\"{fit}/fit.tsv\", \"-o\"");
         assert_eq!(
             refused(&skipped),
-            "stages[2].methods.M0.run[2]: {fit}: stage fit has no lane M0 (its lanes: M1); \
-             a lane that skips fit may not use {fit}"
+            "stages[2].methods.M0.run[2]: {fit}: stage fit has no method M0 (its methods: M1); \
+             a method that skips fit may not use {fit}"
         );
-        let glob = LANES.replace("\"{sim}/sim.tsv\", \"-o\"", "\"{glob:fit/*.tsv}\", \"-o\"");
+        let glob = METHODS.replace("\"{sim}/sim.tsv\", \"-o\"", "\"{glob:fit/*.tsv}\", \"-o\"");
         assert_eq!(
             refused(&glob),
-            "stages[2].methods.M0.run[2]: {glob:fit/*.tsv}: stage fit has no lane M0 \
-             (its lanes: M1); a lane that skips fit may not use {fit}"
+            "stages[2].methods.M0.run[2]: {glob:fit/*.tsv}: stage fit has no method M0 \
+             (its methods: M1); a method that skips fit may not use {fit}"
         );
         let plain = r#"{"name": "N1", "seeds": {"n": 1}, "stages": [
             {"name": "fit", "methods": {"M1": {"run": ["T"], "makes": ["a"]}}},
             {"name": "score", "run": ["T", "{fit}"], "makes": ["m.score.tsv"]}]}"#;
         assert_eq!(
             refused(plain),
-            "stages[1].run[1]: {fit}: stage fit has a lane per method (M1), and this stage \
+            "stages[1].run[1]: {fit}: stage fit has methods (M1), and this stage \
              has none, so it names no one of them"
         );
     }
@@ -1080,7 +1142,7 @@ mod tests {
             ("{bogus}", "{bogus} is no placeholder: not an axis, a binding, a stage, inputs.NAME, \
               glob:STAGE/PATTERN, or one of rep, rep_seed, seed, method, threads, gpu, out, legume"),
             ("{method}", "{method} is for a stage with methods"),
-            ("{gpu}", "{gpu} names a GPU, and this cell asks for none"),
+            ("{gpu}", "{gpu} names a GPU, and this task asks for none"),
             ("{inputs.RUN2}", "{inputs.RUN2}: \"RUN2\" is no declared input"),
             ("{score}", "{score}: stage score runs after this one"),
             ("{sim}", "{sim} is this stage's own folder; that is {out}"),
@@ -1119,9 +1181,9 @@ mod tests {
               "run": ["T", "--set", "a={p1}", "--set", "b={p2}", "--ds", "{DS}", "-k", "{K}"],
               "makes": ["m.score.tsv"]}]}"#,
         );
-        let cells = expand(&s);
-        assert_eq!(cells.len(), 5);
-        let l2 = cells
+        let tasks = expand(&s);
+        assert_eq!(tasks.len(), 5);
+        let l2 = tasks
             .iter()
             .find(|c| c.point["DS"] == "L2" && c.point["K"] == "k1")
             .unwrap();
@@ -1129,20 +1191,20 @@ mod tests {
             l2.argv[1..],
             ["--set", "a=0.01", "--set", "b=0.02", "--ds", "L2", "-k", "k1"]
         );
-        assert!(!cells
+        assert!(!tasks
             .iter()
             .any(|c| c.point["DS"] == "L2" && c.point["K"] == "k3"));
-        let ids: Vec<&str> = cells.iter().map(|c| &c.id[..8]).collect();
+        let ids: Vec<&str> = tasks.iter().map(|c| &c.id[..8]).collect();
         let mut unique = ids.clone();
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), 5, "each point its own id");
     }
 
-    // Cell ids: 8 hex digits of the canonical point, then rep, stage and
+    // Task ids: 8 hex digits of the canonical point, then rep, stage and
     // method. A point keeps its id when an axis gains a value.
     #[test]
-    fn cell_ids_name_the_point_rep_stage_and_method() {
+    fn task_ids_name_the_point_rep_stage_and_method() {
         let one = |values: &str| {
             let s = spec(&format!(
                 r#"{{"name": "N1", "seeds": {{"n": 2}}, "axes": {{"A": [{values}]}},
@@ -1159,12 +1221,12 @@ mod tests {
         assert!(large
             .iter()
             .any(|c| c.id == small[1].id && c.key == small[1].key));
-        assert_eq!(cell_id("0a1b2c3d", 1, "sim", None), "0a1b2c3d.r1.sim");
+        assert_eq!(task_id("0a1b2c3d", 1, "sim", None), "0a1b2c3d.r1.sim");
     }
 
     // seeds_stage_derived_31bit: rep_seed and seed by the stated formulas
     // (the values computed apart from this code), within 31 bits, the
-    // same rep_seed at every point of a replicate, and no two lanes or
+    // same rep_seed at every point of a replicate, and no two methods or
     // stages sharing a seed.
     #[test]
     fn seeds_stage_derived_31bit() {
@@ -1179,17 +1241,17 @@ mod tests {
                           "M1": {"run": ["T", "{seed}"], "makes": ["m.score.tsv"]},
                           "M2": {"run": ["T", "{seed}"], "makes": ["m.score.tsv"]}}}]}"#,
         );
-        let cells = expand(&s);
-        assert_eq!(cells.len(), 2 * 3 * 3);
-        for c in &cells {
+        let tasks = expand(&s);
+        assert_eq!(tasks.len(), 2 * 3 * 3);
+        for c in &tasks {
             assert!(c.rep_seed <= 0x7fff_ffff && c.seed <= 0x7fff_ffff, "{c:?}");
             assert_eq!(c.rep_seed, rep_seed(1, c.rep));
             let m = c.method.as_deref().unwrap_or("");
             assert_eq!(c.seed, stage_seed(c.rep_seed, &c.stage, m));
         }
-        let sim = cell(&cells, ".sim", 1);
+        let sim = task(&tasks, ".sim", 1);
         assert_eq!(sim.argv[1..], ["1448800798", "983310059"]);
-        let r1: Vec<&Cell> = cells.iter().filter(|c| c.rep == 1).collect();
+        let r1: Vec<&Task> = tasks.iter().filter(|c| c.rep == 1).collect();
         assert!(r1.iter().all(|c| c.rep_seed == 1_448_800_798));
         let mut seeds: Vec<u64> = r1
             .iter()
@@ -1204,81 +1266,52 @@ mod tests {
             r#"{"name": "N1", "seeds": {"list": [7, 3]},
             "stages": [{"name": "sim", "run": ["T", "{rep}", "{rep_seed}"], "makes": ["m.score.tsv"]}]}"#,
         );
-        let cells = expand(&listed);
-        assert_eq!(cells[1].argv[1..], ["2", "3"]);
-        assert_eq!(cells[1].seed, stage_seed(3, "sim", ""));
+        let tasks = expand(&listed);
+        assert_eq!(tasks[1].argv[1..], ["2", "3"]);
+        assert_eq!(tasks[1].seed, stage_seed(3, "sim", ""));
     }
 
-    // The key: what a cell runs, by content. Paths, {threads} and {gpu}
+    // The key: what a task runs, by content. Paths, {threads} and {gpu}
     // stay templates; a value, the tool's bytes or an input's do not.
     #[test]
-    fn a_key_follows_what_the_cell_runs_and_not_where() {
+    fn a_key_follows_what_the_task_runs_and_not_where() {
         let text = r#"{"name": "N1", "seeds": {"n": 1}, "inputs": {"RUN1": {"path": "R"}},
           "stages": [
             {"name": "sim", "threads": 4, "run": ["T1", "{inputs.RUN1}", "-t", "{threads}", "-o", "{out}"], "makes": ["s"]},
             {"name": "score", "run": ["T2", "{sim}/s"], "makes": ["m.score.tsv"]}]}"#;
         let s = spec(text);
         let tools = tools(&s);
-        let inputs: HashMap<String, (PathBuf, String)> = [(
-            "RUN1".to_string(),
-            (PathBuf::from("/I/R"), "H1".to_string()),
-        )]
-        .into();
-        let at = |dir: &str, tools: &[Resolved], inputs: &HashMap<String, (PathBuf, String)>| {
-            let ctx = Context {
-                dir: PathBuf::from(dir),
-                tools,
-                inputs,
-            };
-            cells(&s, &ctx).unwrap()
-        };
-        let a = at("/B", &tools, &inputs);
+        let inputs = input("RUN1", "/I/R", "H1");
+        let a = plan_at(&s, "/B", &tools, &inputs);
         assert_eq!(
             a[0].argv[1..],
-            ["/I/R", "-t", "4", "-o", &format!("/B/cells/{}", a[0].id)]
+            ["/I/R", "-t", "4", "-o", &format!("/B/tasks/{}", a[0].id)]
         );
         assert_eq!(a[0].env["RAYON_NUM_THREADS"], "4");
-        let moved = at("/elsewhere", &tools, &inputs);
+        let moved = plan_at(&s, "/elsewhere", &tools, &inputs);
         assert_eq!(a[0].key, moved[0].key);
         assert_eq!(a[1].key, moved[1].key);
 
         let threads = spec(&text.replace("\"threads\": 4", "\"threads\": 2"));
-        let t = cells(
-            &threads,
-            &Context {
-                dir: "/B".into(),
-                tools: &tools,
-                inputs: &inputs,
-            },
-        )
-        .unwrap();
+        let t = plan_at(&threads, "/B", &tools, &inputs);
         assert_eq!(a[0].key, t[0].key, "threads are keyed as {{threads}}");
 
-        let other_input: HashMap<String, (PathBuf, String)> = [(
-            "RUN1".to_string(),
-            (PathBuf::from("/I/R"), "H2".to_string()),
-        )]
-        .into();
-        let b = at("/B", &tools, &other_input);
+        let b = plan_at(&s, "/B", &tools, &input("RUN1", "/I/R", "H2"));
         assert_ne!(a[0].key, b[0].key, "an input's content");
         assert_ne!(a[1].key, b[1].key, "and so its downstream");
         let mut rebuilt = tools.clone();
         tool(&mut rebuilt, "T2").content_key = "K-T2b".into();
-        let c = at("/B", &rebuilt, &inputs);
+        let c = plan_at(&s, "/B", &rebuilt, &inputs);
         assert_eq!(a[0].key, c[0].key);
         assert_ne!(a[1].key, c[1].key, "a tool's bytes");
     }
 
-    /// Each cell's key, with `tools` and the input RUN1 at /I/R keyed `h`.
+    /// Each task's key, with `tools` and the input RUN1 at /I/R keyed `h`.
     fn keys_with(s: &Spec, tools: &[Resolved], h: &str) -> Vec<String> {
-        let inputs: HashMap<String, (PathBuf, String)> =
-            [("RUN1".to_string(), (PathBuf::from("/I/R"), h.to_string()))].into();
-        let ctx = Context {
-            dir: PathBuf::from("/B"),
-            tools,
-            inputs: &inputs,
-        };
-        cells(s, &ctx).unwrap().into_iter().map(|c| c.key).collect()
+        plan_at(s, "/B", tools, &input("RUN1", "/I/R", h))
+            .into_iter()
+            .map(|c| c.key)
+            .collect()
     }
 
     // A declared input named by its path, not by {inputs.NAME}, is read
@@ -1318,12 +1351,7 @@ mod tests {
                     .into_iter()
                     .map(|(n, p)| (n.to_string(), (PathBuf::from(p), format!("H-{n}"))))
                     .collect();
-            let ctx = Context {
-                dir: PathBuf::from("/B"),
-                tools: &tools,
-                inputs: &inputs,
-            };
-            cells(&s, &ctx).unwrap().remove(0).key
+            plan_at(&s, "/B", &tools, &inputs).remove(0).key
         };
         let first = key();
         for _ in 0..32 {
@@ -1389,39 +1417,39 @@ mod tests {
         let (argv, literal, _) = one("{{out}}");
         assert_eq!(argv, "{out}");
         let (argv, folder, _) = one("{out}");
-        assert!(argv.starts_with("/B/cells/"), "{argv}");
+        assert!(argv.starts_with("/B/tasks/"), "{argv}");
         assert_ne!(literal, folder);
     }
 
     #[test]
-    fn the_last_stage_of_each_lane_makes_one_score() {
-        let no_score = LANES.replace(
+    fn the_last_stage_of_each_method_makes_one_score() {
+        let no_score = METHODS.replace(
             r#""makes": ["m.score.tsv"]}}}]}"#,
             r#""makes": ["m.tsv"]}}}]}"#,
         );
         assert_eq!(
             refused(&no_score),
-            "stages[2].methods.M1.makes: lists 0 *.score.tsv; lane M1 ends here, and the last \
-             stage of each lane makes exactly one"
+            "stages[2].methods.M1.makes: lists 0 *.score.tsv; method M1 ends here, and the last \
+             stage of each method makes exactly one"
         );
-        let ends_early = LANES.replace(
+        let ends_early = METHODS.replace(
             r#""M1": {"run": ["TOOL2", "{sim}/sim.tsv", "{out}/fit"], "makes": ["fit.tsv"]}"#,
             r#""M1": {"run": ["TOOL2", "{sim}/sim.tsv", "{out}/fit"], "makes": ["fit.tsv"]},
                "M3": {"run": ["TOOL2"], "makes": ["fit.tsv"]}"#,
         );
         assert_eq!(
             refused(&ends_early),
-            "stages[1].methods.M3.makes: lists 0 *.score.tsv; lane M3 ends here, and the last \
-             stage of each lane makes exactly one"
+            "stages[1].methods.M3.makes: lists 0 *.score.tsv; method M3 ends here, and the last \
+             stage of each method makes exactly one"
         );
-        let two_scores = LANES.replace(
+        let two_scores = METHODS.replace(
             r#""makes": ["m.score.tsv"]}}}]}"#,
             r#""makes": ["m.score.tsv", "n.score.tsv"]}}}]}"#,
         );
         assert_eq!(
             refused(&two_scores),
-            "stages[2].methods.M1.makes: lists 2 *.score.tsv; lane M1 ends here, and the last \
-             stage of each lane makes exactly one"
+            "stages[2].methods.M1.makes: lists 2 *.score.tsv; method M1 ends here, and the last \
+             stage of each method makes exactly one"
         );
     }
 
@@ -1437,7 +1465,7 @@ mod tests {
         assert_eq!(
             refused(&text("")),
             "stages[0].mem_gb: is required for pinto lra-*: it sizes itself to the memory it \
-             sees free, so each cell books what it takes"
+             sees free, so each task books what it takes"
         );
         check(&spec(&text(r#""mem_gb": 8,"#))).unwrap();
     }
@@ -1485,7 +1513,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_is_snapshot_in_every_lane_or_none() {
+    fn a_tool_is_snapshot_in_every_method_or_none() {
         let s = spec(
             r#"{"name": "N1", "seeds": {"n": 1}, "stages": [
             {"name": "fit", "methods": {
@@ -1505,7 +1533,7 @@ mod tests {
         let words = tool_words(&own).unwrap();
         assert_eq!(words.len(), 1);
         assert_eq!((words[0].0.as_str(), words[0].1), (LEGUME, false));
-        // {legume} inside another lane's argv runs it as the lanes that
+        // {legume} inside another method's argv runs it as the methods that
         // run it do, and snapshot when none does.
         let embedded = |m1: &str| {
             let s = spec(&format!(
@@ -1520,6 +1548,15 @@ mod tests {
             r#""M1": {"snapshot": false, "run": ["{legume}", "score"], "makes": ["m.score.tsv"]},"#;
         assert_eq!(embedded(m1), Some(false));
         assert_eq!(embedded(""), Some(true));
+        // run[0] is replaced by the tool's own path: under another tool's
+        // name, a {legume} there runs no legume.
+        let named = spec(
+            r#"{"name": "N1", "seeds": {"n": 1}, "stages": [
+            {"name": "fit", "tool": "T", "run": ["{legume}", "x"], "makes": ["m.score.tsv"]}]}"#,
+        );
+        let words = tool_words(&named).unwrap();
+        assert!(words.iter().all(|w| w.0 != LEGUME), "{words:?}");
+        assert_eq!(expand(&named).remove(0).argv[0], "/T/T");
     }
 
     // glob_natural_sort_fails_empty: matches are natural-sorted and
@@ -1577,38 +1614,25 @@ mod tests {
             f.display()
         ));
         let tools = tools(&s);
-        let inputs: HashMap<String, (PathBuf, String)> =
-            [("R2".to_string(), (declared, "H2".to_string()))].into();
+        let inputs = input("R2", &declared.display().to_string(), "H2");
         let at = |dir: &Path| {
-            let ctx = Context {
-                dir: dir.to_path_buf(),
-                tools: &tools,
-                inputs: &inputs,
-            };
-            let cells = cells(&s, &ctx).unwrap();
-            warnings(&s, &cells, &ctx)
+            let ctx = context(dir, &tools, &inputs);
+            let tasks = tasks(&s, &ctx).unwrap();
+            let w = warnings(&s, &tasks, &ctx);
+            (tasks, w)
         };
-        let w = at(Path::new("/B"));
+        let (tasks, w) = at(Path::new("/B"));
         assert_eq!(w.len(), 2, "{w:?}");
         assert!(w[0].starts_with("seeds.list: seeds less than 1048576 apart overlap"));
         assert_eq!(
             w[1],
             format!(
-                "cell {}: {} is a file outside the benchmark; declare it in inputs, so its \
+                "task {}: {} is a file outside the benchmark; declare it in inputs, so its \
                  content enters the key",
-                cells(
-                    &s,
-                    &Context {
-                        dir: "/B".into(),
-                        tools: &tools,
-                        inputs: &inputs
-                    }
-                )
-                .unwrap()[0]
-                    .id,
+                tasks[0].id,
                 f.display()
             )
         );
-        assert_eq!(at(d.path()).len(), 1, "inside the benchmark");
+        assert_eq!(at(d.path()).1.len(), 1, "inside the benchmark");
     }
 }

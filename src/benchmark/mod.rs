@@ -1,18 +1,9 @@
-//! `legume benchmark`: a sweep of a grid of parameters times seeds times
-//! stages and their methods, planned from a spec. `legume benchmark plan
-//! SPEC` expands the spec to its cells, resolves and snapshots its tools,
+//! `legume benchmark`: a benchmark of a grid of parameters times seeds
+//! times stages and their methods, planned from a spec. `legume benchmark
+//! plan SPEC` expands the spec to its tasks, resolves and snapshots its tools,
 //! and writes the benchmark's configuration to `results/benchmarks/<name>/`
-//! in the project, apart from any output, so it can be run again:
-//!
-//! ```text
-//! specs/<key>.json   the spec as canonical JSON, named by its content key
-//! plan.json          every cell: argv, env, threads, GPUs, timeout, seeds, key
-//! machine.json       the machine it was first planned on
-//! versions.tsv       each tool's source, content key, snapshot and --version
-//! tools/<key>/       the snapshots that run
-//! ```
-//!
-//! Nothing runs yet.
+//! in the project, the files [`USAGE`] lists, apart from any output, so it
+//! can be run again. Nothing runs yet.
 
 pub mod executor;
 pub mod key;
@@ -34,22 +25,22 @@ use std::path::{Path, PathBuf};
 pub const USAGE: &str = "\
 legume benchmark plan SPEC [--retool]
 
-A benchmark's plan: the spec SPEC (JSON) expanded to its cells, a grid
-of parameters times seeds times stages and their methods, each cell with
-its argv, seeds and run key. Every tool is resolved through PATH (a
+A benchmark's plan: the spec SPEC (JSON) expanded to its tasks, a grid
+of parameters times seeds times stages and their methods, each task with
+its argv, seeds and task key. Every tool is resolved through PATH (a
 path with a / from the project) and copied, by its content, into the
 benchmark's folder, from where it runs.
 It writes results/benchmarks/<name>/ in the project:
 
   specs/<key>.json   the spec as canonical JSON, named by its key
-  plan.json          every cell: argv, env, threads, GPUs, timeout, seeds, key
+  plan.json          every task: argv, env, threads, GPUs, timeout, seeds, key
   machine.json       the machine it was first planned on
   versions.tsv       each tool's source, content key, snapshot and --version
   tools/<key>/       the snapshots that run
 
 and says what it planned. A later plan lists what changed: the machine,
 and each tool installed since, whose snapshot it keeps. --retool plans
-with the tools installed now, which rekeys their cells. Nothing runs yet.";
+with the tools installed now, which rekeys their tasks. Nothing runs yet.";
 
 /// `legume benchmark` with `args` (those after `benchmark`), saying what
 /// it planned on `out` and its warnings on `err`. A refusal is a
@@ -120,60 +111,21 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
             .collect();
         return Err(refuse(format!("not found on PATH: {}", names.join(", "))));
     }
-    let dir = root.join("results").join("benchmarks").join(&spec.name);
-    // The benchmark's folder resolved, as each input is; it need not be
-    // there yet.
-    let real_dir = dir.canonicalize().unwrap_or_else(|_| {
-        let real_root = root.canonicalize().unwrap_or_else(|_| root.clone());
-        real_root
-            .join("results")
-            .join("benchmarks")
-            .join(&spec.name)
-    });
-    let mut inputs: HashMap<String, (PathBuf, String)> = HashMap::new();
-    for i in &spec.inputs {
-        let p = crate::absolute(&root.join(&i.path));
-        let there = if i.dir { p.is_dir() } else { p.is_file() };
-        if !there {
-            let what = if i.dir { "folder" } else { "file" };
-            return Err(refuse(format!(
-                "inputs.{}.path: no {what} at {}",
-                i.name,
-                p.display()
-            )));
-        }
-        // An input is the file it names, its `..` and links resolved, so an
-        // argv path to it is found however it is written.
-        let p = p
-            .canonicalize()
-            .with_context(|| format!("resolving {}", p.display()))?;
-        if i.dir && (real_dir.starts_with(&p) || p.starts_with(&real_dir)) {
-            return Err(refuse(format!(
-                "inputs.{}.path: {} overlaps the benchmark's folder, whose files change with \
-                 every plan and run; name a folder apart from it",
-                i.name,
-                p.display()
-            )));
-        }
-        let k = if i.dir {
-            key::dir_key(&p)?
-        } else {
-            key::file_key(&p)?
-        };
-        inputs.insert(i.name.clone(), (p, k));
-    }
+    let rel = Path::new("results").join("benchmarks").join(&spec.name);
+    let dir = root.join(&rel);
+    let inputs = resolve_inputs(&spec, &root, &rel, &dir)?;
     // The last refusal, before any tool is snapshot: what a refusal stops
     // writes nothing but this spec, named by its content.
     let spec_file = dir.join("specs").join(format!("{spec_key}.json"));
     write_spec(&spec_file, &canonical)?;
-    let (resolved, mut drift) = tools::settle(&dir, &found, retool, tools::VERSION_TIMEOUT)?;
+    let (resolved, mut drift) = tools::settle(&dir, &found, retool)?;
     let ctx = plan::Context {
         dir: dir.clone(),
         tools: &resolved,
         inputs: &inputs,
     };
-    let cells = plan::cells(&spec, &ctx)?;
-    warnings.extend(plan::warnings(&spec, &cells, &ctx));
+    let tasks = plan::tasks(&spec, &ctx)?;
+    warnings.extend(plan::warnings(&spec, &tasks, &ctx));
 
     let machine_file = dir.join("machine.json");
     match std::fs::read(&machine_file) {
@@ -205,20 +157,16 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
         max_hours: spec.max_hours,
         min_free_gb: spec.min_free_gb,
         tools: &resolved,
-        cells: &cells,
+        tasks: &tasks,
     };
     crate::job::replace(&dir, "plan.json", crate::pretty(&plan_json)?.as_bytes())?;
 
-    let shown = |p: &Path| {
-        p.strip_prefix(&root)
-            .map_or_else(|_| p.display().to_string(), |r| r.display().to_string())
-    };
     let said = Summary {
         spec: &spec,
-        cells: &cells,
+        tasks: &tasks,
         tools: &resolved,
         drift: &drift,
-        dir: shown(&dir),
+        dir: crate::rel_path(&root, &dir),
         spec_key: &spec_key,
         cores,
         mem_gb,
@@ -231,8 +179,60 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
     Ok(())
 }
 
+/// Each of the spec's inputs, by name: the file or folder it names under
+/// `root`, resolved, and its key. Refused: an input that is not there, and
+/// a folder that overlaps the benchmark's, `dir`, which is `rel` under
+/// `root`.
+fn resolve_inputs(
+    spec: &spec::Spec,
+    root: &Path,
+    rel: &Path,
+    dir: &Path,
+) -> Result<HashMap<String, (PathBuf, String)>> {
+    // The benchmark's folder resolved, as each input is; it need not be
+    // there yet.
+    let real_dir = dir.canonicalize().unwrap_or_else(|_| {
+        root.canonicalize()
+            .unwrap_or_else(|_| root.to_path_buf())
+            .join(rel)
+    });
+    let mut inputs = HashMap::new();
+    for i in &spec.inputs {
+        let p = crate::absolute(&root.join(&i.path));
+        let there = if i.dir { p.is_dir() } else { p.is_file() };
+        if !there {
+            let what = if i.dir { "folder" } else { "file" };
+            return Err(refuse(format!(
+                "inputs.{}.path: no {what} at {}",
+                i.name,
+                p.display()
+            )));
+        }
+        // An input is the file it names, its `..` and links resolved, so an
+        // argv path to it is found however it is written.
+        let p = p
+            .canonicalize()
+            .with_context(|| format!("resolving {}", p.display()))?;
+        if i.dir && (real_dir.starts_with(&p) || p.starts_with(&real_dir)) {
+            return Err(refuse(format!(
+                "inputs.{}.path: {} overlaps the benchmark's folder, whose files change with \
+                 every plan and run; name a folder apart from it",
+                i.name,
+                p.display()
+            )));
+        }
+        let k = if i.dir {
+            key::dir_key(&p)?
+        } else {
+            key::file_key(&p)?
+        };
+        inputs.insert(i.name.clone(), (p, k));
+    }
+    Ok(inputs)
+}
+
 /// `plan.json`: what the benchmark books and the tools it runs, then
-/// every cell.
+/// every task.
 #[derive(Serialize)]
 struct PlanFile<'a> {
     name: &'a str,
@@ -246,7 +246,7 @@ struct PlanFile<'a> {
     max_hours: Option<f64>,
     min_free_gb: f64,
     tools: &'a [tools::Resolved],
-    cells: &'a [plan::Cell],
+    tasks: &'a [plan::Task],
 }
 
 /// The canonical spec at `file`, made only when it is not there yet; one
@@ -263,7 +263,9 @@ fn write_spec(file: &Path, canonical: &str) -> Result<()> {
             .write_all(canonical.as_bytes())
             .with_context(|| format!("writing {}", file.display())),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            if std::fs::read(file)? != canonical.as_bytes() {
+            let there =
+                std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+            if there != canonical.as_bytes() {
                 return Err(refuse(format!(
                     "{}: is there with other bytes than this spec's canonical JSON; a spec \
                      under specs/ is not edited in place",
@@ -276,15 +278,15 @@ fn write_spec(file: &Path, canonical: &str) -> Result<()> {
     }
 }
 
-/// How many of `cells` are done already: a `done.json` with their key.
-fn done(cells: &[plan::Cell]) -> usize {
-    cells
+/// How many of `tasks` are done already: a `done.json` with their key.
+fn done(tasks: &[plan::Task]) -> usize {
+    tasks
         .iter()
-        .filter(|c| {
-            std::fs::read(c.dir.join("done.json"))
+        .filter(|t| {
+            std::fs::read(t.dir.join("done.json"))
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-                .is_some_and(|v| v.get("key").and_then(Value::as_str) == Some(c.key.as_str()))
+                .is_some_and(|v| v.get("key").and_then(Value::as_str) == Some(t.key.as_str()))
         })
         .count()
 }
@@ -292,7 +294,7 @@ fn done(cells: &[plan::Cell]) -> usize {
 /// What the plan says on stdout.
 struct Summary<'a> {
     spec: &'a spec::Spec,
-    cells: &'a [plan::Cell],
+    tasks: &'a [plan::Task],
     tools: &'a [tools::Resolved],
     drift: &'a [String],
     /// The benchmark's folder, from the project.
@@ -307,7 +309,7 @@ impl Summary<'_> {
     fn write(&self, out: &mut dyn Write) -> Result<()> {
         let Self {
             spec,
-            cells,
+            tasks,
             tools,
             drift,
             ref dir,
@@ -324,23 +326,23 @@ impl Summary<'_> {
             spec.name,
             tools::short(spec_key)
         )?;
-        let mut lanes: Vec<(String, usize)> = Vec::new();
-        for c in cells {
-            let name = match &c.method {
-                Some(m) => format!("{}-{m}", c.stage),
-                None => c.stage.clone(),
+        let mut methods: Vec<(String, usize)> = Vec::new();
+        for t in tasks {
+            let name = match &t.method {
+                Some(m) => format!("{}-{m}", t.stage),
+                None => t.stage.clone(),
             };
-            match lanes.iter_mut().find(|(n, _)| *n == name) {
+            match methods.iter_mut().find(|(n, _)| *n == name) {
                 Some((_, k)) => *k += 1,
-                None => lanes.push((name, 1)),
+                None => methods.push((name, 1)),
             }
         }
-        let lanes: Vec<String> = lanes.iter().map(|(n, k)| format!("{n} {k}")).collect();
+        let methods: Vec<String> = methods.iter().map(|(n, k)| format!("{n} {k}")).collect();
         writeln!(
             out,
-            "cells {}: {points} points x {reps} reps; {}",
-            cells.len(),
-            lanes.join(", ")
+            "tasks {}: {points} points x {reps} reps; {}",
+            tasks.len(),
+            methods.join(", ")
         )?;
         let gpus = if spec.gpus.is_empty() {
             "no GPUs".to_string()
@@ -363,7 +365,7 @@ impl Summary<'_> {
                 t.version.as_deref().unwrap_or("NA")
             )?;
         }
-        writeln!(out, "done {} of {} (by key)", done(cells), cells.len())?;
+        writeln!(out, "done {} of {} (by key)", done(tasks), tasks.len())?;
         if !drift.is_empty() {
             writeln!(out, "changed since the last plan")?;
             for d in drift {

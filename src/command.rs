@@ -61,6 +61,56 @@ pub fn flag_pairs(args: &[String]) -> Result<Option<Vec<(&str, &str)>>> {
     Ok(Some(pairs))
 }
 
+/// A flag a command takes: its names, the first the canonical one, and
+/// whether it may be given more than once.
+pub struct Flag {
+    pub names: &'static [&'static str],
+    pub repeatable: bool,
+}
+
+impl Flag {
+    /// A flag given at most once, under any of `names`.
+    pub const fn once(names: &'static [&'static str]) -> Flag {
+        Flag {
+            names,
+            repeatable: false,
+        }
+    }
+
+    /// A flag that may be given any number of times.
+    pub const fn many(names: &'static [&'static str]) -> Flag {
+        Flag {
+            names,
+            repeatable: true,
+        }
+    }
+}
+
+/// `pairs` with each flag under its canonical name in `table`. A flag not
+/// in `table` is refused, and so is a flag that is not repeatable given
+/// twice, under any of its names.
+pub fn canonical_flags<'a>(
+    table: &[Flag],
+    pairs: Vec<(&str, &'a str)>,
+) -> Result<Vec<(&'static str, &'a str)>> {
+    let mut given: Vec<&str> = Vec::new();
+    let mut canonical = Vec::with_capacity(pairs.len());
+    for (flag, value) in pairs {
+        let Some(f) = table.iter().find(|f| f.names.contains(&flag)) else {
+            return Err(usage(format!("unknown argument {flag}")));
+        };
+        let name = f.names[0];
+        if !f.repeatable {
+            if given.contains(&name) {
+                return Err(usage(format!("{name} is given twice")));
+            }
+            given.push(name);
+        }
+        canonical.push((name, value));
+    }
+    Ok(canonical)
+}
+
 /// The value `v` of `flag` names, among `words`: each word and its value.
 pub fn one_of<T: Copy>(flag: &str, v: &str, words: &[(&str, T)]) -> Result<T> {
     match words.iter().find(|(w, _)| *w == v) {
@@ -121,6 +171,26 @@ mod tests {
         let e = flag_pairs(&args("--key K1 --score")).unwrap_err();
         assert_eq!(code(&e), 2);
         assert_eq!(e.to_string(), "--score needs a value, or is unknown");
+    }
+
+    #[test]
+    fn flags_take_their_canonical_name_and_once_unless_repeatable() {
+        const TABLE: &[Flag] = &[Flag::once(&["-o", "--out"]), Flag::many(&["--score"])];
+        let pairs = |s: &str| {
+            let a = args(s);
+            let given = canonical_flags(TABLE, flag_pairs(&a)?.unwrap())?;
+            Ok::<_, anyhow::Error>(format!("{given:?}"))
+        };
+        assert_eq!(
+            pairs("--out O1 --score M1 --score M2").unwrap(),
+            r#"[("-o", "O1"), ("--score", "M1"), ("--score", "M2")]"#
+        );
+        let e = pairs("-o O1 --out O2").unwrap_err();
+        assert_eq!(code(&e), 2);
+        assert_eq!(e.to_string(), "-o is given twice");
+        let e = pairs("--bogus 1").unwrap_err();
+        assert_eq!(code(&e), 2);
+        assert_eq!(e.to_string(), "unknown argument --bogus");
     }
 
     #[test]

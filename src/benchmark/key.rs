@@ -6,15 +6,7 @@
 
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::io::Read;
 use std::path::Path;
-
-/// FNV-1a 128 of `bytes`.
-pub fn fnv128(bytes: &[u8]) -> u128 {
-    let mut h = Fnv128::new();
-    h.write(bytes);
-    h.0
-}
 
 /// FNV-1a 128, fed in pieces.
 struct Fnv128(u128);
@@ -27,7 +19,7 @@ impl Fnv128 {
         Self(Self::OFFSET)
     }
 
-    fn write(&mut self, bytes: &[u8]) {
+    fn update(&mut self, bytes: &[u8]) {
         for &b in bytes {
             self.0 = (self.0 ^ u128::from(b)).wrapping_mul(Self::PRIME);
         }
@@ -35,6 +27,17 @@ impl Fnv128 {
 
     fn hex(&self) -> String {
         format!("{:032x}", self.0)
+    }
+}
+
+impl std::io::Write for Fnv128 {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -55,7 +58,9 @@ pub fn splitmix64(x: u64) -> u64 {
 
 /// The key of `bytes`: FNV-1a 128 as 32 hex digits.
 pub fn key(bytes: &[u8]) -> String {
-    format!("{:032x}", fnv128(bytes))
+    let mut h = Fnv128::new();
+    h.update(bytes);
+    h.hex()
 }
 
 /// `v` as compact JSON with every object's keys sorted by their bytes.
@@ -108,18 +113,11 @@ pub fn key_of(v: &Value) -> String {
 
 /// The key of the bytes of the file at `path`, read in pieces.
 pub fn file_key(path: &Path) -> Result<String> {
-    let mut f = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
     let mut h = Fnv128::new();
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = f
-            .read(&mut buf)
-            .with_context(|| format!("reading {}", path.display()))?;
-        if n == 0 {
-            return Ok(h.hex());
-        }
-        h.write(&buf[..n]);
-    }
+    std::fs::File::open(path)
+        .and_then(|f| std::io::copy(&mut std::io::BufReader::with_capacity(1 << 20, f), &mut h))
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(h.hex())
 }
 
 /// The key of the folder at `path`: of its listing, every file and folder
@@ -130,8 +128,8 @@ pub fn dir_key(path: &Path) -> Result<String> {
     rows.sort();
     let mut h = Fnv128::new();
     for row in &rows {
-        h.write(row.as_bytes());
-        h.write(b"\n");
+        h.update(row.as_bytes());
+        h.update(b"\n");
     }
     Ok(h.hex())
 }
@@ -170,8 +168,7 @@ mod tests {
     // values below. splitmix64 seeded 0 gives 0xe220a8397b1dcdaf first.
     #[test]
     fn hashes_match_their_published_vectors() {
-        assert_eq!(fnv128(b""), 0x6c62272e07bb014262b821756295c58d);
-        assert_eq!(fnv128(b"a"), 0xd228cb696f1a8caf78912b704e4a8964);
+        assert_eq!(key(b""), "6c62272e07bb014262b821756295c58d");
         assert_eq!(fnv64(b""), 0xcbf29ce484222325);
         assert_eq!(fnv64(b"a"), 0xaf63dc4c8601ec8c);
         assert_eq!(splitmix64(0), 0xe220a8397b1dcdaf);

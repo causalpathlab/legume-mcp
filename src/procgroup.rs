@@ -8,8 +8,7 @@
 //! be taken by another process, so a signal to the group reaches only what
 //! the child started. [`Group::stop`] reaps it to see the rest of the group
 //! go, and KILLs only a group it has just seen there; once it is done,
-//! nothing more is sent to the group. Off Unix the child alone is killed,
-//! as before.
+//! nothing more is sent to the group. Off Unix the child alone is killed.
 
 use std::io;
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus};
@@ -70,12 +69,6 @@ impl Group {
 
     /// TERM to the group, up to `grace` for the whole group to go, then
     /// KILL to what is left of it; how the leader ended, reaped.
-    ///
-    /// The leader is reaped once it exits, as an unreaped leader keeps its
-    /// group there; the rest of the group is then seen to go with signal 0.
-    /// While any of the group is left its id is not given to another group,
-    /// so the KILL, sent only to a group just seen to be there, reaches
-    /// only what the child started.
     #[cfg(unix)]
     pub fn stop(&mut self, grace: Duration) -> io::Result<ExitStatus> {
         self.signal(libc::SIGTERM);

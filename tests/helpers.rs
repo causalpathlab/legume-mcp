@@ -1,27 +1,17 @@
 //! The helpers a tool builds its calls from: its arguments, the paths and
 //! command lines it shows, and a free name for a run's outputs.
 
+mod mcp;
+
 use anyhow::Result;
 use legume_mcp::{command_line, free_prefix, parse_args, serve_in, shown_path};
 use legume_mcp::{Call, Content, Handler};
 use legume_mcp::{ServerInfo, ToolSpec};
+use mcp::{call, input, Sink};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::io::{Cursor, Write};
+use std::io::Cursor;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-
-#[derive(Clone, Default)]
-struct Sink(Arc<Mutex<Vec<u8>>>);
-
-impl Write for Sink {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
 
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +20,11 @@ struct PickArgs {
     skip: Vec<String>,
     #[serde(default)]
     all_taken: bool,
+}
+
+/// The outputs of a run at `out`: `{out}.a.bin`.
+fn plan_a_bin(out: &str) -> Result<Vec<PathBuf>> {
+    Ok(vec![PathBuf::from(format!("{out}.a.bin"))])
 }
 
 /// `pick`: a free `fit` prefix whose run writes `{out}.a.bin`; `hold`: a
@@ -47,11 +42,10 @@ impl Handler for Tools {
         match name {
             "pick" => {
                 let a: PickArgs = parse_args(args)?;
-                let plan = |out: &str| Ok(vec![PathBuf::from(format!("{out}.a.bin"))]);
                 let taken = |out: &str| {
                     a.all_taken || a.skip.iter().any(|s| out.ends_with(&format!("/{s}")))
                 };
-                let (out, outputs) = cx.free_prefix("fit", plan, taken)?;
+                let (out, outputs) = cx.free_prefix("fit", plan_a_bin, taken)?;
                 Ok(vec![Content::Json(
                     json!({ "out": out, "outputs": outputs }),
                 )])
@@ -68,14 +62,8 @@ impl Handler for Tools {
     }
 }
 
-fn call(id: u64, name: &str, args: Value) -> String {
-    let msg = json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
-                      "params": { "name": name, "arguments": args } });
-    format!("{msg}\n")
-}
-
 /// The replies of a session of `lines`, by id, keeping records at `project`.
-fn session(project: Option<PathBuf>, lines: &[String]) -> Vec<Value> {
+fn session(project: Option<PathBuf>, lines: &[Value]) -> Vec<Value> {
     let sink = Sink::default();
     let info = ServerInfo {
         name: "t".into(),
@@ -83,20 +71,22 @@ fn session(project: Option<PathBuf>, lines: &[String]) -> Vec<Value> {
         instructions: None,
     };
     serve_in(
-        Cursor::new(lines.concat()),
+        Cursor::new(input(lines)),
         sink.clone(),
         info,
         project,
         Tools,
     )
     .unwrap();
-    let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-    let mut replies: Vec<Value> = text
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
+    let mut replies = sink.messages();
     replies.sort_by_key(|r| r["id"].as_u64());
     replies
+}
+
+/// The text of the error reply `r`.
+fn error_of(r: &Value) -> &str {
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    r["result"]["content"][0]["text"].as_str().unwrap()
 }
 
 fn out_of(r: &Value) -> String {
@@ -145,9 +135,8 @@ fn a_folder_s_free_prefix_is_the_one_a_call_picks() {
     for name in ["fit", "fit-2"] {
         std::fs::write(day.join(format!("{name}.a.bin")), "").unwrap();
     }
-    let plan = |out: &str| Ok(vec![PathBuf::from(format!("{out}.a.bin"))]);
     let skip3 = |out: &str| out.ends_with("/fit-3");
-    let (out, outputs) = free_prefix(&day, "fit", plan, skip3).unwrap();
+    let (out, outputs) = free_prefix(&day, "fit", plan_a_bin, skip3).unwrap();
     assert_eq!(out, format!("{fit}-4"));
     assert_eq!(outputs, [PathBuf::from(format!("{fit}-4.a.bin"))]);
     let r = session(
@@ -176,16 +165,14 @@ fn a_free_prefix_gives_up_when_every_name_is_taken() {
         Some(tmp.path().to_path_buf()),
         &[call(1, "pick", json!({ "all_taken": true }))],
     );
-    assert_eq!(r[0]["result"]["isError"], true, "{}", r[0]);
-    let text = r[0]["result"]["content"][0]["text"].as_str().unwrap();
+    let text = error_of(&r[0]);
     assert!(text.contains("all taken"), "{text}");
 }
 
 #[test]
 fn without_records_a_free_prefix_asks_for_out() {
     let r = session(None, &[call(1, "pick", json!({}))]);
-    assert_eq!(r[0]["result"]["isError"], true, "{}", r[0]);
-    let text = r[0]["result"]["content"][0]["text"].as_str().unwrap();
+    let text = error_of(&r[0]);
     assert!(text.contains("keeps no records"), "{text}");
 }
 

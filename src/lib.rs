@@ -766,6 +766,14 @@ pub fn parse_args<T: serde::de::DeserializeOwned>(args: Value) -> Result<T> {
     serde_json::from_value(args).map_err(|e| anyhow::anyhow!("arguments: {e}"))
 }
 
+/// `path` from `root`, or the whole path when it is not under `root`.
+pub(crate) fn rel_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
 /// `p` as a tool's results show paths: from the root.
 pub fn shown_path(p: &Path) -> String {
     absolute(p).to_string_lossy().into_owned()

@@ -62,15 +62,29 @@ pub struct Counts {
 /// When `scores` and `labels` differ in length.
 pub fn rank(scores: &[Option<f64>], labels: &[bool]) -> Metrics {
     assert_eq!(scores.len(), labels.len(), "one label per score");
+    let (mut scored, unscored) = split(clean, scores, labels);
+    let n_pos = labels.iter().filter(|&&l| l).count();
+    of_groups(
+        tie_groups(&mut scored).chain(unscored),
+        n_pos,
+        labels.len() - n_pos,
+    )
+}
+
+/// The items cleaned by `clean`: the scored ones with their labels, in input
+/// order, and the unscored block, `None` when no item is unscored.
+fn split(
+    clean: impl Fn(Option<f64>) -> Option<f64>,
+    scores: &[Option<f64>],
+    labels: &[bool],
+) -> (Vec<(f64, bool)>, Option<Group>) {
     let mut scored = Vec::with_capacity(scores.len());
     let mut unscored = Group {
         items: 0,
         pos: 0,
         score: None,
     };
-    let mut n_pos = 0;
     for (&score, &pos) in scores.iter().zip(labels) {
-        n_pos += usize::from(pos);
         match clean(score) {
             Some(x) => scored.push((x, pos)),
             None => {
@@ -79,12 +93,7 @@ pub fn rank(scores: &[Option<f64>], labels: &[bool]) -> Metrics {
             }
         }
     }
-    let unscored = (unscored.items > 0).then_some(unscored);
-    of_groups(
-        tie_groups(&mut scored).chain(unscored),
-        n_pos,
-        labels.len() - n_pos,
-    )
+    (scored, (unscored.items > 0).then_some(unscored))
 }
 
 /// A score made ready to rank: `None` when unscored (missing, NaN or
@@ -431,20 +440,8 @@ mod tests {
         scores: &[Option<f64>],
         labels: &[bool],
     ) -> Vec<Group> {
-        let (mut scored, mut unscored) = (Vec::new(), Vec::new());
-        for (&score, &pos) in scores.iter().zip(labels) {
-            match f(score) {
-                Some(x) => scored.push((x, pos)),
-                None => unscored.push(pos),
-            }
-        }
-        let block = Group {
-            items: unscored.len(),
-            pos: unscored.iter().filter(|&&pos| pos).count(),
-            score: None,
-        };
-        let tail = (block.items > 0).then_some(block);
-        tie_groups(&mut scored).chain(tail).collect()
+        let (mut scored, unscored) = split(f, scores, labels);
+        tie_groups(&mut scored).chain(unscored).collect()
     }
 
     /// Cleaned and sorted from the top down, each item its own group: ties

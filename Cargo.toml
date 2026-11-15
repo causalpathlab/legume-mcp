@@ -1,13 +1,12 @@
 [package]
 name = "legume-mcp"
-version = "0.5.7"
+version = "0.5.8"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT"
 authors = ["Yongjin Park <ypp@stat.ubc.ca> <yongjin.park@ubc.ca>"]
 description = "A small stdio Model Context Protocol server for legume tools: tools, progress, cancellation and child runs"
 repository = "https://github.com/causalpathlab/legume-mcp"
-homepage = "https://github.com/causalpathlab/legume-mcp"
 readme = "README.md"
 keywords = ["mcp", "agent", "json-rpc", "genomics"]
 categories = ["science", "command-line-utilities"]
