@@ -3,8 +3,8 @@
 //! benchmark's folder, from where it runs. A reinstall cannot change the
 //! bytes under a key, and two builds of one tool (CPU and CUDA) sit side
 //! by side. `versions.tsv` says what each one is: its source, content
-//! key, what runs, and `ABS --version` (5 s at most, the tool's whole
-//! process group killed after; informational only).
+//! key, what runs, and `exec --version` (within [`VERSION_TIMEOUT`], the
+//! tool's whole process group killed after; informational only).
 //!
 //! A later plan keeps a tool's snapshot when the installed one has
 //! changed, and says so; `--retool` takes the installed one, rekeying its

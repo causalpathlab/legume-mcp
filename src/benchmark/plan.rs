@@ -370,6 +370,7 @@ fn upstream(spec: &Spec, si: usize, lane: &Lane, t: &str, at: &str, name: &str) 
     }
 }
 
+/// The methods of `stage`'s lanes.
 fn lane_names(stage: &Stage) -> Vec<&str> {
     stage
         .lanes
@@ -958,6 +959,7 @@ fn natural(a: &str, b: &str) -> Ordering {
     }
 }
 
+/// A run of digits less its leading zeros, keeping one digit.
 fn trim_zeros(d: &[u8]) -> &[u8] {
     let z = d.iter().take_while(|&&c| c == b'0').count();
     &d[z.min(d.len().saturating_sub(1))..]

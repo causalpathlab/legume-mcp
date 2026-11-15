@@ -349,10 +349,11 @@ fn outside(count: usize, policy: Outside, what: &str, flag: &str, column: &str) 
     Ok(())
 }
 
-/// The universe `spec` names, the truth over it and the score rows' items,
-/// from the scores read, saying what it counted on `out`: the score
-/// columns, the truth and the rows. The keys are left here, so only those
-/// are held while the scores are ranked.
+/// The universe `spec` names, read with the truth over it: says on `out`
+/// how many universe items, truth rows and score rows it counted, and
+/// returns the score columns, the truth and each score row's item. The
+/// keys are dropped here, so only the number columns are held while the
+/// scores are ranked.
 fn over_universe(
     spec: &Spec,
     scores: Keyed,

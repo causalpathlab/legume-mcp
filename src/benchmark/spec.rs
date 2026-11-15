@@ -37,7 +37,8 @@ pub struct Spec {
     pub name: String,
     /// Cores to book; the machine's logical CPUs when not given.
     pub cores: Option<u32>,
-    /// Memory to book, in GB; MemAvailable at plan time when not given.
+    /// Memory to book, in GB (GiB, 2^30 bytes); MemAvailable at plan time
+    /// when not given.
     pub mem_gb: Option<f64>,
     pub gpus: Vec<u32>,
     pub gpu_slots: u32,
@@ -52,7 +53,10 @@ pub struct Spec {
     /// By name.
     pub inputs: Vec<Input>,
     pub stages: Vec<Stage>,
+    /// Method/score pairs gather compares; checked here, not read until
+    /// gather is built.
     pub compare: Vec<[String; 2]>,
+    /// What gather plots; checked here, not read until gather is built.
     pub plot: Option<Plot>,
 }
 
@@ -96,6 +100,7 @@ pub struct Input {
 #[derive(Clone, Debug)]
 pub struct Stage {
     pub name: String,
+    /// Its lanes are methods: each lane's method is Some.
     pub methods: bool,
     pub lanes: Vec<Lane>,
 }

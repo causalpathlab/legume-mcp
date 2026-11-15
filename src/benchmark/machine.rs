@@ -8,7 +8,8 @@ use crate::command::refuse;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-/// What is known of this machine; `None` where it cannot say.
+/// What is known of this machine; `None` where it cannot say. Memory is in
+/// GB (GiB, 2^30 bytes).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Machine {
     pub host: Option<String>,
@@ -16,9 +17,8 @@ pub struct Machine {
     pub kernel: Option<String>,
     pub cores_logical: u32,
     pub cores_physical: Option<u32>,
-    /// GiB.
     pub mem_total_gb: f64,
-    /// GiB, at plan time; not compared between plans.
+    /// At plan time; not compared between plans.
     pub mem_available_gb: Option<f64>,
     pub gpus: Vec<String>,
     pub gpu_driver: Option<String>,

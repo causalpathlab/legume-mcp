@@ -644,8 +644,8 @@ fn a_folder_input_holding_the_benchmark_is_refused() {
 }
 
 // An input whose path has `..` or a link is the file it resolves to: an
-// argv path to that file, however written, reads it, so its content enters the key, and no
-// warning calls it undeclared.
+// argv path to that file, however written, reads it, so its content
+// enters the key, and no warning calls it undeclared.
 #[test]
 fn an_input_is_matched_once_resolved() {
     for (path, named) in [

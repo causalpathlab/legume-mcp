@@ -2,17 +2,8 @@
 //! stages and their methods, planned from a spec. `legume benchmark plan
 //! SPEC` expands the spec to its cells, resolves and snapshots its tools,
 //! and writes the benchmark's configuration to `results/benchmarks/<name>/`
-//! in the project, apart from any output, so it can be run again:
-//!
-//! ```text
-//! specs/<key>.json   the spec as canonical JSON, named by its content key
-//! plan.json          every cell: argv, env, threads, GPUs, timeout, seeds, key
-//! machine.json       the machine it was first planned on
-//! versions.tsv       each tool's source, content key, snapshot and --version
-//! tools/<key>/       the snapshots that run
-//! ```
-//!
-//! Nothing runs yet.
+//! in the project, the files [`USAGE`] lists, apart from any output, so it
+//! can be run again. Nothing runs yet.
 
 pub mod executor;
 pub mod key;
