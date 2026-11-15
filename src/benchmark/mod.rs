@@ -14,9 +14,11 @@
 //!
 //! Nothing runs yet.
 
+pub mod executor;
 pub mod key;
 pub mod machine;
 pub mod plan;
+pub mod pool;
 pub mod spec;
 pub mod tools;
 
