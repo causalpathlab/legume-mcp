@@ -156,6 +156,12 @@ pub enum State {
     },
 }
 
+impl State {
+    fn is_running(&self) -> bool {
+        matches!(self, State::Running(_))
+    }
+}
+
 /// Core-ms by class.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Acct {
@@ -307,8 +313,11 @@ impl Pool {
 
     /// Threads booked by running cells.
     pub fn booked(&self) -> u32 {
-        let running = |(s, w): (&State, &Want)| matches!(s, State::Running(_)).then_some(w.threads);
-        self.state.iter().zip(&self.wants).filter_map(running).sum()
+        let states = self.state.iter().zip(&self.wants);
+        states
+            .filter(|(s, _)| s.is_running())
+            .map(|(_, w)| w.threads)
+            .sum()
     }
 
     /// The cells to launch at `now`, with the machine as `live` says.
@@ -396,7 +405,7 @@ impl Pool {
 
     /// Nothing runs, and nothing more will start.
     pub fn finished(&self) -> bool {
-        let running = (0..self.state.len()).any(|i| self.is_running(i));
+        let running = self.state.iter().any(State::is_running);
         !running && (self.stopped() || !self.state.contains(&State::Pending))
     }
 
@@ -426,7 +435,16 @@ impl Pool {
     }
 
     fn is_running(&self, i: usize) -> bool {
-        matches!(self.state[i], State::Running(_))
+        self.state[i].is_running()
+    }
+
+    /// Cell `i` is pending and every cell upstream of it is done.
+    fn is_ready(&self, i: usize) -> bool {
+        self.state[i] == State::Pending
+            && self.wants[i]
+                .upstream
+                .iter()
+                .all(|&j| self.state[j] == State::Ended(Outcome::Done))
     }
 
     fn pending(&self, i: usize) -> Result<()> {
@@ -465,12 +483,9 @@ impl Pool {
         let mut out = Vec::new();
         let mut best = Hold::Nothing;
         let mut reserving = false;
-        let done = |s: &[State], u: &usize| s[*u] == State::Ended(Outcome::Done);
         for k in 0..self.order.len() {
             let i = self.order[k];
-            let ready = self.state[i] == State::Pending
-                && self.wants[i].upstream.iter().all(|u| done(&self.state, u));
-            if !ready {
+            if !self.is_ready(i) {
                 continue;
             }
             let mut hold = self.hold_of(i, &u);
@@ -515,9 +530,8 @@ impl Pool {
             return Hold::Capped;
         }
         let floor = |avail: f64| u.grow_gb + w.mem_gb + FLOOR_GB > avail;
-        let gpus = |n: u32| (u.free_devices(self.budget.gpu_slots) as u32) < n;
         if u.mem_gb + w.mem_gb > self.budget.mem_gb
-            || (w.gpus > 0 && gpus(w.gpus))
+            || u.free_devices(self.budget.gpu_slots) < w.gpus as usize
             || self.live.disk_low
             || self.live.mem_available_gb.is_some_and(floor)
         {
