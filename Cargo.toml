@@ -7,7 +7,6 @@ license = "MIT"
 authors = ["Yongjin Park <ypp@stat.ubc.ca> <yongjin.park@ubc.ca>"]
 description = "A small stdio Model Context Protocol server for legume tools: tools, progress, cancellation and child runs"
 repository = "https://github.com/causalpathlab/legume-mcp"
-homepage = "https://github.com/causalpathlab/legume-mcp"
 readme = "README.md"
 keywords = ["mcp", "agent", "json-rpc", "genomics"]
 categories = ["science", "command-line-utilities"]

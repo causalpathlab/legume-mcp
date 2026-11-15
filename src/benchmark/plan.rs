@@ -131,7 +131,7 @@ fn segments(token: &str) -> std::result::Result<Vec<Seg<'_>>, String> {
 /// Another tool's argv names `{legume}`.
 fn embeds_legume(method: &Method) -> bool {
     method.tool_word() != LEGUME
-        && method.run[1..].iter().any(|t| {
+        && method.run.iter().any(|t| {
             segments(t)
                 .unwrap_or_default()
                 .contains(&Seg::Name("legume"))
