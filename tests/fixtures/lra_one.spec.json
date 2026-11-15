@@ -1,6 +1,7 @@
 {
   "name": "lra-one",
-  "mem_gb": 8,
+  "cores": 2,
+  "mem_gb": 4,
   "grace_secs": 10,
   "axes": {
     "effect_pve": ["0.02", "0.05", "0.1", "0.2", "0.4"],
@@ -12,7 +13,7 @@
   "seeds": {"n": 5, "base": 1},
   "inputs": {"RUN1": {"path": "RUN1/manifest.json"}},
   "stages": [
-    {"name": "sim", "threads": 4, "mem_gb": 4, "timeout": "30m",
+    {"name": "sim", "threads": 2, "mem_gb": 4, "timeout": "30m",
      "run": ["pinto", "lra-simulate", "--one", "--from", "{inputs.RUN1}",
              "--set", "effect_pve={effect_pve}", "--set", "confounder={confounder}",
              "--set", "confound_scale={confound_scale}", "--set", "n_planted=10",

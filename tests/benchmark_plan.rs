@@ -193,10 +193,10 @@ fn the_lra_one_spec_plans_its_cells_tools_and_keys() {
             sim_out.as_str(),
         ]
     );
-    assert_eq!(sim["threads"], 4);
+    assert_eq!(sim["threads"], 2);
     assert_eq!(sim["mem_gb"], 4.0);
     assert_eq!(sim["timeout_secs"], 1800);
-    assert_eq!(sim["env"]["RAYON_NUM_THREADS"], "4");
+    assert_eq!(sim["env"]["RAYON_NUM_THREADS"], "2");
     let score = cells
         .iter()
         .find(|c| c["stage"] == "score" && c["upstream"][0] == id)
