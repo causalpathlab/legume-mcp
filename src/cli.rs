@@ -4,6 +4,7 @@
 //! arguments (data files, the output prefix) out of the map and names them
 //! in the refusals.
 
+use crate::text;
 use anyhow::Result;
 use clap::error::{ContextKind, ErrorKind};
 use clap::{Arg, ArgAction, ArgMatches, Command};
@@ -91,14 +92,6 @@ pub fn find<'a>(cmd: &'a Command, key: &str) -> Option<&'a Arg> {
                 c.next() == Some(s) && c.next().is_none()
             })
     })
-}
-
-/// A value as it goes on the command line.
-fn text(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        v => v.to_string(),
-    }
 }
 
 /// The words for setting `arg` to `value`; null leaves it at its default.

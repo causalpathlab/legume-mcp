@@ -210,7 +210,6 @@ impl Slurm {
         // The wrapper's timeout and grace go first; Slurm's --time is
         // only a backstop, a few minutes after.
         let minutes = (t.timeout_secs + self.grace_secs).div_ceil(60) + 5;
-        let mem_mb = (t.mem_gb * 1024.0).ceil().max(1.0) as u64;
         let wrap = format!(
             "exec {} benchmark task --plan {} --list {}",
             quote(&s.legume),
@@ -218,16 +217,28 @@ impl Slurm {
             quote(list)
         );
         let mut args = format!(
-            "sbatch --parsable --job-name={} --array=0-{} --cpus-per-task={} --mem={mem_mb}M \
+            "sbatch --parsable --job-name={} --array=0-{} --cpus-per-task={}{} \
              --time={minutes} --open-mode=append --output={} --wrap={}",
             quote(&s.run),
             n - 1,
             t.threads,
+            mem_flag(t.mem_gb),
             quote(&format!("{}/{name}_%a.log", s.slurm_dir)),
             quote(&wrap)
         );
         args.push_str(&place_flags(s.partition.as_deref(), s.account.as_deref()));
         args
+    }
+}
+
+/// The `--mem` flag for a task of `mem_gb`, with a space before it; none
+/// for 0, a task whose memory is not counted, which then gets the
+/// partition's default.
+fn mem_flag(mem_gb: f64) -> String {
+    if mem_gb > 0.0 {
+        format!(" --mem={}M", (mem_gb * 1024.0).ceil() as u64)
+    } else {
+        String::new()
     }
 }
 
@@ -624,6 +635,14 @@ fn parse_poll(out: &str) -> Poll {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_task_whose_memory_is_not_counted_asks_for_none() {
+        // Not the 1 MB that Slurm would kill it at.
+        assert_eq!(mem_flag(0.0), "");
+        assert_eq!(mem_flag(1.0), " --mem=1024M");
+        assert_eq!(mem_flag(2.5), " --mem=2560M");
+    }
 
     fn job(array_job: &str, index: usize) -> Job {
         Job {

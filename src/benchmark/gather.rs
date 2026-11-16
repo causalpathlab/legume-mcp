@@ -47,7 +47,7 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
     let text = std::fs::read_to_string(&spec_file)
         .with_context(|| format!("reading {}", spec_file.display()))?;
     let (spec, value) = super::spec::parse(&text)?;
-    let spec_key = super::key::key(super::key::spec_file(&value).as_bytes());
+    let spec_key = super::key::spec_key(&value);
     let root = crate::project::root().context("finding the project's folder")?;
     let dir = root.join(super::bench_rel(&spec.name));
     let file = dir.join("plan.json");

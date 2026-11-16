@@ -25,7 +25,7 @@ use super::plan::{PlanDoc, Task};
 use super::pool::{Budget, Pool, State, Want};
 use super::remote::{self, Remote, Shell};
 use super::slurm::{srun, Site, Slurm};
-use crate::command::{canonical_flags, failed, flag_pairs, refuse, required, usage, Flag};
+use crate::command::{failed, flags, refuse, required, usage, Flag};
 use crate::project::quote;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 /// `legume benchmark run`'s usage.
 pub const USAGE: &str = "\
-legume benchmark run SPEC --on REMOTE
+legume benchmark run SPEC --on REMOTE [--detach]
 
 Runs the benchmark of the spec SPEC on the cluster REMOTE, from here:
 the spec is planned on a compute node there, and each task runs as a
@@ -48,9 +48,15 @@ an earlier run are reused, and tasks still in Slurm's queue adopted.
 Each start and end is a row of results/benchmarks/<name>/events.tsv
 here. At the end, the scores of the tasks done are copied here and
 gathered into summary.tsv and the rest (legume benchmark gather --help).
-Ctrl-C cancels the run's tasks; run again to resume.";
+Ctrl-C cancels the run's tasks; run again to resume.
 
-const FLAGS: &[Flag] = &[Flag::once(&["--on"])];
+With --detach, the run starts in the background, in a session of its
+own, and this returns at once: its output goes to run.log in the
+benchmark's folder, and its pid to runner.json there. legume benchmark
+stop NAME stops it as Ctrl-C would. A remote not kept yet is asked for
+first.";
+
+const FLAGS: &[Flag] = &[Flag::once(&["--on"]), Flag::switch(&["--detach"])];
 
 /// Cores the pool may book at once on a cluster: Slurm's scheduler and
 /// each method's max_running are the real limits.
@@ -77,21 +83,32 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
         Some(s) if s.starts_with('-') => (None, args),
         Some(s) => (Some(PathBuf::from(s)), &args[1..]),
     };
-    let Some(pairs) = flag_pairs(rest)? else {
+    let Some(given) = flags(FLAGS, rest)? else {
         return Ok(writeln!(out, "{USAGE}")?);
     };
-    let mut on = None;
-    for (_, v) in canonical_flags(FLAGS, pairs)? {
-        on = Some(v.to_string());
+    let (mut on, mut detach) = (None, false);
+    for (flag, v) in given {
+        match flag {
+            "--detach" => detach = true,
+            _ => on = Some(v.to_string()),
+        }
     }
     let spec = spec.ok_or_else(|| usage("run needs SPEC, the spec's JSON file"))?;
     let on = required(on, "--on")?;
-    let code = run(&spec, &on, out, err)?;
-    if code == 0 {
-        Ok(())
-    } else {
-        Err(failed(code, "not every task is done"))
+    if detach {
+        return super::runner::detach_main(&spec, &on, out);
     }
+    super::runner::keep_alive_lock();
+    let result = run(&spec, &on, out, err).and_then(|code| match code {
+        0 => Ok(()),
+        code => Err(failed(code, "not every task is done")),
+    });
+    // A detached runner notes how it ended, for a status to read.
+    if let Some(file) = std::env::var_os(super::runner::RUNNER_ENV) {
+        let code = result.as_ref().map_or_else(crate::command::code, |()| 0);
+        super::runner::ended(Path::new(&file), code, err);
+    }
+    result
 }
 
 /// The run of spec `spec_file` on remote `on`: its exit code.
@@ -99,7 +116,7 @@ fn run(spec_file: &Path, on: &str, out: &mut dyn Write, err: &mut dyn Write) -> 
     let text = std::fs::read_to_string(spec_file)
         .with_context(|| format!("reading {}", spec_file.display()))?;
     let (spec, value) = super::spec::parse(&text)?;
-    let spec_key = super::key::key(super::key::spec_file(&value).as_bytes());
+    let spec_key = super::key::spec_key(&value);
     let root = crate::project::root().context("finding the project's folder")?;
     // Named for the project and its place here, so two projects of one
     // name keep apart there.
@@ -249,6 +266,10 @@ impl Cluster<'_> {
                 t.id
             )));
         }
+        // plan.json here from the start, so a status read while the run
+        // goes on knows every task; the end writes it again with the scores.
+        std::fs::create_dir_all(local).with_context(|| format!("making {}", local.display()))?;
+        super::gather::write(local, "plan.json", &plan_text)?;
         let bench = self.bench(&spec.name);
         let site = Site {
             legume: self.legume.clone(),
@@ -370,7 +391,7 @@ impl Runner<'_> {
     fn resume(&mut self, out: &mut dyn Write) -> Result<()> {
         let resumed = self.ex.resume()?;
         self.pool.resume(0, &resumed.done, &resumed.adopted)?;
-        for (list, event) in [(&resumed.done, "reused"), (&resumed.adopted, "adopted")] {
+        for (list, event) in [(&resumed.done, REUSED), (&resumed.adopted, ADOPTED)] {
             for &i in list {
                 self.events.mark(&self.tasks[i], event)?;
             }
@@ -457,7 +478,7 @@ impl Runner<'_> {
             running.len()
         )?;
         for &i in &running {
-            self.events.mark(&self.tasks[i], "stop-requested")?;
+            self.events.mark(&self.tasks[i], STOP_REQUESTED)?;
         }
         self.events.flush()?;
         self.ex.cancel(&running)
@@ -478,7 +499,7 @@ impl Runner<'_> {
         let at = unix_secs();
         for l in &round.launched {
             self.submitted.insert(l.task, at);
-            self.events.mark(&self.tasks[l.task], "start")?;
+            self.events.mark(&self.tasks[l.task], START)?;
         }
         // A task is skipped only when an end (its upstream's, or its
         // method's halt) says so.
@@ -486,7 +507,7 @@ impl Runner<'_> {
             for (i, said) in self.skipped_said.iter_mut().enumerate() {
                 if !*said && matches!(self.pool.state(i), State::Skipped { .. }) {
                     *said = true;
-                    self.events.mark(&self.tasks[i], "skipped")?;
+                    self.events.mark(&self.tasks[i], SKIPPED)?;
                 }
             }
         }
@@ -534,6 +555,29 @@ struct Events {
 }
 
 const EVENTS_HEADER: &str = "time\ttask\tattempt\tevent\twall_secs\tcpu_secs\tqueue_secs\tnode\n";
+
+/// The words of `events.tsv`'s `event` column besides an end's
+/// ([`Outcome::word`]): a task submitted, done in an earlier run, still
+/// in the queue from one, skipped, or asked to stop.
+const START: &str = "start";
+const REUSED: &str = "reused";
+const ADOPTED: &str = "adopted";
+const SKIPPED: &str = "skipped";
+const STOP_REQUESTED: &str = "stop-requested";
+
+/// The state a task is in when `word` is its latest event in
+/// `events.tsv`: running, done, failed, stopped or skipped; `None` for a
+/// word that does not change it (a stop asked for).
+pub(crate) fn event_state(word: &str) -> Option<&'static str> {
+    Some(match word {
+        START | ADOPTED => "running",
+        "done" | REUSED => "done",
+        "failed" | "timeout" | "oom" | "lost" => "failed",
+        "stopped" => "stopped",
+        SKIPPED => "skipped",
+        _ => return None,
+    })
+}
 
 impl Events {
     fn open(dir: &Path) -> Result<Self> {
@@ -597,5 +641,31 @@ impl Events {
 
     fn flush(&mut self) -> Result<()> {
         Ok(self.file.flush()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::pool::Outcome;
+    use super::*;
+
+    #[test]
+    fn every_word_events_tsv_writes_says_a_state_but_a_stop_asked_for() {
+        let ends = [
+            (Outcome::Done, "done"),
+            (Outcome::Failed, "failed"),
+            (Outcome::Timeout, "failed"),
+            (Outcome::Oom, "failed"),
+            (Outcome::Lost, "failed"),
+            (Outcome::Stopped, "stopped"),
+        ];
+        for (o, state) in ends {
+            assert_eq!(event_state(o.word()), Some(state), "{o:?}");
+        }
+        assert_eq!(event_state(START), Some("running"));
+        assert_eq!(event_state(ADOPTED), Some("running"));
+        assert_eq!(event_state(REUSED), Some("done"));
+        assert_eq!(event_state(SKIPPED), Some("skipped"));
+        assert_eq!(event_state(STOP_REQUESTED), None);
     }
 }

@@ -10,7 +10,7 @@
 //! when the cluster wants them:
 //!
 //! ```toml
-//! [R1]
+//! [REMOTE1]
 //! ssh = "HOST1"
 //! folder = "/path/on/the/cluster"
 //! bin = "/path/on/the/cluster/legume/bin"
@@ -82,11 +82,18 @@ fn absolute(p: &str) -> bool {
     p.starts_with('/')
 }
 
+/// `remotes.toml` and the remotes it keeps (none before it is made).
+pub fn kept() -> Result<(PathBuf, Vec<Remote>)> {
+    let file = config_file()
+        .ok_or_else(|| refuse("no config folder for remotes.toml: set HOME, or LEGUME_REMOTES"))?;
+    let all = read(&file)?;
+    Ok((file, all))
+}
+
 /// Remote `name`, from `remotes.toml`, or asked for on stdin and kept.
 pub fn named(name: &str, out: &mut dyn Write) -> Result<Remote> {
-    let file =
-        config_file().ok_or_else(|| refuse("no config folder: set HOME, or LEGUME_REMOTES"))?;
-    if let Some(r) = read(&file)?.into_iter().find(|r| r.name == name) {
+    let (file, all) = kept()?;
+    if let Some(r) = all.into_iter().find(|r| r.name == name) {
         return Ok(r);
     }
     let r = ask(name, &mut std::io::stdin().lock(), out)?;
@@ -540,9 +547,9 @@ mod tests {
         }
     }
 
-    fn r1() -> Remote {
+    fn remote1() -> Remote {
         Remote {
-            name: "R1".into(),
+            name: "REMOTE1".into(),
             ssh: "HOST1".into(),
             folder: "/a/b \"c\"".into(),
             bin: Some("/a/bin".into()),
@@ -554,9 +561,9 @@ mod tests {
     #[test]
     fn remotes_round_trip_through_toml() {
         let text = to_toml(&[
-            r1(),
+            remote1(),
             Remote {
-                name: "R2".into(),
+                name: "REMOTE2".into(),
                 ssh: "u@h".into(),
                 folder: "/x".into(),
                 bin: None,
@@ -565,31 +572,34 @@ mod tests {
             },
         ]);
         let back = parse(&text).unwrap();
-        assert_eq!(back[0], r1());
+        assert_eq!(back[0], remote1());
         assert_eq!(back[1].account.as_deref(), Some("ACCT1"));
     }
 
     #[test]
     fn comments_and_blank_lines_are_skipped() {
-        let r = parse("# mine\n\n[R1]\nssh = \"HOST1\"  # a host\nfolder = \"/x\"\n").unwrap();
+        let r = parse("# mine\n\n[REMOTE1]\nssh = \"HOST1\"  # a host\nfolder = \"/x\"\n").unwrap();
         assert_eq!((r[0].ssh.as_str(), r[0].folder.as_str()), ("HOST1", "/x"));
     }
 
     #[test]
     fn bad_remotes_are_refused() {
         for (text, says) in [
-            ("[R1]\nssh = \"h\"\n", "needs ssh and folder"),
+            ("[REMOTE1]\nssh = \"h\"\n", "needs ssh and folder"),
             (
-                "[R1]\nssh = \"h\"\nfolder = \"~/x\"\n",
+                "[REMOTE1]\nssh = \"h\"\nfolder = \"~/x\"\n",
                 "is not an absolute path",
             ),
             (
-                "[R1]\nssh = \"h\"\nfolder = \"/x\"\nport = \"22\"\n",
+                "[REMOTE1]\nssh = \"h\"\nfolder = \"/x\"\nport = \"22\"\n",
                 "unknown key port",
             ),
             ("ssh = \"h\"\n", "before any [section]"),
-            ("[R1]\nssh = h\n", "double quotes"),
-            ("[R1]\nssh = \"h\" x\n", "after a value's closing quote"),
+            ("[REMOTE1]\nssh = h\n", "double quotes"),
+            (
+                "[REMOTE1]\nssh = \"h\" x\n",
+                "after a value's closing quote",
+            ),
             ("[R 1]\n", "letters, digits"),
         ] {
             let e = format!("{:#}", parse(text).unwrap_err());
@@ -601,7 +611,7 @@ mod tests {
     fn a_bin_outside_an_install_is_kept_and_said() {
         let mut input: &[u8] = b"HOST1\n/x\n/x/tools\n\n\n";
         let mut said = Vec::new();
-        let r = ask("R1", &mut input, &mut said).unwrap();
+        let r = ask("REMOTE1", &mut input, &mut said).unwrap();
         assert_eq!((r.bin.as_deref(), r.prefix()), (Some("/x/tools"), None));
         assert!(String::from_utf8(said)
             .unwrap()
@@ -617,11 +627,11 @@ mod tests {
     fn asking_repeats_until_a_needed_answer_and_leaves_optional_ones_empty() {
         let mut input: &[u8] = b"\nHOST1\n~/x\n/x\n\n\nACCT1\n";
         let mut said = Vec::new();
-        let r = ask("R1", &mut input, &mut said).unwrap();
+        let r = ask("REMOTE1", &mut input, &mut said).unwrap();
         assert_eq!(
             r,
             Remote {
-                name: "R1".into(),
+                name: "REMOTE1".into(),
                 ssh: "HOST1".into(),
                 folder: "/x".into(),
                 bin: None,
@@ -637,7 +647,7 @@ mod tests {
     #[test]
     fn no_answer_is_refused() {
         let mut input: &[u8] = b"HOST1\n";
-        let e = ask("R1", &mut input, &mut Vec::new()).unwrap_err();
+        let e = ask("REMOTE1", &mut input, &mut Vec::new()).unwrap_err();
         assert_eq!(crate::command::code(&e), 3);
     }
 
@@ -645,8 +655,8 @@ mod tests {
     fn save_replaces_a_remote_of_the_same_name() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("legume").join("remotes.toml");
-        save(&file, &r1()).unwrap();
-        let mut again = r1();
+        save(&file, &remote1()).unwrap();
+        let mut again = remote1();
         again.ssh = "HOST2".into();
         save(&file, &again).unwrap();
         let all = read(&file).unwrap();

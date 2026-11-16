@@ -169,7 +169,7 @@ pub fn guide(id: Option<&str>) -> Result<String> {
 /// The recipes for whole pieces of work, as MCP prompts: what a person
 /// starts with (`/mcp__legume__explore` in Claude Code).
 pub(crate) fn prompts() -> Vec<Prompt> {
-    vec![
+    let prompts = vec![
         Prompt::new(
             "explore",
             "Explore a data set",
@@ -185,8 +185,47 @@ pub(crate) fn prompts() -> Vec<Prompt> {
             TRIANGULATE,
         )
         .arg("hypothesis", "The hypothesis, as H1, H2, ... (`status` lists them)", false),
-    ]
+    ];
+    // The benchmark recipe, when legume has the benchmark tools.
+    #[cfg(all(feature = "benchmark", unix))]
+    let prompts: Vec<Prompt> = prompts.into_iter().chain([
+        Prompt::new(
+            "benchmark",
+            "Run a benchmark",
+            "Turn the person's description of a benchmark into a spec, check and plan it with them, start it on a cluster and follow it (guide section `benchmark`).",
+            BENCHMARK,
+        )
+        .arg("what", "What the person wants to compare, in their words", false)
+        .arg("on", "The remote to run on, as remotes.toml names it", false),
+    ]).collect();
+    prompts
 }
+
+/// The `benchmark` prompt.
+#[cfg(all(feature = "benchmark", unix))]
+const BENCHMARK: &str = "\
+Let us run a benchmark together (the legume guide, section `benchmark`).
+
+What to compare: {what}
+Remote: {on}
+
+1. Read guide section `benchmark` (`guide` with {\"section\": \"benchmark\"}).
+2. Ask me what I want to compare, in plain words: the methods, the settings \
+to vary (the axes) and their values, how many replicates, the truth each \
+method is scored against, and the metric I will read. Ask which remote to run \
+on if I have not said.
+3. Write the spec from my words. Show it to me, briefly, field by field.
+4. Call `benchmark_plan` with the spec and `on`. If it refuses, fix the field \
+it names and call it again; ask me when the fix is a choice of mine.
+5. Show me the counts (points x replicates x methods, the tasks) and what each \
+task books, and ask before starting. Suggest a small pilot first (one seed, \
+fewer points) when the benchmark is large.
+6. Call `benchmark_start` and tell me plainly what is running and where. If it \
+refuses the remote, tell me what to add to my remotes.toml.
+7. Follow it with `benchmark_status` now and then; tell me of failures as they \
+come. It runs on after this conversation ends; if I ask to stop it, call \
+`benchmark_stop`, and a start again resumes it. Once it ends, show me \
+summary.tsv and ask me what I see in it; record my words in the notebook.";
 
 const EXPLORE: &str = "\
 Let us explore a data set together, the way the legume guide says (its sections 4 and 13).
@@ -236,11 +275,12 @@ on our cells is our cells, not curated knowledge.
 6. Use only the verb the table allows, and name what disagrees. \"Drives\" needs \
 genetic, perturbation or applied-treatment evidence that agrees.";
 
+/// The `legume` server's handler.
 struct Brain;
 
 impl Handler for Brain {
     fn tools(&self) -> Vec<ToolSpec> {
-        vec![
+        let tools = vec![
             ToolSpec::new(
                 "guide",
                 "The guide to working with the legume tools and the user: without `section`, its sections; with one (e.g. \"8.3\", \"quick\"), that section's text.",
@@ -271,7 +311,14 @@ impl Handler for Brain {
             )
             .writes()
             .idempotent(),
-        ]
+        ];
+        // The benchmark tools, when legume has them.
+        #[cfg(all(feature = "benchmark", unix))]
+        let tools: Vec<ToolSpec> = tools
+            .into_iter()
+            .chain(crate::benchmark::mcp::tools())
+            .collect();
+        tools
     }
 
     fn prompts(&self) -> Vec<Prompt> {
@@ -290,6 +337,8 @@ impl Handler for Brain {
                 let built = crate::report::build(p.root(), args["day"].as_str())?;
                 crate::report::said(p.root(), &built)
             }
+            #[cfg(all(feature = "benchmark", unix))]
+            n if n.starts_with("benchmark_") => crate::benchmark::mcp::call(n, &args, cx)?,
             _ => anyhow::bail!("no tool `{name}`"),
         };
         Ok(vec![Content::Text(text)])

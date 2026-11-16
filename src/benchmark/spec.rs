@@ -790,18 +790,25 @@ fn plot(v: Option<&Value>, axes: &[Axis]) -> Result<Option<Plot>> {
     Ok(Some(Plot { x, facet, metrics }))
 }
 
-fn from_value(v: &Value) -> Result<Spec> {
-    let mut o = Obj::new("", v).map_err(|_| refuse("the spec is not a JSON object"))?;
-    let name = o
-        .string("name")?
-        .ok_or_else(|| bad("name", "is required: the benchmark's folder name"))?;
-    let name = value("name", &name)?;
+/// `name`, a benchmark's name, which names its folder: one to 40 of
+/// `[A-Za-z0-9._-]`, not starting with a dot.
+pub(crate) fn benchmark_name(name: &str) -> Result<String> {
+    let name = value("name", name)?;
     if name.starts_with('.') {
         return Err(bad(
             "name",
             format!("{name:?} starts with a dot; a benchmark's folder is not hidden"),
         ));
     }
+    Ok(name)
+}
+
+fn from_value(v: &Value) -> Result<Spec> {
+    let mut o = Obj::new("", v).map_err(|_| refuse("the spec is not a JSON object"))?;
+    let name = o
+        .string("name")?
+        .ok_or_else(|| bad("name", "is required: the benchmark's folder name"))?;
+    let name = benchmark_name(&name)?;
     let cores = o.nonzero_u32("cores", "is 0, so nothing could run")?;
     let mem_gb = o.number("mem_gb")?;
     let gpus = gpu_ids(&mut o)?;

@@ -62,11 +62,21 @@ pub fn required<T>(what: Option<T>, flag: &str) -> Result<T> {
 /// `args` as flag and value pairs; `None` for `-h` or `--help` in a flag's
 /// place. A flag with no value after it is refused.
 pub fn flag_pairs(args: &[String]) -> Result<Option<Vec<(&str, &str)>>> {
+    pairs(args, |_| false)
+}
+
+/// `args` as flag and value pairs, a flag that `switch` says takes no
+/// value paired with an empty one.
+fn pairs(args: &[String], switch: impl Fn(&str) -> bool) -> Result<Option<Vec<(&str, &str)>>> {
     let mut pairs = Vec::with_capacity(args.len() / 2);
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         if matches!(flag.as_str(), "-h" | "--help") {
             return Ok(None);
+        }
+        if switch(flag) {
+            pairs.push((flag.as_str(), ""));
+            continue;
         }
         let Some(value) = it.next() else {
             return Err(usage(format!("{flag} needs a value, or is unknown")));
@@ -76,11 +86,27 @@ pub fn flag_pairs(args: &[String]) -> Result<Option<Vec<(&str, &str)>>> {
     Ok(Some(pairs))
 }
 
-/// A flag a command takes: its names, the first the canonical one, and
-/// whether it may be given more than once.
+/// `args` as the flags of `table`, each under its canonical name with its
+/// value (a switch's empty); `None` for `-h` or `--help` in a flag's
+/// place. Refused as [`flag_pairs`] and [`canonical_flags`] refuse.
+pub fn flags<'a>(
+    table: &[Flag],
+    args: &'a [String],
+) -> Result<Option<Vec<(&'static str, &'a str)>>> {
+    let switch = |a: &str| table.iter().any(|f| f.switch && f.names.contains(&a));
+    match pairs(args, switch)? {
+        Some(p) => canonical_flags(table, p).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// A flag a command takes: its names, the first the canonical one,
+/// whether it may be given more than once, and whether it is a switch,
+/// which takes no value.
 pub struct Flag {
     pub names: &'static [&'static str],
     pub repeatable: bool,
+    pub switch: bool,
 }
 
 impl Flag {
@@ -89,6 +115,7 @@ impl Flag {
         Flag {
             names,
             repeatable: false,
+            switch: false,
         }
     }
 
@@ -97,6 +124,16 @@ impl Flag {
         Flag {
             names,
             repeatable: true,
+            switch: false,
+        }
+    }
+
+    /// A flag that takes no value, given at most once.
+    pub const fn switch(names: &'static [&'static str]) -> Flag {
+        Flag {
+            names,
+            repeatable: false,
+            switch: true,
         }
     }
 }
@@ -207,6 +244,27 @@ mod tests {
         let e = pairs("--bogus 1").unwrap_err();
         assert_eq!(code(&e), 2);
         assert_eq!(e.to_string(), "unknown argument --bogus");
+    }
+
+    #[test]
+    fn a_switch_takes_no_value() {
+        const TABLE: &[Flag] = &[Flag::once(&["--on"]), Flag::switch(&["--detach"])];
+        let a = args("--detach --on R1");
+        assert_eq!(
+            flags(TABLE, &a).unwrap().unwrap(),
+            [("--detach", ""), ("--on", "R1")]
+        );
+        let a = args("--on R1 --detach --detach");
+        assert_eq!(
+            flags(TABLE, &a).unwrap_err().to_string(),
+            "--detach is given twice"
+        );
+        assert!(flags(TABLE, &args("--detach -h")).unwrap().is_none());
+        let a = args("--detach --on");
+        assert_eq!(
+            flags(TABLE, &a).unwrap_err().to_string(),
+            "--on needs a value, or is unknown"
+        );
     }
 
     #[test]

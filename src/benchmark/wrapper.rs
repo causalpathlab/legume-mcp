@@ -163,6 +163,10 @@ fn run(t: &Task, grace: Duration) -> Result<Option<(i32, String)>> {
     unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
     super::stop::catch();
 
+    // Where this attempt's part of the job's output starts: Slurm appends
+    // every attempt's to one file.
+    let output_from = job_output().map_or(0, |(_, len)| len);
+    let oom_kills_before = oom_kills();
     let start = Instant::now();
     let started = super::executor::unix_secs();
     let mut cmd = std::process::Command::new(first);
@@ -191,9 +195,21 @@ fn run(t: &Task, grace: Duration) -> Result<Option<(i32, String)>> {
         }
     };
     let (cpu_secs, max_rss_mb) = children_usage();
-    let oom = oom_said(&log_path);
-    // Stopped, then timed out, then done, then out of memory, then failed.
-    let (outcome, not_done) = if stopped {
+    // Ended for its memory: the kernel killed something in the job's
+    // memory group meanwhile, or Slurm said so in the job's own output
+    // (this wrapper's stdout); a tool that still exited 0 was not.
+    let memory_killed = status.code() != Some(0)
+        && (oom_kills()
+            .zip(oom_kills_before)
+            .is_some_and(|(now, before)| now > before)
+            || slurm_said_oom(output_from));
+    let oom = memory_killed || oom_said(&log_path);
+    // Ended for its memory, then stopped, then timed out, then done, then
+    // out of memory by the tool's say, then failed.
+    let (outcome, not_done) = if memory_killed {
+        let why = "ended for exceeding its memory".to_string();
+        (Outcome::Oom, Some(why))
+    } else if stopped {
         (Outcome::Stopped, Some("stopped".to_string()))
     } else if timed_out {
         let why = format!("timed out after {} s", t.timeout_secs);
@@ -404,19 +420,150 @@ fn children_usage() -> (f64, f64) {
 /// it ("memory allocation of N bytes failed"). Evidence only: a kill by
 /// Slurm for memory is not said here.
 fn oom_said(log: &Path) -> bool {
-    use std::io::{Read, Seek, SeekFrom};
-    const TAIL: u64 = 64 << 10;
-    let Ok(mut f) = std::fs::File::open(log) else {
-        return false;
-    };
-    let len = f.metadata().map_or(0, |m| m.len());
-    let mut tail = Vec::new();
-    if f.seek(SeekFrom::Start(len.saturating_sub(TAIL))).is_err()
-        || f.read_to_end(&mut tail).is_err()
-    {
-        return false;
-    }
-    String::from_utf8_lossy(&tail)
+    super::tail::tail(log, TAIL)
         .lines()
         .any(|l| l.contains("memory allocation of ") && l.ends_with(" bytes failed"))
+}
+
+/// How many times the kernel has killed a process for memory in this
+/// process's memory group and its parents up to its Slurm job's (or only
+/// its own, outside Slurm), from cgroup v2's `memory.events` or v1's
+/// `memory.oom_control`; none when neither can be read.
+fn oom_kills() -> Option<u64> {
+    let groups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let (root, path) = groups.lines().find_map(|l| {
+        let mut parts = l.splitn(3, ':');
+        let (_, controllers, path) = (parts.next()?, parts.next()?, parts.next()?);
+        match controllers {
+            "" => Some(("/sys/fs/cgroup".to_string(), path)),
+            c if c.split(',').any(|c| c == "memory") => {
+                Some(("/sys/fs/cgroup/memory".to_string(), path))
+            }
+            _ => None,
+        }
+    })?;
+    let mut total = None;
+    for dir in oom_groups(path) {
+        let dir = Path::new(&root).join(dir.trim_start_matches('/'));
+        let text = std::fs::read_to_string(dir.join("memory.events"))
+            .or_else(|_| std::fs::read_to_string(dir.join("memory.oom_control")));
+        if let Some(n) = text.ok().as_deref().and_then(oom_kill_count) {
+            total = Some(total.unwrap_or(0) + n);
+        }
+    }
+    total
+}
+
+/// The memory groups whose kills count for a process in group `path`:
+/// it and its parents up to the one named for its Slurm job (`job_N`),
+/// or only it when none is.
+fn oom_groups(path: &str) -> Vec<&str> {
+    let Some(job) = path.find("/job_") else {
+        return vec![path];
+    };
+    // The job's group ends at the next `/`, or is the whole path.
+    let job_end = path[job + 1..]
+        .find('/')
+        .map_or(path.len(), |i| job + 1 + i);
+    let mut groups = vec![path];
+    let mut at = path;
+    while at.len() > job_end {
+        at = &at[..at.rfind('/').unwrap_or(job_end)];
+        groups.push(at);
+    }
+    groups
+}
+
+/// The `oom_kill` count in a `memory.events` or `memory.oom_control`.
+fn oom_kill_count(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("oom_kill ")?.trim().parse().ok())
+}
+
+/// The job's output file (this wrapper's stdout, when it is a file) and
+/// its length now.
+fn job_output() -> Option<(std::path::PathBuf, u64)> {
+    let path = std::fs::read_link("/proc/self/fd/1").ok()?;
+    let meta = std::fs::metadata(&path).ok()?;
+    meta.is_file().then_some((path, meta.len()))
+}
+
+/// Whether Slurm said, in the job's output past byte `from` (this
+/// attempt's part), that it ended the job for its memory: slurmstepd
+/// writes that there before it stops the job.
+fn slurm_said_oom(from: u64) -> bool {
+    job_output().is_some_and(|(path, _)| slurm_oom_in(&super::tail::tail_from(&path, from, TAIL)))
+}
+
+/// Whether `text` has slurmstepd's word that a job went over its memory.
+fn slurm_oom_in(text: &str) -> bool {
+    text.lines().any(|l| {
+        l.starts_with("slurmstepd")
+            && (l.contains("exceeded memory limit")
+                || l.contains("Exceeded job memory limit")
+                || l.contains("oom-kill"))
+    })
+}
+
+/// How much of the end of a log is read for what it says.
+const TAIL: u64 = 64 << 10;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slurms_word_on_memory_is_read_and_nothing_else() {
+        for said in [
+            "slurmstepd: error: Job 1 exceeded memory limit (2340 > 1024), being killed",
+            "slurmstepd: error: Exceeded job memory limit",
+            "slurmstepd: error: Detected 1 oom-kill event(s) in step 1.batch cgroup.",
+        ] {
+            assert!(slurm_oom_in(&format!("x\n{said}\n")), "{said}");
+        }
+        assert!(!slurm_oom_in("my tool: exceeded memory limit\n"));
+        assert!(!slurm_oom_in(
+            "slurmstepd: error: *** JOB 1 CANCELLED ***\n"
+        ));
+    }
+
+    #[test]
+    fn the_kernels_kills_count_up_to_the_slurm_job() {
+        assert_eq!(
+            oom_groups("/slurm/uid_1/job_2/step_batch/task_0"),
+            [
+                "/slurm/uid_1/job_2/step_batch/task_0",
+                "/slurm/uid_1/job_2/step_batch",
+                "/slurm/uid_1/job_2"
+            ]
+        );
+        assert_eq!(oom_groups("/user.slice/a.scope"), ["/user.slice/a.scope"]);
+        assert_eq!(
+            oom_kill_count("low 0\nhigh 0\nmax 3\noom 1\noom_kill 2\n"),
+            Some(2)
+        );
+        assert_eq!(
+            oom_kill_count("oom_kill_disable 0\nunder_oom 0\noom_kill 5\n"),
+            Some(5)
+        );
+        assert_eq!(oom_kill_count("oom_kill_disable 0\n"), None);
+    }
+
+    #[test]
+    fn a_tail_starts_past_what_an_earlier_attempt_wrote() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("out.log");
+        std::fs::write(
+            &f,
+            "old: exceeded
+new
+",
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::tail::tail_from(&f, 14, TAIL),
+            "new
+"
+        );
+    }
 }
