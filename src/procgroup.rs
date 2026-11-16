@@ -37,6 +37,12 @@ impl Group {
         })
     }
 
+    /// The leader's pid, the group's id.
+    #[cfg(all(feature = "benchmark", target_os = "linux"))]
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
     /// The leader's stdout, when it is piped and not taken yet.
     pub fn take_stdout(&mut self) -> Option<ChildStdout> {
         self.child.stdout.take()
@@ -110,7 +116,7 @@ impl Group {
     /// still the group's: the leader is not reaped yet, or [`Self::stop`]
     /// has just seen the group there.
     #[cfg(unix)]
-    fn signal(&self, sig: libc::c_int) -> bool {
+    pub fn signal(&self, sig: libc::c_int) -> bool {
         if self.reaped {
             return false;
         }

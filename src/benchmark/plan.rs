@@ -38,7 +38,7 @@ use super::spec::{
 use super::tools::Resolved;
 use crate::command::refuse;
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -65,8 +65,8 @@ impl Context<'_> {
     }
 }
 
-/// One task, as `plan.json` lists it.
-#[derive(Clone, Debug, Serialize)]
+/// One task, as `plan.json` lists it, and as the wrapper reads it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
     pub point: BTreeMap<String, String>,

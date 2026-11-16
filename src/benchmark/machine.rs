@@ -75,6 +75,11 @@ pub fn here() -> Machine {
     }
 }
 
+/// This machine's host name.
+pub(crate) fn host() -> Option<String> {
+    uname().0
+}
+
 /// The host name, and the kernel as `sysname release`.
 fn uname() -> (Option<String>, Option<String>) {
     // SAFETY: an all-zero utsname is valid; uname fills it in.

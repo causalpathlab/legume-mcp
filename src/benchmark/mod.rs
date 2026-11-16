@@ -3,7 +3,8 @@
 //! plan SPEC` expands the spec to its tasks, resolves and snapshots its tools,
 //! and writes the benchmark's configuration to `results/benchmarks/<name>/`
 //! in the project, the files [`USAGE`] lists, apart from any output, so it
-//! can be run again. Nothing runs yet.
+//! can be run again. `legume benchmark task` runs one of its tasks under
+//! the [`wrapper`], as a compute node runs it.
 
 pub mod executor;
 pub mod key;
@@ -12,6 +13,8 @@ pub mod plan;
 pub mod pool;
 pub mod spec;
 pub mod tools;
+#[cfg(target_os = "linux")]
+pub mod wrapper;
 
 use crate::command::{refuse, usage};
 use anyhow::{Context, Result};
@@ -40,7 +43,12 @@ It writes results/benchmarks/<name>/ in the project:
 
 and says what it planned. A later plan lists what changed: the machine,
 and each tool installed since, whose snapshot it keeps. --retool plans
-with the tools installed now, which rekeys their tasks. Nothing runs yet.";
+with the tools installed now, which rekeys their tasks.
+
+legume benchmark task --plan PLAN (--task ID | --list FILE [--index N])
+
+Runs one task of a plan under the wrapper, as a compute node runs it
+(legume benchmark task --help).";
 
 /// `legume benchmark` with `args` (those after `benchmark`), saying what
 /// it planned on `out` and its warnings on `err`. A refusal is a
@@ -63,8 +71,12 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
             let spec = spec.ok_or_else(|| usage("plan needs SPEC, the spec's JSON file"))?;
             plan_spec(&spec, retool, out, err)
         }
+        #[cfg(target_os = "linux")]
+        Some("task") => wrapper::main(&args[1..], out, err),
+        #[cfg(not(target_os = "linux"))]
+        Some("task") => Err(usage("benchmark task runs on Linux only")),
         Some(other) => Err(usage(format!(
-            "unknown command {other}: benchmark has plan"
+            "unknown command {other}: benchmark has plan and task"
         ))),
     }
 }

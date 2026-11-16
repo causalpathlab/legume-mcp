@@ -1,6 +1,6 @@
 [package]
 name = "legume-mcp"
-version = "0.5.9"
+version = "0.5.10"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT"
@@ -103,4 +103,8 @@ required-features = ["benchmark"]
 
 [[test]]
 name = "benchmark_pool"
+required-features = ["benchmark"]
+
+[[test]]
+name = "benchmark_task"
 required-features = ["benchmark"]

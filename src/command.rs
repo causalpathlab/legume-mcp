@@ -10,6 +10,8 @@ use anyhow::Result;
 pub struct Exit {
     pub code: i32,
     pub message: String,
+    /// The command line cannot run: its usage is said after the message.
+    pub usage: bool,
 }
 
 impl std::fmt::Display for Exit {
@@ -25,6 +27,18 @@ pub fn usage(message: impl std::fmt::Display) -> anyhow::Error {
     Exit {
         code: 2,
         message: message.to_string(),
+        usage: true,
+    }
+    .into()
+}
+
+/// What a command ran and how it failed: exit code `code`, any but 0, as
+/// when it passes on a tool's own.
+pub fn failed(code: i32, message: impl std::fmt::Display) -> anyhow::Error {
+    Exit {
+        code,
+        message: message.to_string(),
+        usage: false,
     }
     .into()
 }
@@ -35,6 +49,7 @@ pub fn refuse(message: impl std::fmt::Display) -> anyhow::Error {
     Exit {
         code: 3,
         message: message.to_string(),
+        usage: false,
     }
     .into()
 }
@@ -150,6 +165,7 @@ mod tests {
         let e = Exit {
             code: 3,
             message: "M1".into(),
+            usage: false,
         };
         assert_eq!(code(&e.into()), 3);
     }
