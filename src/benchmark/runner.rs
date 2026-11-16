@@ -4,24 +4,27 @@
 //! asks it to stop. The benchmark's folder keeps:
 //!
 //! - `run.log`: the runner's stdout and stderr, appended run after run;
-//! - `runner.json`: the runner's pid and the time its process started,
-//!   when and on which remote it started, the spec's key, and, once it
-//!   ended, its exit code;
+//! - `runner.json`: the runner's pid, when and on which remote it
+//!   started, the spec's key, and, once it ended, its exit code;
+//! - `runner.alive`: locked by the runner for its whole life, so the
+//!   system lets it go as the runner ends, however it ends. The start
+//!   takes it, under `runner.lock`, and hands it down to the runner;
 //! - `runner.lock`: held while a start checks for a live runner, starts
 //!   one and writes `runner.json`, and while a runner notes its end, so
 //!   two starts never both go ahead and an end is never noted before the
 //!   start that it ends.
 //!
-//! A runner is alive while its pid is there, started when `runner.json`
-//! says (on Linux, by `/proc/<pid>/stat`), and runs `benchmark run`.
+//! A runner is alive while `runner.alive` is locked.
 
 use super::bench_rel;
 use super::remote::{self, Remote};
+use super::spec::Spec;
 use crate::command::{refuse, usage};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::fs::File;
 use std::io::Write;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -38,8 +41,15 @@ as Ctrl-C ends a run in a terminal. A run again resumes.";
 /// there how it ended.
 pub(super) const RUNNER_ENV: &str = "LEGUME_BENCHMARK_RUNNER";
 
+/// Set in a detached runner's environment, to the descriptor it holds
+/// `runner.alive` locked by.
+const ALIVE_FD_ENV: &str = "LEGUME_BENCHMARK_ALIVE_FD";
+
 /// The runner's file, in the benchmark's folder.
 pub(crate) const RUNNER_FILE: &str = "runner.json";
+
+/// The lock a runner holds for its whole life, in the benchmark's folder.
+const ALIVE_FILE: &str = "runner.alive";
 
 /// The lock a start and an end hold, in the benchmark's folder.
 const LOCK_FILE: &str = "runner.lock";
@@ -51,10 +61,6 @@ pub(crate) const LOG_FILE: &str = "run.log";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct RunnerFile {
     pub(crate) pid: u32,
-    /// When its process started, in clock ticks since boot (Linux's
-    /// `/proc/<pid>/stat`): a pid used again later has another.
-    #[serde(default)]
-    pub(crate) start_ticks: Option<u64>,
     /// When it started (RFC 3339).
     pub(crate) started: String,
     pub(crate) spec_key: String,
@@ -106,69 +112,53 @@ pub(crate) fn read(dir: &Path) -> Option<RunnerFile> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// When process `pid` started, in clock ticks since boot: field 22 of
-/// `/proc/<pid>/stat`, read after its name (which may hold spaces).
-#[cfg(target_os = "linux")]
-fn start_ticks(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let (_, after) = stat.rsplit_once(')')?;
-    // After the name, the fields from the third: the 22nd is the 20th.
-    after.split_whitespace().nth(19)?.parse().ok()
-}
-
-/// No start times off Linux.
-#[cfg(not(target_os = "linux"))]
-fn start_ticks(_pid: u32) -> Option<u64> {
-    None
-}
-
-/// Whether runner `r` is alive: its pid there, started when it says, and
-/// running `benchmark run`, whatever its program's path (a reinstalled
-/// legume's is `/proc/self/exe`).
-#[cfg(target_os = "linux")]
-pub(crate) fn alive(r: &RunnerFile) -> bool {
-    if r.start_ticks.is_some_and(|t| start_ticks(r.pid) != Some(t)) {
-        return false;
-    }
-    // A zombie's, or a gone process's, cmdline is empty.
-    let Ok(bytes) = std::fs::read(format!("/proc/{}/cmdline", r.pid)) else {
-        return false;
-    };
-    let args: Vec<&[u8]> = bytes.split(|&b| b == 0).collect();
-    args.windows(2)
-        .any(|w| w[0] == b"benchmark" && w[1] == b"run")
-}
-
-/// Whether runner `r`'s pid is there: it can be sent a signal.
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn alive(r: &RunnerFile) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(r.pid) else {
-        return false;
-    };
-    // SAFETY: signal 0 checks the pid, and sends nothing.
-    unsafe { libc::kill(pid, 0) == 0 }
+/// Whether the runner of the benchmark in `dir` is alive: another holds
+/// its `runner.alive`.
+pub(crate) fn alive(dir: &Path) -> bool {
+    let path = dir.join(ALIVE_FILE);
+    path.exists() && matches!(crate::lock::try_lock(&path), Ok(None))
 }
 
 /// The live runner of the benchmark in `dir`, if one is.
 pub(crate) fn live(dir: &Path) -> Option<RunnerFile> {
-    read(dir).filter(|r| r.exit.is_none() && alive(r))
+    alive(dir).then(|| read(dir)).flatten()
 }
 
 /// `runner.lock` in `dir`, held until the file returned is dropped.
-fn lock(dir: &Path) -> Result<std::fs::File> {
+fn lock(dir: &Path) -> Result<File> {
     let path = dir.join(LOCK_FILE);
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    // SAFETY: flock on a file this function opened, waiting for it.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("locking {}", path.display()));
+    crate::lock::lock(&path).with_context(|| format!("locking {}", path.display()))
+}
+
+/// `cmd` set to start in a session of its own, holding `alive` (the
+/// start's lock on `runner.alive`) from its first moment, by a descriptor
+/// kept across exec and named in [`ALIVE_FD_ENV`].
+fn hand_down(cmd: &mut Command, alive: &File) {
+    let fd = alive.as_raw_fd();
+    cmd.env(ALIVE_FD_ENV, fd.to_string());
+    // SAFETY: setsid and fcntl are async-signal-safe, the calls between
+    // fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setsid() == -1 || libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
-    Ok(file)
+}
+
+/// In a detached runner: the descriptor of its lock on `runner.alive`
+/// ([`hand_down`]) closed on exec again, so the commands it runs do not
+/// hold the lock past its end.
+pub(super) fn keep_alive_lock() {
+    let fd = std::env::var(ALIVE_FD_ENV)
+        .ok()
+        .and_then(|v| v.parse::<RawFd>().ok());
+    if let Some(fd) = fd {
+        // SAFETY: fcntl on a descriptor number: on any other, it fails.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
 }
 
 /// Remote `on` as `remotes.toml` keeps it; one not there is asked for on
@@ -178,9 +168,7 @@ pub(crate) fn kept_remote(on: &str, ask: Option<&mut dyn Write>) -> Result<Remot
     if let Some(out) = ask {
         return remote::named(on, out);
     }
-    let file = remote::config_file()
-        .ok_or_else(|| refuse("no config folder for remotes.toml: set HOME, or LEGUME_REMOTES"))?;
-    let all = remote::read(&file)?;
+    let (file, all) = remote::kept()?;
     match all.iter().find(|r| r.name == on) {
         Some(r) => Ok(r.clone()),
         None => Err(Refused::UnknownRemote {
@@ -192,12 +180,20 @@ pub(crate) fn kept_remote(on: &str, ask: Option<&mut dyn Write>) -> Result<Remot
     }
 }
 
+/// `legume benchmark run SPEC --on ON`, run by this legume's own binary.
+pub(crate) fn run_command(spec_file: &Path, on: &str) -> Result<Command> {
+    let mut cmd = crate::own_command(["benchmark", "run"])?;
+    cmd.arg(spec_file).arg("--on").arg(on);
+    Ok(cmd)
+}
+
 /// A detached start: the project, the spec's file (as the runner reads
-/// it) and text, and the remote.
+/// it), the spec read and its key, and the remote.
 pub(crate) struct Detach<'a> {
     pub(crate) root: &'a Path,
     pub(crate) spec_file: &'a Path,
-    pub(crate) text: &'a str,
+    pub(crate) spec: &'a Spec,
+    pub(crate) spec_key: &'a str,
     pub(crate) on: &'a str,
 }
 
@@ -226,25 +222,33 @@ impl Started {
 /// benchmark's folder. Under `runner.lock`: refused while a runner of the
 /// benchmark is alive ([`Refused::Running`]); the remote found, asked for
 /// on `ask` when given ([`kept_remote`]); then `before` (what the start
-/// writes once it goes ahead), the runner started, and `runner.json`
-/// written.
+/// writes once it goes ahead), the runner started holding `runner.alive`,
+/// and `runner.json` written.
 pub(crate) fn detach(
     d: &Detach,
     ask: Option<&mut dyn Write>,
     before: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Started> {
-    let (spec, value) = super::spec::parse(d.text)?;
-    let spec_key = super::key::key(super::key::spec_file(&value).as_bytes());
-    let dir = d.root.join(bench_rel(&spec.name));
+    let name = &d.spec.name;
+    let dir = d.root.join(bench_rel(name));
     std::fs::create_dir_all(&dir).with_context(|| format!("making {}", dir.display()))?;
     let _held = lock(&dir)?;
     if let Some(runner) = live(&dir) {
         return Err(Refused::Running {
-            name: spec.name,
+            name: name.clone(),
             runner,
         }
         .into());
     }
+    let alive_path = dir.join(ALIVE_FILE);
+    let alive = crate::lock::try_lock(&alive_path)
+        .with_context(|| format!("locking {}", alive_path.display()))?
+        .with_context(|| {
+            format!(
+                "{} is held, though {RUNNER_FILE} names no live runner",
+                alive_path.display()
+            )
+        })?;
     kept_remote(d.on, ask)?;
     before()?;
     let log_path = dir.join(LOG_FILE);
@@ -260,46 +264,32 @@ pub(crate) fn detach(
         d.spec_file.display(),
         d.on
     )?;
-    let exe = crate::own_exe().context("finding this legume")?;
-    let mut cmd = Command::new(exe);
-    cmd.arg("benchmark")
-        .arg("run")
-        .arg(d.spec_file)
-        .arg("--on")
-        .arg(d.on)
-        .current_dir(d.root)
+    let mut cmd = run_command(d.spec_file, d.on)?;
+    cmd.current_dir(d.root)
         .env(crate::project::ROOT_ENV, d.root)
         .env(RUNNER_ENV, dir.join(RUNNER_FILE))
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
-    // SAFETY: setsid is async-signal-safe, the one call between fork and
-    // exec.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    hand_down(&mut cmd, &alive);
     let mut child = cmd.spawn().context("starting the runner")?;
+    // The runner holds it from here.
+    drop(alive);
     let pid = child.id();
     // Reaped here while this process lasts; once it ends, by whoever
     // adopts the runner.
     std::thread::spawn(move || child.wait());
     let file = RunnerFile {
         pid,
-        start_ticks: start_ticks(pid),
         started,
-        spec_key,
+        spec_key: d.spec_key.to_string(),
         remote: d.on.to_string(),
         exit: None,
         ended: None,
     };
-    crate::job::replace(&dir, RUNNER_FILE, crate::pretty(&file)?.as_bytes())?;
+    super::gather::write(&dir, RUNNER_FILE, crate::pretty(&file)?)?;
     Ok(Started {
-        name: spec.name,
+        name: name.clone(),
         on: d.on.to_string(),
         pid,
     })
@@ -310,12 +300,14 @@ pub(crate) fn detach(
 pub(super) fn detach_main(spec_file: &Path, on: &str, out: &mut dyn Write) -> Result<()> {
     let text = std::fs::read_to_string(spec_file)
         .with_context(|| format!("reading {}", spec_file.display()))?;
+    let (spec, value) = super::spec::parse(&text)?;
     let root = crate::project::root().context("finding the project's folder")?;
     let spec_file = crate::absolute(spec_file);
     let d = Detach {
         root: &root,
         spec_file: &spec_file,
-        text: &text,
+        spec: &spec,
+        spec_key: &super::key::spec_key(&value),
         on,
     };
     let started = detach(&d, Some(&mut *out), &mut || Ok(())).map_err(|e| {
@@ -350,7 +342,7 @@ pub(super) fn ended(file: &Path, code: i32, err: &mut dyn Write) {
     r.exit = Some(code);
     r.ended = Some(crate::project::rfc3339());
     if let Ok(text) = crate::pretty(&r) {
-        let _ = crate::job::replace(dir, RUNNER_FILE, text.as_bytes());
+        let _ = super::gather::write(dir, RUNNER_FILE, text);
     }
 }
 
@@ -370,7 +362,7 @@ pub(crate) fn stop_runner(dir: &Path, name: &str) -> Result<String> {
         )));
     };
     let pid = libc::pid_t::try_from(r.pid).context("a pid out of range")?;
-    // SAFETY: a plain kill of the pid runner.json names, checked alive.
+    // SAFETY: a plain kill of the pid runner.json names, alive by its lock.
     if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
         return Err(std::io::Error::last_os_error()).context(format!("stopping pid {pid}"));
     }
@@ -395,38 +387,46 @@ pub fn stop_main(args: &[String], out: &mut dyn Write) -> Result<()> {
     Ok(write!(out, "{said}")?)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn runner(pid: u32, start_ticks: Option<u64>) -> RunnerFile {
-        RunnerFile {
-            pid,
-            start_ticks,
-            started: String::new(),
-            spec_key: String::new(),
-            remote: String::new(),
-            exit: None,
-            ended: None,
-        }
+    #[test]
+    fn a_runner_is_alive_while_its_lock_is_held_handed_down_or_not() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(!alive(d.path()), "no runner.alive");
+        let held = crate::lock::try_lock(&d.path().join(ALIVE_FILE))
+            .unwrap()
+            .unwrap();
+        assert!(alive(d.path()));
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        hand_down(&mut cmd, &held);
+        let mut child = cmd.spawn().unwrap();
+        drop(held);
+        // The child holds it now.
+        assert!(alive(d.path()));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // A child another test forks meanwhile holds it too, until it
+        // execs.
+        let gone = (0..100).any(|_| {
+            let gone = !alive(d.path());
+            if !gone {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            gone
+        });
+        assert!(gone);
     }
 
     #[test]
-    fn a_runner_is_alive_by_its_start_and_its_arguments_not_its_name() {
-        let mut child = Command::new("sh")
-            .args(["-c", "sleep 30; true", "benchmark", "run"])
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        let ticks = start_ticks(pid).unwrap();
-        assert!(alive(&runner(pid, Some(ticks))));
-        assert!(alive(&runner(pid, None)));
-        // Another process at that pid started at another time.
-        assert!(!alive(&runner(pid, Some(ticks + 1))));
-        // This test is not a `benchmark run`.
-        assert!(!alive(&runner(std::process::id(), None)));
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert!(!alive(&runner(pid, Some(ticks))));
+    fn a_run_is_legume_benchmark_run_spec_on_remote() {
+        let cmd = run_command(Path::new("specs-in/N1.json"), "REMOTE1").unwrap();
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            ["benchmark", "run", "specs-in/N1.json", "--on", "REMOTE1"]
+        );
     }
 }

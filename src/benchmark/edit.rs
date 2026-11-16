@@ -158,6 +158,11 @@ pub struct MethodCount {
     pub threads: u32,
     pub mem_gb: f64,
     pub timeout_secs: u64,
+    pub gpus: u32,
+    /// The most of its tasks that run at once, when it says.
+    pub max_running: Option<u32>,
+    /// The word naming its tool ([`spec::Method::tool_word`]).
+    pub tool: String,
 }
 
 /// What the spec, as it stands, plans and refuses.
@@ -612,7 +617,7 @@ impl Editor {
 
     /// The spec key of the file's spec, if there is one, and of this one.
     pub fn keys(&self) -> (Option<String>, String) {
-        let k = |v: &Value| key::key(key::spec_file(v).as_bytes());
+        let k = key::spec_key;
         (self.saved.as_ref().map(k), k(&self.value))
     }
 
@@ -955,7 +960,8 @@ fn value_label(v: &Value) -> String {
     }
 }
 
-fn plural(n: usize) -> &'static str {
+/// A plural's `s`, unless `n` is 1.
+pub(crate) fn plural(n: usize) -> &'static str {
     if n == 1 {
         ""
     } else {
@@ -1112,6 +1118,9 @@ pub(crate) fn counts(spec: &spec::Spec, canonical: &Value) -> Counts {
                 threads: m.threads,
                 mem_gb: m.mem_gb,
                 timeout_secs: m.timeout_secs,
+                gpus: m.gpus,
+                max_running: m.max_running,
+                tool: m.tool_word().to_string(),
             })
         })
         .collect();
@@ -1128,7 +1137,7 @@ pub(crate) fn counts(spec: &spec::Spec, canonical: &Value) -> Counts {
         cores: spec.cores,
         mem_gb: spec.mem_gb,
         core_hours,
-        key: key::key(key::spec_file(canonical).as_bytes()),
+        key: key::spec_key(canonical),
     }
 }
 

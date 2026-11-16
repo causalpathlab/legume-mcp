@@ -182,6 +182,18 @@ fn a_refused_spec_names_the_field_to_fix() {
         "{text}"
     );
     assert!(text.contains("Fix that field"), "{text}");
+    // Threads past the cores the spec books, refused as the editor
+    // refuses them, by a check and by a start.
+    let mut bad = spec();
+    bad["cores"] = json!(1);
+    for tool in ["benchmark_plan", "benchmark_start"] {
+        let (text, error) = s.call(tool, json!({ "spec": bad, "on": "REMOTE1" }));
+        assert!(error, "{text}");
+        assert!(
+            text.contains("stages[1].threads: 2 is more than the benchmark's cores, 1"),
+            "{text}"
+        );
+    }
     // A placeholder that names nothing, refused by the plan's checks.
     let mut bad = spec();
     bad["stages"][1]["run"][1] = json!("{nothing}/sim.tsv");
