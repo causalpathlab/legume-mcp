@@ -20,6 +20,7 @@
 
 use crate::command::refuse;
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -309,15 +310,16 @@ pub struct Shell {
     env: Vec<(OsString, OsString)>,
 }
 
-/// What a script printed and how it exited.
-pub struct Ran {
-    pub stdout: String,
+/// What a script printed and how it exited: its stdout as text, or as
+/// the bytes it printed.
+pub struct Ran<O = String> {
+    pub stdout: O,
     pub stderr: String,
     /// `None` when a signal ended it.
     pub code: Option<i32>,
 }
 
-impl Ran {
+impl<O> Ran<O> {
     pub fn ok(&self) -> bool {
         self.code == Some(0)
     }
@@ -394,6 +396,16 @@ impl Shell {
     /// exited. Only a shell that cannot start (no bash, no ssh) is an
     /// error; ssh exits 255 when it cannot connect.
     pub fn run(&self, script: &str) -> Result<Ran> {
+        let ran = self.run_bytes(script)?;
+        Ok(Ran {
+            stdout: String::from_utf8_lossy(&ran.stdout).into_owned(),
+            stderr: ran.stderr,
+            code: ran.code,
+        })
+    }
+
+    /// [`Shell::run`], its stdout as the bytes it printed.
+    fn run_bytes(&self, script: &str) -> Result<Ran<Vec<u8>>> {
         let mut child = self
             .command()
             .stdin(Stdio::piped())
@@ -419,7 +431,7 @@ impl Shell {
             child.wait_with_output()
         })?;
         Ok(Ran {
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stdout,
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
             code: status.code(),
         })
@@ -427,7 +439,13 @@ impl Shell {
 
     /// `script` run, refused unless it exits 0: its stdout.
     pub fn check(&self, script: &str, what: &str) -> Result<String> {
-        let ran = self.run(script)?;
+        let out = self.check_bytes(script, what)?;
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// [`Shell::check`], its stdout as the bytes it printed.
+    fn check_bytes(&self, script: &str, what: &str) -> Result<Vec<u8>> {
+        let ran = self.run_bytes(script)?;
         if !ran.ok() {
             let to = self
                 .ssh
@@ -440,6 +458,26 @@ impl Shell {
             );
         }
         Ok(ran.stdout)
+    }
+
+    /// Those of the files at `paths` that are there, each read whole as
+    /// bytes, by path, in one call of a few processes; `what` says what
+    /// for, in an error.
+    pub fn fetch(&self, paths: &[String], what: &str) -> Result<HashMap<String, Vec<u8>>> {
+        if paths.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // Each size and path, then each file, in that order.
+        let said = self.check_bytes(
+            &format!(
+                "s=$(printf '%s\\n' {} | xargs -r -d '\\n' stat -c '%s %n' 2> /dev/null || true)\n\
+                 printf '{FETCH_MARK}\\n%s\\n{FETCH_END}\\n' \"$s\"\n\
+                 [ -z \"$s\" ] || printf '%s\\n' \"$s\" | cut -d' ' -f2- | xargs -r -d '\\n' cat\n",
+                crate::project::quote(&paths.join("\n"))
+            ),
+            what,
+        )?;
+        fetched(&said).with_context(|| format!("{what}: the reply is garbled"))
     }
 
     /// The shared SSH connection closed; nothing for this machine.
@@ -456,9 +494,51 @@ impl Shell {
     }
 }
 
+/// The lines that start and end a fetch's list of sizes and paths.
+const FETCH_MARK: &str = "@@fetch";
+const FETCH_END: &str = "@@end";
+
+/// The files a fetch sent, in `said`, by path: none when it is garbled.
+fn fetched(said: &[u8]) -> Option<HashMap<String, Vec<u8>>> {
+    let find = |hay: &[u8], what: &[u8]| hay.windows(what.len()).position(|w| w == what);
+    let (mark, end) = (format!("{FETCH_MARK}\n"), format!("\n{FETCH_END}\n"));
+    let start = find(said, mark.as_bytes())? + mark.len();
+    let list_len = find(&said[start..], end.as_bytes())?;
+    let list = std::str::from_utf8(&said[start..start + list_len]).ok()?;
+    let mut body = &said[start + list_len + end.len()..];
+    let mut files = HashMap::new();
+    for line in list.lines().filter(|l| !l.is_empty()) {
+        let (size, path) = line.split_once(' ')?;
+        let n: usize = size.parse().ok()?;
+        files.insert(path.to_string(), body.get(..n)?.to_vec());
+        body = &body[n..];
+    }
+    body.iter().all(u8::is_ascii_whitespace).then_some(files)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fetch_is_read_by_its_sizes() {
+        // After a login's noise; a file of bytes that are not UTF-8, and a
+        // path with a space.
+        let said = b"motd\n@@fetch\n3 /a/done.json\n2 /a/m score.tsv\n0 /b/e\n@@end\n{}\n\xe9\n";
+        let got = fetched(said).unwrap();
+        assert_eq!(got["/a/done.json"], b"{}\n");
+        assert_eq!(got["/a/m score.tsv"], b"\xe9\n");
+        assert_eq!(got["/b/e"], b"");
+        assert!(fetched(b"@@fetch\n\n@@end\n").unwrap().is_empty());
+        for bad in [
+            &b"nothing\n"[..],
+            b"@@fetch\n9 /a\n@@end\nshort",
+            b"@@fetch\n1 /a\n@@end\nab",
+            b"@@fetch\nx /a\n@@end\na",
+        ] {
+            assert!(fetched(bad).is_none(), "{}", String::from_utf8_lossy(bad));
+        }
+    }
 
     fn r1() -> Remote {
         Remote {

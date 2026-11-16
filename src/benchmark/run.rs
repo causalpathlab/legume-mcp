@@ -12,7 +12,9 @@
 //!    ([`super::slurm`]) runs it as array jobs, each task under the
 //!    wrapper, one SSH call per round;
 //! 4. each start and end is a row of `events.tsv` in the benchmark's
-//!    folder here.
+//!    folder here;
+//! 5. at the end, the scores of the tasks done are copied here, with
+//!    plan.json, and gathered ([`super::gather`]).
 //!
 //! Ctrl-C cancels the run's array tasks, waits for them to say they
 //! stopped, and exits 130; a run again resumes. The run exits 0 when
@@ -44,7 +46,9 @@ SSH target, the folder on the cluster for benchmarks, the folder of
 legume's tools there, and a Slurm partition and account. Tasks done in
 an earlier run are reused, and tasks still in Slurm's queue adopted.
 Each start and end is a row of results/benchmarks/<name>/events.tsv
-here. Ctrl-C cancels the run's tasks; run again to resume.";
+here. At the end, the scores of the tasks done are copied here and
+gathered into summary.tsv and the rest (legume benchmark gather --help).
+Ctrl-C cancels the run's tasks; run again to resume.";
 
 const FLAGS: &[Flag] = &[Flag::once(&["--on"])];
 
@@ -94,7 +98,8 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
 fn run(spec_file: &Path, on: &str, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32> {
     let text = std::fs::read_to_string(spec_file)
         .with_context(|| format!("reading {}", spec_file.display()))?;
-    let (spec, _) = super::spec::parse(&text)?;
+    let (spec, value) = super::spec::parse(&text)?;
+    let spec_key = super::key::key(super::key::spec_file(&value).as_bytes());
     let root = crate::project::root().context("finding the project's folder")?;
     // Named for the project and its place here, so two projects of one
     // name keep apart there.
@@ -115,7 +120,7 @@ fn run(spec_file: &Path, on: &str, out: &mut dyn Write, err: &mut dyn Write) -> 
         shell: &shell,
     };
     let local = root.join(super::bench_rel(&spec.name));
-    let result = c.run(&spec, &text, &local, out, err);
+    let result = c.run(&spec, &spec_key, &text, &local, out, err);
     shell.close();
     result
 }
@@ -153,8 +158,13 @@ impl Cluster<'_> {
 
     /// `spec`, whose text is `text`, sent to the project's folder there and
     /// planned on a compute node as job `run`, in one call: what the plan
-    /// said, and its plan.json.
-    fn plan(&self, spec: &super::spec::Spec, text: &str, run: &str) -> Result<(String, PlanDoc)> {
+    /// said, and its plan.json, as text and read.
+    fn plan(
+        &self,
+        spec: &super::spec::Spec,
+        text: &str,
+        run: &str,
+    ) -> Result<(String, String, PlanDoc)> {
         let d = quote(&self.dir);
         let s = quote(&format!("specs-in/{}.json", spec.name));
         let plan = srun(
@@ -191,11 +201,11 @@ impl Cluster<'_> {
         let (said, plan) = said
             .split_once(&format!("{PLAN_MARK}\n"))
             .context("planning on the cluster: no plan.json")?;
-        let plan: PlanDoc = serde_json::from_str(plan).context("reading plan.json")?;
-        if plan.legume.as_deref() != Some(env!("CARGO_PKG_VERSION")) {
-            return Err(self.other_legume(plan.legume.as_deref()));
+        let doc: PlanDoc = serde_json::from_str(plan).context("reading plan.json")?;
+        if doc.legume.as_deref() != Some(env!("CARGO_PKG_VERSION")) {
+            return Err(self.other_legume(doc.legume.as_deref()));
         }
-        Ok((said.to_string(), plan))
+        Ok((said.to_string(), plan.to_string(), doc))
     }
 
     /// The refusal of a cluster whose legume is `there`, not this one.
@@ -209,11 +219,13 @@ impl Cluster<'_> {
         ))
     }
 
-    /// The benchmark of `spec`, whose text is `text`, run, its events kept
-    /// in `local`: its exit code.
+    /// The benchmark of `spec`, of key `spec_key`, whose text is `text`,
+    /// run, its events kept and its scores gathered in `local`: its exit
+    /// code.
     fn run(
         &self,
         spec: &super::spec::Spec,
+        spec_key: &str,
         text: &str,
         local: &Path,
         out: &mut dyn Write,
@@ -229,7 +241,7 @@ impl Cluster<'_> {
             "planning {} on {} (a compute node)",
             spec.name, self.remote.name
         )?;
-        let (said, plan) = self.plan(spec, text, &run)?;
+        let (said, plan_text, plan) = self.plan(spec, text, &run)?;
         write!(out, "{said}")?;
         if let Some(t) = plan.tasks.iter().find(|t| t.gpus > 0) {
             return Err(refuse(format!(
@@ -273,7 +285,65 @@ impl Cluster<'_> {
         };
         r.resume(out)?;
         let code = r.drive(err)?;
-        summary(&r.pool, plan.tasks.len(), code, local, out)
+        let code = summary(&r.pool, plan.tasks.len(), code, local, out)?;
+        // A run stopped by hand ends now; the next run gathers.
+        if super::stop::asked() {
+            return Ok(code);
+        }
+        match self.gather(spec, spec_key, &plan_text, &plan, local) {
+            Ok(g) => g.say(
+                &super::bench_rel(&spec.name).display().to_string(),
+                out,
+                err,
+            )?,
+            Err(e) => writeln!(err, "warning: gathering: {e:#}")?,
+        }
+        Ok(code)
+    }
+
+    /// The scores of `plan`'s scored tasks done there and not yet here,
+    /// with their `done.json`, copied to their places under `local` in one
+    /// call, and `plan_text` as its plan.json: then gathered there.
+    fn gather(
+        &self,
+        spec: &super::spec::Spec,
+        spec_key: &str,
+        plan_text: &str,
+        plan: &PlanDoc,
+        local: &Path,
+    ) -> Result<super::gather::Gathered> {
+        let mut wanted = Vec::new();
+        for (t, f) in super::gather::scored(plan) {
+            let here = plan
+                .task_dir(local, t)
+                .with_context(|| format!("{}: its folder is not in the plan's", t.id))?;
+            if !t.done_in(&here) {
+                wanted.push((t, f, here));
+            }
+        }
+        let there = |t: &Task, name: &str| t.dir.join(name).display().to_string();
+        let paths: Vec<String> = wanted
+            .iter()
+            .flat_map(|(t, f, _)| [there(t, f), there(t, "done.json")])
+            .collect();
+        let got = self.shell.fetch(&paths, "fetching the scores")?;
+        super::gather::write(local, "plan.json", plan_text)?;
+        for (t, f, here) in &wanted {
+            // The score before done.json, which says it is whole.
+            for name in [*f, "done.json"] {
+                match got.get(&there(t, name)) {
+                    Some(bytes) => {
+                        std::fs::create_dir_all(here)
+                            .with_context(|| format!("making {}", here.display()))?;
+                        super::gather::write(here, name, bytes)?;
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(here.join(name));
+                    }
+                }
+            }
+        }
+        super::gather::gather(local, spec, spec_key, plan)
     }
 }
 

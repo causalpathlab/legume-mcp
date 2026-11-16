@@ -37,7 +37,8 @@ impl World {
         w.tool("TOOL1", tool1);
         w.tool(
             "TOOL2",
-            r#"while [ $# -gt 0 ]; do [ "$1" = -o ] && o=$2; shift; done; printf y > "$o""#,
+            r#"s=$(cat "$1"); while [ $# -gt 0 ]; do [ "$1" = -o ] && o=$2; shift; done
+printf 'score\tmetric\tvalue\tpart\nt\tauprc\t%s\tall\n' "$s" > "$o""#,
         );
         std::fs::write(w.project().join("spec.json"), SPEC).unwrap();
         w
@@ -145,8 +146,10 @@ fn said(o: &Output) -> String {
     )
 }
 
-const MAKES_SIM: &str =
-    r#"while [ $# -gt 0 ]; do [ "$1" = -o ] && o=$2; shift; done; printf x > "$o.tsv""#;
+/// A sim that makes a value from its seed's last digit, 0.d, which the
+/// score passes on.
+const MAKES_SIM: &str = r#"seed=$2; while [ $# -gt 0 ]; do [ "$1" = -o ] && o=$2; shift; done
+printf '0.%s' "${seed#"${seed%?}"}" > "$o.tsv""#;
 
 #[test]
 fn a_spec_is_planned_on_the_cluster_run_there_and_resumed() {
@@ -177,6 +180,35 @@ fn a_spec_is_planned_on_the_cluster_run_there_and_resumed() {
     assert_eq!(done[2], "1", "{done:?}");
     assert!(done[6].parse::<f64>().is_ok(), "queue_secs: {done:?}");
     assert!(!done[7].is_empty(), "the node: {done:?}");
+    // The scores came here and were gathered.
+    assert!(
+        s.contains("gathered 2 of 2 scored tasks: results.tsv, summary.tsv"),
+        "{s}"
+    );
+    let local = w.project().join("results/benchmarks/N1");
+    let summary = std::fs::read_to_string(local.join("summary.tsv")).unwrap();
+    let rows: Vec<&str> = summary.lines().collect();
+    assert_eq!(
+        rows[0],
+        "method\tscore\tpart\tmetric\treps\tn\tn_nan\tmean\tsd\tmedian\tq1\tq3"
+    );
+    assert!(
+        rows[1].starts_with("score\tt\tall\tauprc\t2\t2\t0\t"),
+        "{summary}"
+    );
+    let results = std::fs::read_to_string(local.join("results.tsv")).unwrap();
+    assert_eq!(results.lines().count(), 3, "{results}");
+    // And gathered again here, by hand, the same.
+    let o = w
+        .legume(&["benchmark", "gather", "spec.json"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", said(&o));
+    assert!(said(&o).contains("gathered 2 of 2"), "{}", said(&o));
+    assert_eq!(
+        std::fs::read_to_string(local.join("summary.tsv")).unwrap(),
+        summary
+    );
 
     // Again: every task is reused, nothing goes in.
     let o = w.run();
@@ -194,6 +226,7 @@ fn a_failed_sim_fails_the_run_and_its_score_is_skipped() {
     let s = said(&o);
     assert!(s.contains("2 failed") && s.contains("2 skipped"), "{s}");
     assert_eq!((w.count("failed"), w.count("skipped")), (2, 2));
+    assert!(s.contains("gathered 0 of 2 scored tasks"), "{s}");
     assert_eq!(w.log("sbatch.log").lines().count(), 1);
 }
 

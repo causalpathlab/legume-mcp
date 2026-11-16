@@ -7,6 +7,7 @@
 //! the [`wrapper`], as a compute node runs it.
 
 pub mod executor;
+pub mod gather;
 #[cfg(unix)]
 pub mod install;
 pub mod key;
@@ -29,7 +30,6 @@ pub mod wrapper;
 use crate::command::{refuse, usage};
 use anyhow::{Context, Result};
 use serde::Serialize;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -60,6 +60,12 @@ legume benchmark run SPEC --on REMOTE
 
 Runs the benchmark on the cluster REMOTE, over SSH from here: planned on
 a compute node, its tasks Slurm array tasks (legume benchmark run --help).
+
+legume benchmark gather SPEC
+
+Gathers its scores: results.tsv, summary.tsv, paired.tsv (with compare)
+and summary.svg (with plot), in its folder (legume benchmark gather
+--help). A run on a cluster gathers at its end.
 
 legume benchmark install --on REMOTE [CRATE ...]
 
@@ -92,6 +98,7 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
             let spec = spec.ok_or_else(|| usage("plan needs SPEC, the spec's JSON file"))?;
             plan_spec(&spec, retool, out, err)
         }
+        Some("gather") => gather::main(&args[1..], out, err),
         #[cfg(unix)]
         Some("install") => install::main(&args[1..], out, err),
         #[cfg(unix)]
@@ -101,7 +108,7 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
         #[cfg(not(target_os = "linux"))]
         Some("task") => Err(usage("benchmark task runs on Linux only")),
         Some(other) => Err(usage(format!(
-            "unknown command {other}: benchmark has plan, run, install and task"
+            "unknown command {other}: benchmark has plan, run, gather, install and task"
         ))),
     }
 }
@@ -325,15 +332,7 @@ fn write_spec(file: &Path, canonical: &str) -> Result<()> {
 
 /// How many of `tasks` are done already: a `done.json` with their key.
 fn done(tasks: &[plan::Task]) -> usize {
-    tasks
-        .iter()
-        .filter(|t| {
-            std::fs::read(t.dir.join("done.json"))
-                .ok()
-                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-                .is_some_and(|v| v.get("key").and_then(Value::as_str) == Some(t.key.as_str()))
-        })
-        .count()
+    tasks.iter().filter(|t| t.done_in(&t.dir)).count()
 }
 
 /// What the plan says on stdout.
