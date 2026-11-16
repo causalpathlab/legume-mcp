@@ -21,6 +21,8 @@ pub mod remote;
 #[cfg(unix)]
 pub mod run;
 #[cfg(unix)]
+pub mod runner;
+#[cfg(unix)]
 pub mod slurm;
 pub mod spec;
 #[cfg(unix)]
@@ -58,10 +60,16 @@ and says what it planned. A later plan lists what changed: the machine,
 and each tool installed since, whose snapshot it keeps. --retool plans
 with the tools installed now, which rekeys their tasks.
 
-legume benchmark run SPEC --on REMOTE
+legume benchmark run SPEC --on REMOTE [--detach]
 
 Runs the benchmark on the cluster REMOTE, over SSH from here: planned on
 a compute node, its tasks Slurm array tasks (legume benchmark run --help).
+With --detach, in the background.
+
+legume benchmark stop NAME
+
+Stops benchmark NAME's runner in the background: its Slurm tasks are
+cancelled, as Ctrl-C would.
 
 legume benchmark gather SPEC
 
@@ -106,12 +114,14 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
         Some("install") => install::main(&args[1..], out, err),
         #[cfg(unix)]
         Some("run") => run::main(&args[1..], out, err),
+        #[cfg(unix)]
+        Some("stop") => runner::stop_main(&args[1..], out),
         #[cfg(target_os = "linux")]
         Some("task") => wrapper::main(&args[1..], out, err),
         #[cfg(not(target_os = "linux"))]
         Some("task") => Err(usage("benchmark task runs on Linux only")),
         Some(other) => Err(usage(format!(
-            "unknown command {other}: benchmark has plan, run, gather, install and task"
+            "unknown command {other}: benchmark has plan, run, stop, gather, install and task"
         ))),
     }
 }

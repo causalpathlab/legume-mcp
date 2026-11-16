@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 /// `legume benchmark run`'s usage.
 pub const USAGE: &str = "\
-legume benchmark run SPEC --on REMOTE
+legume benchmark run SPEC --on REMOTE [--detach]
 
 Runs the benchmark of the spec SPEC on the cluster REMOTE, from here:
 the spec is planned on a compute node there, and each task runs as a
@@ -48,7 +48,13 @@ an earlier run are reused, and tasks still in Slurm's queue adopted.
 Each start and end is a row of results/benchmarks/<name>/events.tsv
 here. At the end, the scores of the tasks done are copied here and
 gathered into summary.tsv and the rest (legume benchmark gather --help).
-Ctrl-C cancels the run's tasks; run again to resume.";
+Ctrl-C cancels the run's tasks; run again to resume.
+
+With --detach, the run starts in the background, in a session of its
+own, and this returns at once: its output goes to run.log in the
+benchmark's folder, and its pid to runner.json there. legume benchmark
+stop NAME stops it as Ctrl-C would. A remote not kept yet is asked for
+first.";
 
 const FLAGS: &[Flag] = &[Flag::once(&["--on"])];
 
@@ -77,7 +83,9 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
         Some(s) if s.starts_with('-') => (None, args),
         Some(s) => (Some(PathBuf::from(s)), &args[1..]),
     };
-    let Some(pairs) = flag_pairs(rest)? else {
+    let detach = rest.iter().any(|a| a == "--detach");
+    let rest: Vec<String> = rest.iter().filter(|a| *a != "--detach").cloned().collect();
+    let Some(pairs) = flag_pairs(&rest)? else {
         return Ok(writeln!(out, "{USAGE}")?);
     };
     let mut on = None;
@@ -86,12 +94,19 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
     }
     let spec = spec.ok_or_else(|| usage("run needs SPEC, the spec's JSON file"))?;
     let on = required(on, "--on")?;
-    let code = run(&spec, &on, out, err)?;
-    if code == 0 {
-        Ok(())
-    } else {
-        Err(failed(code, "not every task is done"))
+    if detach {
+        return super::runner::detach(&spec, &on, out);
     }
+    let result = run(&spec, &on, out, err).and_then(|code| match code {
+        0 => Ok(()),
+        code => Err(failed(code, "not every task is done")),
+    });
+    // A detached runner notes how it ended, for a status to read.
+    if let Some(file) = std::env::var_os(super::runner::RUNNER_ENV) {
+        let code = result.as_ref().map_or_else(crate::command::code, |()| 0);
+        super::runner::ended(Path::new(&file), code, err);
+    }
+    result
 }
 
 /// The run of spec `spec_file` on remote `on`: its exit code.

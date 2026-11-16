@@ -796,7 +796,7 @@ The result of exploring is **hypotheses**, not findings. Say so.
 | Key numbers (`facts`, flagged ones in `status`) and `inputs` for every step, in `INDEX.tsv` | New in legume-mcp 0.5.0; each tool adds its own numbers |
 | The day's slides: `report.pdf` (typeset by legume when built with `--features pdf`, nothing else to install) and `report.md`, figures in place, with the trail graph | New in legume-mcp 0.5.0 |
 | Recipes as MCP prompts on the `legume` server: `explore`, `triangulate` | New in legume-mcp 0.5.0 |
-| Benchmarks on a cluster from the `legume` server: `benchmark_plan`, `benchmark_start`, `benchmark_status`, the prompt `benchmark` and section `benchmark` | New in legume-mcp 0.5.16, with `--features benchmark` |
+| Benchmarks on a cluster from the `legume` server: `benchmark_plan`, `benchmark_start`, `benchmark_status`, `benchmark_stop`, the prompt `benchmark` and section `benchmark` | New in legume-mcp 0.5.16, with `--features benchmark` |
 | `next` hints in results ("Next, if the person agrees"); tool annotations (read-only, writes, destructive) | New in legume-mcp 0.5.0; the job tools give them, each tool adds its own |
 | Testing on outside data (section 9): `plan` and data-beans `import` | Available with 0.5.0 |
 | lupin `decided_by` on labelling decisions | Available |
@@ -917,9 +917,11 @@ A benchmark runs every method on a grid of settings, several times each,
 and scores each run against a truth. The person says what to compare; the
 agent writes the spec, the JSON below, checks it with `benchmark_plan`,
 shows the person the plan, starts it with `benchmark_start` and follows it
-with `benchmark_status`. These tools are on the `legume` server when legume
-is built with `--features benchmark`. The same spec runs from a terminal:
-`legume benchmark plan SPEC`, `legume benchmark run SPEC --on REMOTE`.
+with `benchmark_status`, and stops it with `benchmark_stop` when the person
+asks. These tools are on the `legume` server when legume is built with
+`--features benchmark`. The same spec runs from a terminal: `legume
+benchmark plan SPEC`, `legume benchmark run SPEC --on REMOTE [--detach]`,
+`legume benchmark stop NAME`.
 
 **Words.** A *task* is one run: a grid point, a replicate, a stage and one
 of its methods. A *method* is one way to do a stage; a stage without
@@ -1005,11 +1007,14 @@ spec in `specs-in/<name>.json`, checks it and says the tasks and what each
 books; without `on` it plans here, finding the tools on PATH. Show the
 person the counts and what each task books, and ask before starting.
 `benchmark_start {"spec": "specs-in/<name>.json", "on": "REMOTE1"}` returns
-at once; the run plans on a compute node, then runs the tasks as Slurm
-array tasks. `benchmark_status {"name": "<name>"}` gives the tasks by state,
-the latest failures and, once the run has gathered, the head of
-`summary.tsv`; poll it now and then, not in a tight loop. Starting again
-resumes: done tasks are reused. A run ends with its server.
+at once; the run goes on in the background, after the server ends too
+(`runner.json` and `run.log` in the benchmark's folder): it plans on a
+compute node, then runs the tasks as Slurm array tasks. `benchmark_status
+{"name": "<name>"}` says whether the runner is alive, the tasks by state, the
+latest failures, the end of `run.log` and, once the run has gathered, the
+head of `summary.tsv`; poll it now and then, not in a tight loop.
+`benchmark_stop {"name": "<name>"}` cancels its tasks and ends it. Starting
+again resumes: done tasks are reused.
 
 ## References
 

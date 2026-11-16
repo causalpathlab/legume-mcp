@@ -485,3 +485,89 @@ fn a_task_wanting_gpus_is_refused_on_a_cluster() {
     assert!(said(&o).contains("wants GPUs"), "{}", said(&o));
     assert_eq!(w.log("sbatch.log"), "");
 }
+
+/// `runner.json` in the benchmark's folder here, read.
+fn runner_json(w: &World) -> Option<serde_json::Value> {
+    let bytes = std::fs::read(w.project().join("results/benchmarks/N1/runner.json")).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+#[test]
+fn a_detached_run_returns_at_once_and_stop_cancels_its_tasks() {
+    let w = World::new("sleep 30").with_remote();
+    let mut detach = w.command();
+    detach.arg("--detach");
+    let started = Instant::now();
+    let o = detach.stdin(Stdio::null()).output().unwrap();
+    assert!(o.status.success(), "{}", said(&o));
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let s = said(&o);
+    assert!(
+        s.contains("started benchmark N1 on R1 in the background, as pid "),
+        "{s}"
+    );
+    assert!(s.contains("log: results/benchmarks/N1/run.log"), "{s}");
+    let r = runner_json(&w).unwrap();
+    assert_eq!(r["remote"], "R1");
+    assert_eq!(r["spec_key"].as_str().unwrap().len(), 32);
+    assert!(r["exit"].is_null(), "{r}");
+    // Another, while it is alive, is refused.
+    let o = w
+        .command()
+        .arg("--detach")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(3), "{}", said(&o));
+    assert!(
+        said(&o).contains("is running already, as pid"),
+        "{}",
+        said(&o)
+    );
+    // Both sims running under their wrappers, then stopped.
+    let start = Instant::now();
+    let running = || {
+        std::fs::read_dir(w.state().join("q"))
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.path().join("pid").exists())
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    while running() < 2 {
+        assert!(start.elapsed() < Duration::from_secs(20), "never ran");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let o = w.legume(&["benchmark", "stop", "N1"]).output().unwrap();
+    assert!(o.status.success(), "{}", said(&o));
+    assert!(
+        said(&o).contains("sent TERM to the runner of benchmark N1"),
+        "{}",
+        said(&o)
+    );
+    let start = Instant::now();
+    let exit = loop {
+        if let Some(code) = runner_json(&w).and_then(|r| r["exit"].as_i64()) {
+            break code;
+        }
+        assert!(start.elapsed() < Duration::from_secs(30), "still running");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(exit, 130);
+    let cancelled = w.log("scancel.log");
+    assert_eq!(cancelled.split_whitespace().count(), 2, "{cancelled}");
+    assert_eq!(w.count("stopped"), 2);
+    let log = std::fs::read_to_string(w.project().join("results/benchmarks/N1/run.log")).unwrap();
+    assert!(log.contains("planning N1 on R1"), "{log}");
+    assert!(log.contains("the run ended, exit 130"), "{log}");
+    // Nothing is left to stop.
+    let o = w.legume(&["benchmark", "stop", "N1"]).output().unwrap();
+    assert_eq!(o.status.code(), Some(3), "{}", said(&o));
+    assert!(
+        said(&o).contains("its runner ended, exit 130"),
+        "{}",
+        said(&o)
+    );
+}

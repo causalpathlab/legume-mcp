@@ -327,8 +327,30 @@ fn a_start_refuses_a_remote_it_does_not_know_with_how_to_add_it() {
     assert!(error && text.contains("`on` is required"), "{text}");
 }
 
+/// `runner.json` in benchmark N1's folder, read, when it is there.
+fn runner_json(w: &World) -> Option<Value> {
+    serde_json::from_slice(&std::fs::read(w.bench().join("runner.json")).ok()?).ok()
+}
+
+/// The exit code `runner.json` notes, once the runner ended, within
+/// `limit`.
+fn ended(w: &World, limit: Duration) -> i64 {
+    let until = Instant::now() + limit;
+    loop {
+        if let Some(code) = runner_json(w).and_then(|r| r["exit"].as_i64()) {
+            return code;
+        }
+        assert!(
+            Instant::now() < until,
+            "still running: {:?}",
+            runner_json(w)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
-fn a_start_runs_on_the_cluster_and_the_status_follows_it_to_its_summary() {
+fn a_started_run_outlives_the_server_and_a_status_follows_it_to_its_summary() {
     let w = World::new();
     let mut s = w.serve(None);
     let (text, error) = s.call(
@@ -337,41 +359,33 @@ fn a_start_runs_on_the_cluster_and_the_status_follows_it_to_its_summary() {
     );
     assert!(!error, "{text}");
     assert!(
-        text.starts_with(
-            "started benchmark N1 on REMOTE1, as job-1: legume benchmark run \
-             specs-in/N1.json --on REMOTE1"
-        ),
+        text.starts_with("started benchmark N1 on REMOTE1 in the background, as pid "),
         "{text}"
     );
-    // A second start while it runs is refused.
-    let (again, error) = s.call(
-        "benchmark_start",
-        json!({ "spec": "specs-in/N1.json", "on": "REMOTE1" }),
+    assert!(
+        text.contains("log: results/benchmarks/N1/run.log"),
+        "{text}"
     );
-    if error {
-        assert!(again.contains("is running already, as job-1"), "{again}");
-    }
-    let until = Instant::now() + Duration::from_secs(120);
-    let text = loop {
-        let (text, error) = s.call("benchmark_status", json!({ "name": "N1" }));
-        assert!(!error, "{text}");
-        if text.contains("run: job-1, done") || text.contains("run: job-1, failed") {
-            break text;
-        }
-        assert!(Instant::now() < until, "still running:\n{text}");
-        std::thread::sleep(Duration::from_millis(300));
-    };
-    assert!(text.contains("run: job-1, done"), "{text}");
+    // The server ends at once; the run goes on to its end.
+    drop(s);
+    assert_eq!(ended(&w, Duration::from_secs(60)), 0);
+    let mut s = w.serve(None);
+    let (text, error) = s.call("benchmark_status", json!({ "name": "N1" }));
+    assert!(!error, "{text}");
+    assert!(text.contains("on REMOTE1, started "), "{text}");
+    assert!(text.contains(", exit 0\n"), "{text}");
     assert!(
         text.contains("tasks 4: 4 done, 0 failed, 0 skipped, 0 running, 0 pending"),
         "{text}"
     );
     assert!(text.contains("summary.tsv (2 lines):"), "{text}");
     assert!(text.contains("  score\tt\tall\tauprc\t2\t2\t0\t"), "{text}");
+    assert!(text.contains("run.log, the last lines:"), "{text}");
+    assert!(text.contains("the run ended, exit 0"), "{text}");
     // It went over the stand-in ssh, to the remote's target.
     let ssh = std::fs::read_to_string(w.root().join("state/ssh.log")).unwrap();
     assert!(ssh.contains("HOST1"), "{ssh}");
-    // The driver script keeps the spec and the run.
+    // The driver script keeps the spec, and the run in the foreground.
     drop(s);
     let day = std::fs::read_dir(w.project().join("results"))
         .unwrap()
@@ -381,7 +395,66 @@ fn a_start_runs_on_the_cluster_and_the_status_follows_it_to_its_summary() {
     let runall = std::fs::read_to_string(day.join("runall.sh")).unwrap();
     assert!(runall.contains("specs-in/N1.json"), "{runall}");
     assert!(
-        runall.contains("legume benchmark run specs-in/N1.json --on REMOTE1"),
+        runall.contains("legume benchmark run specs-in/N1.json --on REMOTE1\n"),
         "{runall}"
+    );
+    assert!(!runall.contains("--detach"), "{runall}");
+}
+
+#[test]
+fn a_stop_ends_a_live_run_and_its_tasks() {
+    let w = World::new();
+    w.tool("TOOL1", "sleep 30");
+    let mut s = w.serve(None);
+    let (text, error) = s.call(
+        "benchmark_start",
+        json!({ "spec": spec(), "on": "REMOTE1" }),
+    );
+    assert!(!error, "{text}");
+    // A second start while it is alive is refused.
+    let (text, error) = s.call(
+        "benchmark_start",
+        json!({ "spec": "specs-in/N1.json", "on": "REMOTE1" }),
+    );
+    assert!(
+        error && text.contains("is running already, as pid"),
+        "{text}"
+    );
+    // Both sims in the stand-in queue, running.
+    let until = Instant::now() + Duration::from_secs(20);
+    let running = || {
+        std::fs::read_dir(w.root().join("state/q"))
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.path().join("pid").exists())
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    while running() < 2 {
+        assert!(Instant::now() < until, "never ran");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let (text, error) = s.call("benchmark_status", json!({ "name": "N1" }));
+    assert!(!error, "{text}");
+    assert!(text.contains(": alive\n"), "{text}");
+    assert!(text.contains("2 running, 2 pending"), "{text}");
+    std::thread::sleep(Duration::from_millis(300));
+    let (text, error) = s.call("benchmark_stop", json!({ "name": "N1" }));
+    assert!(!error, "{text}");
+    assert!(
+        text.contains("sent TERM to the runner of benchmark N1"),
+        "{text}"
+    );
+    assert_eq!(ended(&w, Duration::from_secs(30)), 130);
+    let cancelled = std::fs::read_to_string(w.root().join("state/scancel.log")).unwrap();
+    assert_eq!(cancelled.split_whitespace().count(), 2, "{cancelled}");
+    let (text, _) = s.call("benchmark_status", json!({ "name": "N1" }));
+    assert!(text.contains(", exit 130\n"), "{text}");
+    assert!(text.contains("2 stopped"), "{text}");
+    let (text, error) = s.call("benchmark_stop", json!({ "name": "N1" }));
+    assert!(
+        error && text.contains("no live runner (its runner ended, exit 130)"),
+        "{text}"
     );
 }

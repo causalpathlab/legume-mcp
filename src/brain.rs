@@ -29,7 +29,7 @@ pub fn serve() -> Result<()> {
         project: project::enter()?,
         watch: crate::watch::base(),
     };
-    crate::serve_stdio(info(), options, Role::Brain, Brain::default())
+    crate::serve_stdio(info(), options, Role::Brain, Brain)
 }
 
 /// [`serve`] on any input and output, keeping the records of the project
@@ -43,14 +43,7 @@ where
         project,
         watch: None,
     };
-    crate::serve_as(
-        input,
-        output,
-        info(),
-        options,
-        Role::Brain,
-        Brain::default(),
-    )
+    crate::serve_as(input, output, info(), options, Role::Brain, Brain)
 }
 
 fn info() -> ServerInfo {
@@ -302,12 +295,7 @@ on our cells is our cells, not curated knowledge.
 genetic, perturbation or applied-treatment evidence that agrees.";
 
 /// The `legume` server's handler.
-#[derive(Default)]
-struct Brain {
-    /// The benchmark runs it started.
-    #[cfg(all(feature = "benchmark", unix))]
-    runs: crate::benchmark::mcp::Runs,
-}
+struct Brain;
 
 impl Handler for Brain {
     fn tools(&self) -> Vec<ToolSpec> {
@@ -364,7 +352,9 @@ impl Handler for Brain {
                 crate::report::said(p.root(), &built)
             }
             #[cfg(all(feature = "benchmark", unix))]
-            n if crate::benchmark::mcp::TOOLS.contains(&n) => self.runs.call(n, &args, cx)?,
+            n if crate::benchmark::mcp::TOOLS.contains(&n) => {
+                crate::benchmark::mcp::call(n, &args, cx)?
+            }
             _ => anyhow::bail!("no tool `{name}`"),
         };
         Ok(vec![Content::Text(text)])

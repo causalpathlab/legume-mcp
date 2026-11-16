@@ -828,7 +828,12 @@ fn the_notebook_is_the_legume_servers_alone() {
     let names: Vec<&str> = listed.iter().map(|t| t["name"].as_str().unwrap()).collect();
     let mut want = vec!["guide", "status", "report"];
     if cfg!(all(feature = "benchmark", unix)) {
-        want.extend(["benchmark_plan", "benchmark_start", "benchmark_status"]);
+        want.extend([
+            "benchmark_plan",
+            "benchmark_start",
+            "benchmark_status",
+            "benchmark_stop",
+        ]);
     }
     want.push("notebook");
     assert_eq!(

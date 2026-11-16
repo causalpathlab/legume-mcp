@@ -6,21 +6,23 @@
 //!   keeps it in `specs-in/<name>.json`, and plans it as `legume benchmark
 //!   plan` does; with `on`, it checks it only, as a run on that cluster
 //!   plans it again there.
-//! - `benchmark_start` starts `legume benchmark run SPEC --on REMOTE` as a
-//!   background job of this server ([`crate::Call::spawn_job`]) and returns
-//!   at once.
+//! - `benchmark_start` starts `legume benchmark run SPEC --on REMOTE
+//!   --detach` ([`super::runner`]): the run goes on in the background, past
+//!   this server's end, and the tool returns at once.
 //! - `benchmark_status` reads where a benchmark stands from its folder:
-//!   `events.tsv`, `plan.json` and `summary.tsv`.
+//!   `runner.json` and `run.log`, `events.tsv`, `plan.json` and
+//!   `summary.tsv`.
+//! - `benchmark_stop` sends its runner TERM, as `legume benchmark stop`.
 //!
 //! A refusal comes back as the tool's error, naming the spec's field. Each
 //! reply stays under [`REPLY_MAX`] bytes.
 
-use super::{bench_rel, key, plan, remote, spec, tools};
+use super::{bench_rel, key, plan, remote, runner, spec, tools};
 use crate::command::{refuse, Exit};
 use crate::{Call, ToolSpec};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -36,10 +38,21 @@ const SPECS_IN: &str = "specs-in";
 const FAILURES_SHOWN: usize = 5;
 
 /// Lines of `summary.tsv` a status shows.
-const SUMMARY_LINES: usize = 12;
+const SUMMARY_LINES: usize = 10;
+
+/// Lines of `run.log` a status shows, the last.
+const LOG_LINES: usize = 8;
+
+/// The most a status shows of one line, in bytes.
+const LINE_MAX: usize = 160;
 
 /// The names of the benchmark tools.
-pub(crate) const TOOLS: [&str; 3] = ["benchmark_plan", "benchmark_start", "benchmark_status"];
+pub(crate) const TOOLS: [&str; 4] = [
+    "benchmark_plan",
+    "benchmark_start",
+    "benchmark_status",
+    "benchmark_stop",
+];
 
 /// The benchmark tools, as `tools/list` shows them.
 pub(crate) fn tools() -> Vec<ToolSpec> {
@@ -51,6 +64,8 @@ pub(crate) fn tools() -> Vec<ToolSpec> {
         "type": "string",
         "description": "A remote (a cluster) named in the person's remotes.toml, e.g. REMOTE1",
     });
+    let name =
+        json!({ "type": "string", "description": "The benchmark's name, the spec's `name`" });
     vec![
         ToolSpec::new(
             "benchmark_plan",
@@ -65,7 +80,7 @@ pub(crate) fn tools() -> Vec<ToolSpec> {
         .idempotent(),
         ToolSpec::new(
             "benchmark_start",
-            "Start a benchmark on a cluster: `legume benchmark run SPEC --on REMOTE` as a background job of this server, returning at once. It plans on a compute node, then runs each task as a Slurm array task; tasks done in an earlier run are reused, so starting again resumes. Follow it with benchmark_status. It runs while this server does. A remote not in remotes.toml is refused with how to add it: ask the person.",
+            "Start a benchmark on a cluster: `legume benchmark run SPEC --on REMOTE --detach`, in the background, returning at once. The run goes on after this server ends. It plans on a compute node, then runs each task as a Slurm array task; tasks done in an earlier run are reused, so starting again resumes. Follow it with benchmark_status, stop it with benchmark_stop. A start while its runner is alive is refused. A remote not in remotes.toml is refused with how to add it: ask the person.",
             json!({
                 "type": "object",
                 "properties": { "spec": spec, "on": on },
@@ -76,97 +91,99 @@ pub(crate) fn tools() -> Vec<ToolSpec> {
         .open_world(),
         ToolSpec::new(
             "benchmark_status",
-            "Where a benchmark stands, from results/benchmarks/<name>/: its tasks by state (done, failed, skipped, running, pending), the latest failures, the run this server started, and the head of summary.tsv once gathered. Without `name`, the benchmarks of the project.",
+            "Where a benchmark stands, from results/benchmarks/<name>/: whether its runner is alive (or how it ended), its tasks by state (done, failed, skipped, running, pending), the latest failures, the head of summary.tsv once gathered, and the end of run.log. Without `name`, the benchmarks of the project.",
             json!({
                 "type": "object",
-                "properties": { "name": { "type": "string", "description": "The benchmark's name, the spec's `name`" } },
+                "properties": { "name": name.clone() },
             }),
         )
         .read_only(),
+        ToolSpec::new(
+            "benchmark_stop",
+            "Stop a benchmark's runner: it is sent TERM, so it cancels its Slurm array tasks, waits for them to stop and ends. Refused when no runner is alive. Ask the person first; benchmark_start again resumes it.",
+            json!({
+                "type": "object",
+                "properties": { "name": name },
+                "required": ["name"],
+            }),
+        )
+        .destructive(),
     ]
 }
 
-/// The runs this server started, by benchmark name: their job ids.
-#[derive(Default)]
-pub(crate) struct Runs {
-    jobs: HashMap<String, String>,
+/// Benchmark tool `name` called with `args`: its reply.
+pub(crate) fn call(name: &str, args: &Value, cx: &Call) -> Result<String> {
+    let root = project_root(cx)?;
+    let said = match name {
+        "benchmark_plan" => plan_tool(&root, args, cx),
+        "benchmark_start" => start(&root, args, cx),
+        "benchmark_status" => match args["name"].as_str() {
+            Some(n) => named(&root, n).map(|(rel, dir)| status_text(&rel, &dir)),
+            None => listed(&root),
+        },
+        "benchmark_stop" => {
+            let n = args["name"]
+                .as_str()
+                .context("`name` is required: the benchmark's name")?;
+            named(&root, n).and_then(|(_, dir)| runner::stop_runner(&dir, n))
+        }
+        _ => anyhow::bail!("no tool `{name}`"),
+    }?;
+    Ok(clip(&said, REPLY_MAX))
 }
 
-impl Runs {
-    /// Benchmark tool `name` called with `args`: its reply.
-    pub(crate) fn call(&mut self, name: &str, args: &Value, cx: &Call) -> Result<String> {
-        let root = project_root(cx)?;
-        let said = match name {
-            "benchmark_plan" => plan_tool(&root, args, cx),
-            "benchmark_start" => self.start(&root, args, cx),
-            "benchmark_status" => match args["name"].as_str() {
-                Some(n) => self.status(&root, n, cx),
-                None => listed(&root),
-            },
-            _ => anyhow::bail!("no tool `{name}`"),
-        }?;
-        Ok(clip(&said, REPLY_MAX))
+/// `benchmark_start`: the run detached, the spec and the run recorded.
+fn start(root: &Path, args: &Value, cx: &Call) -> Result<String> {
+    let on = args["on"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .context("`on` is required: the remote to run on, as remotes.toml names it")?;
+    let given = given_spec(root, &args["spec"], cx)?;
+    plan::check(&given.spec).map_err(fix_hint)?;
+    known_remote(on)?;
+    let name = &given.spec.name;
+    let rel = bench_rel(name);
+    if let Some(r) = runner::live(&root.join(&rel)) {
+        return Err(refuse(format!(
+            "benchmark {name} is running already, as pid {} (since {}, on {}): follow it \
+             with benchmark_status, or stop it with benchmark_stop",
+            r.pid, r.started, r.remote
+        )));
     }
+    let exe = crate::own_exe().context("finding this server's binary")?;
+    let mut detached = run_command(Command::new(&exe), root, &given.rel, on);
+    detached.arg("--detach");
+    let said = cx.run_reading(detached)?;
+    // The driver script repeats the run in the foreground, skipped once
+    // it has gathered.
+    if let Some(p) = &cx.records {
+        let bare = p.command(&run_command(Command::new(&exe), root, &given.rel, on));
+        let line = p.guarded(&bare, &[root.join(&rel).join("summary.tsv")]);
+        p.script_step(&format!("{line}\n"), Some(&bare));
+    }
+    Ok(format!(
+        "{said}It first plans on a compute node there (that waits in Slurm's queue), then \
+         runs each task as a Slurm array task; tasks done before are reused. It goes on \
+         after this server ends. Follow it with benchmark_status {{\"name\": \"{name}\"}}: \
+         events.tsv gets a row as each task starts and ends, and summary.tsv comes once it \
+         ends. benchmark_stop stops it; benchmark_start again resumes it.\n"
+    ))
+}
 
-    /// `benchmark_start`.
-    fn start(&mut self, root: &Path, args: &Value, cx: &Call) -> Result<String> {
-        let on = args["on"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .context("`on` is required: the remote to run on, as remotes.toml names it")?;
-        let given = given_spec(root, &args["spec"], cx)?;
-        plan::check(&given.spec).map_err(fix_hint)?;
-        known_remote(on)?;
-        let name = &given.spec.name;
-        if let Some(id) = self.jobs.get(name) {
-            if cx.jobs.status(Some(id))?["state"] == "running" {
-                return Err(refuse(format!(
-                    "benchmark {name} is running already, as {id}: follow it with \
-                     benchmark_status; starting it again once it ends resumes it"
-                )));
-            }
-        }
-        let exe = crate::own_exe().context("finding this server's binary")?;
-        let cmd = run_command(Command::new(exe), root, &given.rel, on);
-        let summary_tsv = root.join(bench_rel(name)).join("summary.tsv");
-        let id = cx.spawn_job(
-            cmd,
-            &[summary_tsv],
-            &format!("benchmark {name} run on {on}"),
-        )?;
-        self.jobs.insert(name.clone(), id.clone());
-        Ok(format!(
-            "started benchmark {name} on {on}, as {id}: legume benchmark run {} --on {on}\n\
-             It first plans on a compute node there (that waits in Slurm's queue), then runs \
-             each task as a Slurm array task; tasks done before are reused. Follow it with \
-             benchmark_status {{\"name\": \"{name}\"}}; its events go to {}/events.tsv as \
-             tasks start and end, and summary.tsv comes once it ends. It runs while this \
-             server does: when the server ends, the run is stopped (its Slurm tasks \
-             cancelled, or left for the next start to adopt), and benchmark_start again \
-             resumes it.\n",
-            given.rel.display(),
-            bench_rel(name).display(),
-        ))
+/// Benchmark `name`'s folder, from the project and under `root`; refused
+/// when the name is none or the folder is not there.
+fn named(root: &Path, name: &str) -> Result<(PathBuf, PathBuf)> {
+    spec::benchmark_name(name)?;
+    let rel = bench_rel(name);
+    let dir = root.join(&rel);
+    if !dir.is_dir() {
+        return Err(refuse(format!(
+            "no benchmark {name}: {} is not there; benchmark_status without `name` lists \
+             the benchmarks",
+            rel.display()
+        )));
     }
-
-    /// `benchmark_status` of benchmark `name`.
-    fn status(&self, root: &Path, name: &str, cx: &Call) -> Result<String> {
-        spec::benchmark_name(name)?;
-        let rel = bench_rel(name);
-        let dir = root.join(&rel);
-        let job = match self.jobs.get(name) {
-            Some(id) => Some((id.as_str(), cx.jobs.status(Some(id))?)),
-            None => None,
-        };
-        if !dir.is_dir() && job.is_none() {
-            return Err(refuse(format!(
-                "no benchmark {name}: {} is not there; benchmark_status without `name` lists \
-                 the benchmarks",
-                rel.display()
-            )));
-        }
-        Ok(status_text(&rel, &dir, job))
-    }
+    Ok((rel, dir))
 }
 
 /// The project's folder: the server's records', else the one `legume`
@@ -436,29 +453,27 @@ fn state_of(event: &str) -> Option<&'static str> {
     })
 }
 
-/// A benchmark's status, from its folder `dir` (`rel` from the project),
-/// with the run this server started for it, when it did: its id and
-/// status.
-fn status_text(rel: &Path, dir: &Path, job: Option<(&str, Value)>) -> String {
+/// A benchmark's status, from its folder `dir` (`rel` from the project):
+/// its runner, its tasks, its summary and the end of its log.
+fn status_text(rel: &Path, dir: &Path) -> String {
     let mut out = format!("benchmark at {}\n", rel.display());
-    match &job {
-        Some((id, v)) => {
-            let state = v["state"].as_str().unwrap_or("unknown");
+    match runner::read(dir) {
+        Some(r) => {
+            let state = match r.exit {
+                Some(code) => format!(
+                    "ended {}, exit {code}",
+                    r.ended.as_deref().unwrap_or("at a time not noted")
+                ),
+                None if runner::alive(r.pid) => "alive".to_string(),
+                None => "gone, without noting how it ended (see run.log)".to_string(),
+            };
             let _ = writeln!(
                 out,
-                "run: {id}, {state}, {} s",
-                v["seconds"].as_u64().unwrap_or(0)
+                "runner: pid {}, on {}, started {}: {state}",
+                r.pid, r.remote, r.started
             );
-            let said = match state {
-                "running" => lines_of(&v["last_lines"]),
-                "done" => tail(v["output"].as_str().unwrap_or(""), 4),
-                _ => tail(v["error"].as_str().unwrap_or(""), 8),
-            };
-            for l in said {
-                let _ = writeln!(out, "  {}", clip(l, 240));
-            }
         }
-        None => out.push_str("run: none started by this server\n"),
+        None => out.push_str("runner: none started with --detach (no runner.json)\n"),
     }
     let planned: Option<Vec<String>> = std::fs::read(dir.join("plan.json"))
         .ok()
@@ -544,7 +559,7 @@ fn status_text(rel: &Path, dir: &Path, job: Option<(&str, Value)>) -> String {
             still.len()
         );
         for f in &still[still.len().saturating_sub(FAILURES_SHOWN)..] {
-            let _ = writeln!(out, "  {}", clip(f, 240));
+            let _ = writeln!(out, "  {}", clip(f, LINE_MAX));
         }
     }
     match std::fs::read_to_string(dir.join("summary.tsv")) {
@@ -560,19 +575,18 @@ fn status_text(rel: &Path, dir: &Path, job: Option<(&str, Value)>) -> String {
                 }
             );
             for l in text.lines().take(SUMMARY_LINES) {
-                let _ = writeln!(out, "  {}", clip(l, 240));
+                let _ = writeln!(out, "  {}", clip(l, LINE_MAX));
             }
         }
         Err(_) => out.push_str("summary.tsv: not yet (a run gathers it at its end)\n"),
     }
+    if let Ok(log) = std::fs::read_to_string(dir.join(runner::LOG_FILE)) {
+        let _ = writeln!(out, "{}, the last lines:", runner::LOG_FILE);
+        for l in tail(&log, LOG_LINES) {
+            let _ = writeln!(out, "  {}", clip(l, LINE_MAX));
+        }
+    }
     out
-}
-
-/// The strings of the JSON list `v`.
-fn lines_of(v: &Value) -> Vec<&str> {
-    v.as_array()
-        .map(|a| a.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default()
 }
 
 /// The last `n` lines of `text`.
@@ -675,7 +689,7 @@ mod tests {
             format!("{head}\n{}\n", rows.join("\n")),
         )
         .unwrap();
-        let said = status_text(Path::new("results/benchmarks/N1"), d.path(), None);
+        let said = status_text(Path::new("results/benchmarks/N1"), d.path());
         assert!(
             said.contains(
                 "tasks seen in events.tsv 5: 2 done, 1 failed, 1 skipped, 1 running, 0 pending"
@@ -688,7 +702,10 @@ mod tests {
             "{said}"
         );
         assert!(!said.contains("B.r1.sim oom"), "{said}");
-        assert!(said.contains("run: none started by this server"), "{said}");
+        assert!(
+            said.contains("runner: none started with --detach"),
+            "{said}"
+        );
         assert!(said.contains("summary.tsv: not yet"), "{said}");
     }
 }
