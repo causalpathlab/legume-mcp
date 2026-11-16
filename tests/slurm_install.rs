@@ -141,7 +141,7 @@ fn legume_pins_legume_mcp_with_benchmark_unless_it_has_a_version() {
         ],
     ));
     assert!(
-        t.contains(r#"crates=([0]="legume-mcp@1.2.3:benchmark" [1]="legume-mcp@1.2.3:pdf,benchmark" [2]="legume-mcp@0.1")"#),
+        t.contains(r#"[0]="legume-mcp@1.2.3:benchmark" [1]="legume-mcp@1.2.3:pdf,benchmark" [2]="legume-mcp@0.1")"#),
         "{t}"
     );
     let o = run(&bin, &["--dry-run", "--prefix", "/x", "--legume", "1 2"]);
