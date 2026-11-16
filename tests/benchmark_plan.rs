@@ -162,7 +162,10 @@ fn the_lra_one_spec_plans_its_tasks_tools_and_keys() {
     // What the benchmark books comes first, the tasks last.
     let text = std::fs::read_to_string(bench.join("plan.json")).unwrap();
     assert!(
-        text.starts_with("{\n  \"name\": \"lra-one\",\n  \"spec_key\": "),
+        text.starts_with(&format!(
+            "{{\n  \"name\": \"lra-one\",\n  \"legume\": \"{}\",\n  \"spec_key\": ",
+            env!("CARGO_PKG_VERSION")
+        )),
         "{}",
         &text[..200]
     );
@@ -543,7 +546,7 @@ fn the_command_line_exits_by_what_went_wrong() {
         ),
         (
             &["nope", "S1.json"],
-            "unknown command nope: benchmark has plan, run and task",
+            "unknown command nope: benchmark has plan, run, install and task",
         ),
     ] {
         let o = p.legume(args);

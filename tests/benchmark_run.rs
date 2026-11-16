@@ -51,8 +51,9 @@ impl World {
         self.root().join("state")
     }
 
+    /// The cluster's legume tools, an install's bin folder.
     fn tools(&self) -> PathBuf {
-        self.root().join("tools")
+        self.root().join("pfx/bin")
     }
 
     fn project(&self) -> PathBuf {
@@ -87,13 +88,18 @@ impl World {
     }
 
     fn command(&self) -> Command {
+        self.legume(&["benchmark", "run", "spec.json", "--on", "R1"])
+    }
+
+    /// legume with `args`, in the project, against the stand-ins.
+    fn legume(&self, args: &[&str]) -> Command {
         let path = format!(
             "{}:{}",
             self.root().join("bin").display(),
             std::env::var("PATH").unwrap_or_default()
         );
         let mut c = Command::new(env!("CARGO_BIN_EXE_legume"));
-        c.args(["benchmark", "run", "spec.json", "--on", "R1"])
+        c.args(args)
             .current_dir(self.project())
             .env("PATH", path)
             .env("FAKE_SLURM", self.state())
@@ -276,4 +282,79 @@ fn ctrl_c_cancels_the_runs_tasks() {
     let cancelled = w.log("scancel.log");
     assert_eq!(cancelled.split_whitespace().count(), 2, "{cancelled}");
     assert_eq!((w.count("stop-requested"), w.count("stopped")), (2, 2));
+}
+
+#[test]
+fn install_submits_one_job_with_this_legume_and_not_while_one_is_queued() {
+    let w = World::new(MAKES_SIM).with_remote();
+    let install = || {
+        w.legume(&["benchmark", "install", "--on", "R1"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let o = install();
+    assert!(o.status.success(), "{}", said(&o));
+    assert!(said(&o).contains("Submitted job 101"), "{}", said(&o));
+    let installs = w.root().join("pfx/install");
+    assert!(installs.join("slurm-install.sh").exists());
+    let runs: Vec<_> = std::fs::read_dir(&installs)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_dir())
+        .collect();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let job = std::fs::read_to_string(runs[0].join("install.sbatch")).unwrap();
+    let pinned = format!("legume-mcp@{}:benchmark", env!("CARGO_PKG_VERSION"));
+    assert!(
+        job.contains(&pinned) && job.contains("--partition=PART1"),
+        "{job}"
+    );
+
+    // While job 101 is queued, another install says so and starts none.
+    let o = install();
+    assert!(o.status.success(), "{}", said(&o));
+    assert!(said(&o).contains("still in Slurm's queue"), "{}", said(&o));
+    assert!(said(&o).contains("job 101, submitted"), "{}", said(&o));
+    assert_eq!(w.log("sbatch.log").lines().count(), 1);
+}
+
+#[test]
+fn install_wants_bin_to_be_an_install_prefixs() {
+    let w = World::new(MAKES_SIM);
+    std::fs::create_dir_all(w.remotes().parent().unwrap()).unwrap();
+    std::fs::write(
+        w.remotes(),
+        "[R1]\nssh = \"HOST1\"\nfolder = \"/x\"\nbin = \"/x/tools\"\n",
+    )
+    .unwrap();
+    let o = w
+        .legume(&["benchmark", "install", "--on", "R1"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(3), "{}", said(&o));
+    assert!(said(&o).contains("PREFIX/bin"), "{}", said(&o));
+    assert_eq!(w.log("sbatch.log"), "");
+}
+
+#[test]
+fn a_cluster_legume_of_another_version_is_refused() {
+    let w = World::new(MAKES_SIM).with_remote();
+    // The cluster's legume plans, then says it is 0.0.1.
+    std::fs::remove_file(w.tools().join("legume")).unwrap();
+    w.tool(
+        "legume",
+        &format!(
+            "{} \"$@\" || exit\n[ \"$2\" = plan ] && sed -i 's/\"legume\": \"[^\"]*\"/\"legume\": \"0.0.1\"/' \
+             results/benchmarks/N1/plan.json",
+            env!("CARGO_BIN_EXE_legume")
+        ),
+    );
+    let o = w.run();
+    assert_eq!(o.status.code(), Some(3), "{}", said(&o));
+    let s = said(&o);
+    assert!(s.contains("the cluster's legume is 0.0.1"), "{s}");
+    assert!(s.contains("legume benchmark install --on R1"), "{s}");
+    assert_eq!(w.log("sbatch.log"), "");
 }
