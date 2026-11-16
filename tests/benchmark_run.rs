@@ -156,7 +156,16 @@ fn a_spec_is_planned_on_the_cluster_run_there_and_resumed() {
     let s = said(&o);
     assert!(s.contains("4 tasks: 4 done"), "{s}");
     // Planned on a node, in the project's folder on the cluster.
-    let bench = w.cluster().join("P1/results/benchmarks/N1");
+    // Named for the project and a key of where it is here.
+    let projects: Vec<_> = std::fs::read_dir(w.cluster())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert!(
+        projects.len() == 1 && projects[0].starts_with("P1-") && projects[0].len() == 11,
+        "{projects:?}"
+    );
+    let bench = w.cluster().join(&projects[0]).join("results/benchmarks/N1");
     assert!(bench.join("plan.json").exists());
     assert!(w.log("srun.log").contains("--partition=PART1"));
     // The sims went in as one array job, then the scores as another.
@@ -311,11 +320,48 @@ fn install_submits_one_job_with_this_legume_and_not_while_one_is_queued() {
         "{job}"
     );
 
-    // While job 101 is queued, another install says so and starts none.
+    // While job 101 is queued, another install says so and starts none,
+    // even past a later install that never got a job.
+    std::fs::create_dir_all(installs.join("29991231-000000")).unwrap();
     let o = install();
     assert!(o.status.success(), "{}", said(&o));
-    assert!(said(&o).contains("still in Slurm's queue"), "{}", said(&o));
-    assert!(said(&o).contains("job 101, submitted"), "{}", said(&o));
+    assert!(
+        said(&o).contains("job 101 is still in Slurm's queue, submitted"),
+        "{}",
+        said(&o)
+    );
+    assert_eq!(w.log("sbatch.log").lines().count(), 1);
+
+    // Nor while another install is being submitted.
+    std::fs::remove_dir_all(w.state().join("q/101")).unwrap();
+    let mut held = Command::new("flock")
+        .arg(installs.join(".lock"))
+        .args(["sleep", "30"])
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while Command::new("flock")
+        .args(["-n"])
+        .arg(installs.join(".lock"))
+        .arg("true")
+        .status()
+        .unwrap()
+        .success()
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the lock is never held"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let o = install();
+    held.kill().unwrap();
+    held.wait().unwrap();
+    assert!(
+        said(&o).contains("being submitted right now"),
+        "{}",
+        said(&o)
+    );
     assert_eq!(w.log("sbatch.log").lines().count(), 1);
 }
 
@@ -356,5 +402,53 @@ fn a_cluster_legume_of_another_version_is_refused() {
     let s = said(&o);
     assert!(s.contains("the cluster's legume is 0.0.1"), "{s}");
     assert!(s.contains("legume benchmark install --on R1"), "{s}");
+    assert_eq!(w.log("sbatch.log"), "");
+}
+
+#[test]
+fn an_install_of_another_legume_is_refused_before_planning() {
+    let w = World::new(MAKES_SIM).with_remote();
+    std::fs::write(
+        w.root().join("pfx/.crates2.json"),
+        r#"{"installs":{"legume-mcp 0.0.1 (registry+https://example.org/index)":{}}}"#,
+    )
+    .unwrap();
+    let o = w.run();
+    assert_eq!(o.status.code(), Some(3), "{}", said(&o));
+    assert!(
+        said(&o).contains("the cluster's legume is 0.0.1"),
+        "{}",
+        said(&o)
+    );
+    assert_eq!(w.log("srun.log"), "", "no planning job");
+
+    // The install's record of this legume plans as before.
+    std::fs::write(
+        w.root().join("pfx/.crates2.json"),
+        format!(
+            r#"{{"installs":{{"legume-mcp {} (registry+https://example.org/index)":{{}}}}}}"#,
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .unwrap();
+    let o = w.run();
+    assert!(o.status.success(), "{}", said(&o));
+}
+
+#[test]
+fn a_task_wanting_gpus_is_refused_on_a_cluster() {
+    let w = World::new(MAKES_SIM).with_remote();
+    let spec = SPEC.replace(
+        r#""makes": ["sim.tsv"]"#,
+        r#""makes": ["sim.tsv"], "gpus": 1"#,
+    );
+    std::fs::write(
+        w.project().join("spec.json"),
+        spec.replace(r#""seeds""#, r#""gpus": [0], "seeds""#),
+    )
+    .unwrap();
+    let o = w.run();
+    assert_eq!(o.status.code(), Some(3), "{}", said(&o));
+    assert!(said(&o).contains("wants GPUs"), "{}", said(&o));
     assert_eq!(w.log("sbatch.log"), "");
 }

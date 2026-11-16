@@ -19,7 +19,6 @@ use super::pool::Outcome;
 use crate::command::{canonical_flags, failed, flag_pairs, required, usage, Flag};
 use crate::procgroup::Group;
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use serde_json::json;
 use std::io::Write;
 use std::os::unix::process::ExitStatusExt;
@@ -56,13 +55,6 @@ const LINGER: Duration = Duration::from_secs(1);
 /// How often the wrapper looks at the tool, its clock and its own stop.
 const TICK: Duration = Duration::from_millis(50);
 
-/// What the wrapper reads of `plan.json`.
-#[derive(Deserialize)]
-struct Plan {
-    grace_secs: u64,
-    tasks: Vec<Task>,
-}
-
 /// `legume benchmark task` with `args` (those after `task`).
 pub fn main(args: &[String], out: &mut dyn Write, _err: &mut dyn Write) -> Result<()> {
     let Some(pairs) = flag_pairs(args)? else {
@@ -85,15 +77,44 @@ pub fn main(args: &[String], out: &mut dyn Write, _err: &mut dyn Write) -> Resul
     };
     let text = std::fs::read_to_string(&plan_file)
         .with_context(|| format!("reading {}", plan_file.display()))?;
-    let plan: Plan =
+    let plan: super::plan::PlanDoc =
         serde_json::from_str(&text).with_context(|| format!("reading {}", plan_file.display()))?;
     let Some(task) = plan.tasks.iter().find(|t| t.id == id) else {
         return Err(usage(format!("{}: no task {id}", plan_file.display())));
     };
-    match run(task, Duration::from_secs(plan.grace_secs))? {
+    let ran = run(task, Duration::from_secs(plan.grace_secs));
+    if ran.is_err() {
+        failed_itself(task);
+    }
+    match ran? {
         None => Ok(()),
         // The wrapper exits as the tool did, said as no usage is.
         Some((code, said)) => Err(failed(code, format!("task {}: {said}", task.id))),
+    }
+}
+
+/// `exit.json` for task `t` when the wrapper itself failed (why is in
+/// the Slurm log), so the runner sees the end now and not only once the
+/// task is lost; nothing when even that cannot be written.
+fn failed_itself(t: &Task) {
+    let exit = TaskExit {
+        task: t.id.clone(),
+        key: t.key.clone(),
+        attempt: 0,
+        outcome: Outcome::Failed,
+        exit: None,
+        signal: None,
+        timed_out: false,
+        stopped: false,
+        oom: false,
+        started: super::executor::unix_secs(),
+        secs: 0.0,
+        cpu_secs: 0.0,
+        max_rss_mb: 0.0,
+        node: super::machine::host().unwrap_or_default(),
+    };
+    if let Ok(text) = crate::pretty(&exit) {
+        let _ = crate::job::replace(&t.dir, "exit.json", text.as_bytes());
     }
 }
 
@@ -117,37 +138,6 @@ fn listed(list: &Path, index: Option<String>) -> Result<String> {
             text.lines().count()
         ))),
     }
-}
-
-/// How the tool ended.
-#[derive(Clone, Copy)]
-enum Status {
-    Exit(i32),
-    Signal(i32),
-}
-
-impl Status {
-    fn of(status: std::process::ExitStatus) -> Status {
-        match (status.code(), status.signal()) {
-            (Some(c), _) => Status::Exit(c),
-            (None, s) => Status::Signal(s.unwrap_or(0)),
-        }
-    }
-
-    /// The wrapper's exit code: the tool's, or 128 plus its signal.
-    fn code(self) -> i32 {
-        match self {
-            Status::Exit(c) => c,
-            Status::Signal(s) => 128 + s,
-        }
-    }
-}
-
-/// How the tool ended, as the wrapper saw it.
-struct End {
-    status: Status,
-    timed_out: bool,
-    stopped: bool,
 }
 
 /// Task `t` run once under the wrapper, with `grace` between TERM and
@@ -183,71 +173,53 @@ fn run(t: &Task, grace: Duration) -> Result<Option<(i32, String)>> {
         .stdout(log.try_clone()?)
         .stderr(log);
     // The task's time is the tool's, not that of ending what it left.
-    let (end, secs) = match Group::spawn(&mut cmd) {
+    let (status, timed_out, stopped, secs) = match Group::spawn(&mut cmd) {
         Ok(mut group) => {
             let (timed_out, stopped) =
                 watch(&mut group, Duration::from_secs(t.timeout_secs), grace)?;
             let secs = start.elapsed().as_secs_f64();
-            let status = Status::of(group.stop(LINGER)?);
+            let status = group.stop(LINGER)?;
             end_adopted();
-            let end = End {
-                status,
-                timed_out,
-                stopped,
-            };
-            (end, secs)
+            (status, timed_out, stopped, secs)
         }
         Err(e) => {
             // As a shell says a command it cannot run: 127.
             let mut log = std::fs::OpenOptions::new().append(true).open(&log_path)?;
             writeln!(log, "legume benchmark task: running {first}: {e}")?;
-            let end = End {
-                status: Status::Exit(127),
-                timed_out: false,
-                stopped: false,
-            };
-            (end, start.elapsed().as_secs_f64())
+            let status = std::process::ExitStatus::from_raw(127 << 8);
+            (status, false, false, start.elapsed().as_secs_f64())
         }
     };
     let (cpu_secs, max_rss_mb) = children_usage();
-
-    let not_done = if end.stopped {
-        Some("stopped".to_string())
-    } else if end.timed_out {
-        Some(format!("timed out after {} s", t.timeout_secs))
-    } else {
-        match end.status {
-            Status::Exit(0) => write_done(t, secs, cpu_secs).err(),
-            Status::Exit(c) => Some(format!("exit {c}")),
-            Status::Signal(s) => Some(format!("signal {s}")),
-        }
-    };
-    let (exit, signal) = match end.status {
-        Status::Exit(c) => (Some(c), None),
-        Status::Signal(s) => (None, Some(s)),
-    };
     let oom = oom_said(&log_path);
     // Stopped, then timed out, then done, then out of memory, then failed.
-    let outcome = if end.stopped {
-        Outcome::Stopped
-    } else if end.timed_out {
-        Outcome::Timeout
-    } else if not_done.is_none() {
-        Outcome::Done
-    } else if oom {
-        Outcome::Oom
+    let (outcome, not_done) = if stopped {
+        (Outcome::Stopped, Some("stopped".to_string()))
+    } else if timed_out {
+        let why = format!("timed out after {} s", t.timeout_secs);
+        (Outcome::Timeout, Some(why))
     } else {
-        Outcome::Failed
+        let why = match (status.code(), status.signal()) {
+            (Some(0), _) => write_done(t, secs, cpu_secs).err(),
+            (Some(c), _) => Some(format!("exit {c}")),
+            (None, s) => Some(format!("signal {}", s.unwrap_or(0))),
+        };
+        let outcome = match &why {
+            None => Outcome::Done,
+            Some(_) if oom => Outcome::Oom,
+            Some(_) => Outcome::Failed,
+        };
+        (outcome, why)
     };
     let exit = TaskExit {
         task: t.id.clone(),
         key: t.key.clone(),
         attempt,
         outcome,
-        exit,
-        signal,
-        timed_out: end.timed_out,
-        stopped: end.stopped,
+        exit: status.code(),
+        signal: status.signal(),
+        timed_out,
+        stopped,
         oom,
         started,
         secs,
@@ -258,7 +230,11 @@ fn run(t: &Task, grace: Duration) -> Result<Option<(i32, String)>> {
     crate::job::replace(dir, "exit.json", crate::pretty(&exit)?.as_bytes())?;
     // A tool that exits 0 and is not done (its timeout, a stop, a makes
     // file not made) ends the wrapper with 1.
-    Ok(not_done.map(|why| (end.status.code().max(1), why)))
+    // The wrapper's code: the tool's, or 128 plus its signal.
+    let code = status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+    Ok(not_done.map(|why| (code.max(1), why)))
 }
 
 /// `done.json` for task `t`, when the tool made every `makes` file (there

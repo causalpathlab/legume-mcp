@@ -469,3 +469,19 @@ fn the_index_counts_every_line_of_the_list() {
     assert_eq!(o.status.code(), Some(2));
     assert!(said(&o).contains("line 0 is empty"), "{}", said(&o));
 }
+
+#[test]
+fn a_wrapper_that_fails_itself_still_says_the_task_failed() {
+    let mut b = Bench::new();
+    let dir = b.task("T1", "exit 0", &[], 30);
+    // The last done.json cannot be cleared: a folder is in its place.
+    std::fs::create_dir_all(dir.join("done.json/x")).unwrap();
+    let plan = b.plan(1);
+    let o = task(&plan, "T1");
+    assert!(!o.status.success());
+    let exit = read(&dir.join("exit.json"));
+    assert_eq!(
+        (exit["outcome"].as_str(), exit["key"].as_str()),
+        (Some("failed"), Some("key-T1"))
+    );
+}

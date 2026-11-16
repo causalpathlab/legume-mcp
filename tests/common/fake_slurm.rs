@@ -79,16 +79,22 @@ exit 0
 "#;
 
 const SCANCEL: &str = r#"#!/bin/bash
-# An array job's id cancels each of its tasks.
+# An array job's id cancels each of its tasks; one not in the queue is
+# an error, after the rest are cancelled, as Slurm's is.
 S=$FAKE_SLURM
 echo "$*" >> "$S/scancel.log"
+code=0
 for j in "$@"; do
   case $j in *_*) pat=$j ;; *) pat="${j}_*" ;; esac
+  found=0
   for q in "$S"/q/$pat; do
     [ -d "$q" ] || continue
+    found=1
     if [ -f "$q/pid" ]; then kill -TERM "$(cat "$q/pid")"; else rm -rf "$q"; fi
   done
+  [ $found = 1 ] || { echo "scancel: error: Invalid job id $j" >&2; code=1; }
 done
+exit $code
 "#;
 
 const SSH: &str = r#"#!/bin/bash

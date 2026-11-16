@@ -6,7 +6,7 @@
 
 use legume_mcp::benchmark::executor::Executor;
 use legume_mcp::benchmark::plan::Task;
-use legume_mcp::benchmark::pool::{Budget, Launch, Outcome};
+use legume_mcp::benchmark::pool::{Launch, Outcome};
 use legume_mcp::benchmark::remote::Shell;
 use legume_mcp::benchmark::slurm::{Site, Slurm};
 #[path = "common/bench.rs"]
@@ -83,14 +83,8 @@ impl Cluster {
             account: None,
             max_array,
         };
-        let budget = Budget {
-            cores: 64,
-            mem_gb: 256.0,
-            gpus: Vec::new(),
-            gpu_slots: 0,
-        };
         let tasks: Vec<Task> = serde_json::from_value(json!(self.plan)).unwrap();
-        let mut s = Slurm::new(shell, site, tasks, 1, budget).unwrap();
+        let mut s = Slurm::new(shell, site, tasks, 1);
         s.lost_after = Duration::from_millis(300);
         s
     }
@@ -128,7 +122,8 @@ fn ends(s: &mut Slurm, n: usize) -> Vec<(usize, Outcome)> {
     let start = Instant::now();
     while all.len() < n {
         assert!(start.elapsed() < Duration::from_secs(20), "ended: {all:?}");
-        let ended = s.poll(Duration::from_millis(100)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let ended = s.poll().unwrap();
         all.extend(ended.into_iter().map(|e| (e.task, e.outcome)));
     }
     all.sort_by_key(|e| e.0);
@@ -166,7 +161,10 @@ fn tasks_of_one_shape_go_in_as_one_array_job() {
         &std::fs::read_to_string(c.root().join("tasks/T2/slurm.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(job, json!({"array_job_id": "101", "index": 1}));
+    assert_eq!(
+        job,
+        json!({"array_job_id": "101", "index": 1, "key": "key-T2"})
+    );
     // The list says which task each array index runs.
     let mut lists: Vec<String> = std::fs::read_dir(c.root().join("slurm"))
         .unwrap()
@@ -210,7 +208,8 @@ fn one_squeue_per_round_for_any_number_of_tasks() {
     let mut rounds = 0;
     let mut ended = 0;
     while ended < 6 {
-        ended += s.poll(Duration::from_millis(200)).unwrap().len();
+        std::thread::sleep(Duration::from_millis(200));
+        ended += s.poll().unwrap().len();
         rounds += 1;
         assert!(rounds < 100);
     }
@@ -250,11 +249,30 @@ fn a_task_gone_from_the_queue_without_an_exit_is_lost_after_a_while() {
     s.launch(&launch(&[t])).unwrap();
     // Queued: not lost, however long it waits.
     std::thread::sleep(Duration::from_millis(400));
-    assert!(s.poll(Duration::ZERO).unwrap().is_empty());
+    assert!(s.poll().unwrap().is_empty());
     std::fs::remove_dir_all(c.state().join("q/101_0")).unwrap();
     // Gone: lost once it has been gone for lost_after.
-    assert!(s.poll(Duration::ZERO).unwrap().is_empty());
+    assert!(s.poll().unwrap().is_empty());
     assert_eq!(ends(&mut s, 1), vec![(t, Outcome::Lost)]);
+}
+
+#[test]
+fn a_stop_after_a_task_left_the_queue_still_stops_the_rest() {
+    let mut c = Cluster::new();
+    let a = c.task("T1", "true", 1, 1.0, 30);
+    let b = c.task("T2", "true", 1, 1.0, 30);
+    let shell = c.shell().with_env("FAKE_SLURM_HOLD", "1");
+    let mut s = c.slurm_with(shell, 100);
+    s.launch(&launch(&[a, b])).unwrap();
+    // T1 left the queue since the last poll; scancel says so, and T2 is
+    // stopped all the same.
+    std::fs::remove_dir_all(c.state().join("q/101_0")).unwrap();
+    s.cancel(&[a, b]).unwrap();
+    assert!(!c.state().join("q/101_1").exists());
+    assert_eq!(
+        ends(&mut s, 2),
+        vec![(a, Outcome::Stopped), (b, Outcome::Stopped)]
+    );
 }
 
 #[test]
@@ -266,26 +284,6 @@ fn a_pending_task_stopped_is_stopped_not_lost() {
     s.launch(&launch(&[t])).unwrap();
     s.cancel(&[t]).unwrap();
     assert_eq!(ends(&mut s, 1), vec![(t, Outcome::Stopped)]);
-}
-
-#[test]
-fn an_adopted_task_ends_by_its_exit_json() {
-    let mut c = Cluster::new();
-    let t = c.task("T1", "true", 1, 1.0, 30);
-    let mut s = c.slurm(100);
-    c.queue("77_0", "R");
-    s.adopt(t, "77_0").unwrap();
-    assert!(s.poll(Duration::ZERO).unwrap().is_empty());
-    let dir = c.root().join("tasks/T1");
-    std::fs::create_dir_all(&dir).unwrap();
-    let exit = json!({
-        "task": "T1", "key": "key-T1", "attempt": 1, "outcome": "done", "exit": 0,
-        "signal": null, "timed_out": false, "stopped": false, "oom": false, "started": 1.0, "secs": 1.0,
-        "cpu_secs": 0.5, "max_rss_mb": 3.0, "node": "NODE1",
-    });
-    std::fs::write(dir.join("exit.json"), exit.to_string()).unwrap();
-    assert_eq!(ends(&mut s, 1), vec![(t, Outcome::Done)]);
-    assert!(s.adopt(t, "77").is_err());
 }
 
 #[test]
@@ -301,7 +299,7 @@ fn a_failed_submission_cancels_what_went_in() {
     // No task keeps a slurm.json naming the cancelled job.
     assert!(!c.root().join("tasks/T1/slurm.json").exists());
     // Nothing is watched: no end comes.
-    assert!(s.poll(Duration::ZERO).unwrap().is_empty());
+    assert!(s.poll().unwrap().is_empty());
 }
 
 #[test]
@@ -321,28 +319,36 @@ fn the_ssh_shell_shares_one_connection() {
 #[test]
 fn resume_finds_done_tasks_by_key_and_adopts_queued_ones() {
     let mut c = Cluster::new();
-    let ids: Vec<usize> = (1..=4)
+    let ids: Vec<usize> = (1..=5)
         .map(|n| c.task(&format!("T{n}"), "true", 1, 1.0, 30))
         .collect();
     let dir = |n: usize| c.root().join(format!("tasks/T{n}"));
-    for n in 1..=4 {
+    for n in 1..=5 {
         std::fs::create_dir_all(dir(n)).unwrap();
     }
     // T1 done with its key, T2 done with another; T3 queued; T4 placed
-    // but ended, so not adopted.
+    // but ended, so not adopted; T5 queued for another key, so cancelled.
     std::fs::write(dir(1).join("done.json"), r#"{"key": "key-T1"}"#).unwrap();
     std::fs::write(dir(2).join("done.json"), r#"{"key": "old"}"#).unwrap();
-    for n in [3, 4] {
-        let placed = format!("{{\n  \"array_job_id\": \"77\", \"index\": {n}\n}}\n");
+    for (n, key) in [(3, "key-T3"), (4, "key-T4"), (5, "old")] {
+        let placed =
+            format!("{{\n  \"array_job_id\": \"77\", \"index\": {n}, \"key\": \"{key}\"\n}}\n");
         std::fs::write(dir(n).join("slurm.json"), placed).unwrap();
-        c.queue(&format!("77_{n}"), "PD");
+        c.queue(&format!("77_{n}"), "R");
     }
     std::fs::write(dir(4).join("exit.json"), "{}").unwrap();
     let mut s = c.slurm(100);
     let r = s.resume().unwrap();
     assert_eq!(r.done, vec![ids[0]]);
     assert_eq!(r.adopted, vec![ids[2]]);
-    // The adopted task is watched: cancelling it cancels its array task.
-    s.cancel(&[ids[2]]).unwrap();
-    assert_eq!(c.log("scancel.log").trim(), "77_3");
+    assert_eq!(c.log("scancel.log").trim(), "77_5");
+    // The adopted task is watched, and ends by its exit.json.
+    assert!(s.poll().unwrap().is_empty());
+    let exit = json!({
+        "task": "T3", "key": "key-T3", "attempt": 1, "outcome": "done", "exit": 0,
+        "signal": null, "timed_out": false, "stopped": false, "oom": false, "started": 1.0,
+        "secs": 1.0, "cpu_secs": 0.5, "max_rss_mb": 3.0, "node": "NODE1",
+    });
+    std::fs::write(dir(3).join("exit.json"), exit.to_string()).unwrap();
+    assert_eq!(ends(&mut s, 1), vec![(ids[2], Outcome::Done)]);
 }

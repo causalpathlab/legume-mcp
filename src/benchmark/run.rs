@@ -19,14 +19,13 @@
 //! every task is done, 1 when any is not.
 
 use super::executor::{round, unix_secs, Ended, Executor, Round, TaskExit};
-use super::plan::Task;
+use super::plan::{PlanDoc, Task};
 use super::pool::{Budget, Pool, State, Want};
 use super::remote::{self, Remote, Shell};
 use super::slurm::{srun, Site, Slurm};
 use crate::command::{canonical_flags, failed, flag_pairs, refuse, required, usage, Flag};
 use crate::project::quote;
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -58,22 +57,14 @@ const CLUSTER_CORES: u32 = 100_000;
 const WAIT_FIRST: Duration = Duration::from_secs(40);
 const WAIT_STEP: Duration = Duration::from_secs(10);
 const WAIT_MAX: Duration = Duration::from_secs(180);
+/// How long a round waits once the run is stopping.
+const WAIT_STOPPING: Duration = Duration::from_secs(10);
 
 /// Rounds in a row the cluster may leave unanswered before the run ends.
 const MAX_FAILURES: u32 = 5;
 
 /// A fixed wait between rounds, in ms, for tests.
 const POLL_ENV: &str = "LEGUME_BENCHMARK_POLL_MS";
-
-/// What the runner reads of `plan.json`.
-#[derive(Deserialize)]
-struct PlanDoc {
-    /// The legume that planned it; none before 0.5.13.
-    #[serde(default)]
-    legume: Option<String>,
-    grace_secs: u64,
-    tasks: Vec<Task>,
-}
 
 /// `legume benchmark run` with `args` (those after `run`).
 pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
@@ -104,16 +95,15 @@ fn run(spec_file: &Path, on: &str, out: &mut dyn Write, err: &mut dyn Write) -> 
     let text = std::fs::read_to_string(spec_file)
         .with_context(|| format!("reading {}", spec_file.display()))?;
     let (spec, _) = super::spec::parse(&text)?;
-    if text.lines().any(|l| l == SPEC_END) {
-        return Err(refuse(format!(
-            "the spec has a line {SPEC_END}, which legume sends it by"
-        )));
-    }
     let root = crate::project::root().context("finding the project's folder")?;
-    let project = root
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "project".into());
+    // Named for the project and its place here, so two projects of one
+    // name keep apart there.
+    let project = format!(
+        "{}-{}",
+        root.file_name()
+            .map_or("project".into(), |n| n.to_string_lossy()),
+        &super::key::key(root.display().to_string().as_bytes())[..8]
+    );
     let remote = remote::named(on, out)?;
     let shell = Shell::ssh(&remote.ssh);
     let c = Cluster {
@@ -130,8 +120,9 @@ fn run(spec_file: &Path, on: &str, out: &mut dyn Write, err: &mut dyn Write) -> 
     result
 }
 
-/// The line after a spec sent in a heredoc.
-const SPEC_END: &str = "@@spec";
+/// What starts the planning call's output when the cluster's install
+/// has another legume, before its version.
+const LEGUME_MARK: &str = "@@legume ";
 /// The line before plan.json in the planning call's output.
 const PLAN_MARK: &str = "@@plan.json";
 
@@ -173,29 +164,49 @@ impl Cluster<'_> {
             (4, 60),
             &format!("{} benchmark plan {s}", quote(&self.legume)),
         );
+        // An install's own record of its legume, read before the planning
+        // job waits in the queue, which a legume of another version would
+        // only be refused after.
+        let installed = self.remote.prefix().map_or(String::new(), |p| {
+            format!(
+                "v=$(grep -o '\"legume-mcp [^ ]*' {}/.crates2.json 2> /dev/null | head -1 | cut -d' ' -f2)\n\
+                 if [ -n \"$v\" ] && [ \"$v\" != {here} ]; then echo \"{LEGUME_MARK}$v\"; exit 0; fi\n",
+                quote(p),
+                here = env!("CARGO_PKG_VERSION"),
+            )
+        });
         let said = self.shell.check(
             &format!(
-                "set -e\nmkdir -p {d}/specs-in\ncat > {d}/{s} <<'{SPEC_END}'\n{text}\n{SPEC_END}\n\
+                "set -e\n{installed}mkdir -p {d}/specs-in\nprintf '%s\\n' {} > {d}/{s}\n\
                  cd {d}\n{path}LEGUME_MCP_PROJECT={d} {plan}\necho {PLAN_MARK}\ncat {}/plan.json\n",
+                quote(text),
                 quote(&self.bench(&spec.name)),
                 path = self.path(),
             ),
             "planning on the cluster",
         )?;
+        if let Some((_, there)) = said.split_once(LEGUME_MARK) {
+            return Err(self.other_legume(Some(there.trim())));
+        }
         let (said, plan) = said
             .split_once(&format!("{PLAN_MARK}\n"))
             .context("planning on the cluster: no plan.json")?;
         let plan: PlanDoc = serde_json::from_str(plan).context("reading plan.json")?;
-        let here = env!("CARGO_PKG_VERSION");
-        if plan.legume.as_deref() != Some(here) {
-            return Err(refuse(format!(
-                "the cluster's legume is {}, and this one {here}: legume benchmark \
-                 install --on {} installs this one there",
-                plan.legume.as_deref().unwrap_or("older"),
-                self.remote.name
-            )));
+        if plan.legume.as_deref() != Some(env!("CARGO_PKG_VERSION")) {
+            return Err(self.other_legume(plan.legume.as_deref()));
         }
         Ok((said.to_string(), plan))
+    }
+
+    /// The refusal of a cluster whose legume is `there`, not this one.
+    fn other_legume(&self, there: Option<&str>) -> anyhow::Error {
+        refuse(format!(
+            "the cluster's legume is {}, and this one {}: legume benchmark install --on {} \
+             installs this one there",
+            there.unwrap_or("older"),
+            env!("CARGO_PKG_VERSION"),
+            self.remote.name
+        ))
     }
 
     /// The benchmark of `spec`, whose text is `text`, run, its events kept
@@ -220,6 +231,12 @@ impl Cluster<'_> {
         )?;
         let (said, plan) = self.plan(spec, text, &run)?;
         write!(out, "{said}")?;
+        if let Some(t) = plan.tasks.iter().find(|t| t.gpus > 0) {
+            return Err(refuse(format!(
+                "{} wants GPUs, which a run on a cluster does not book yet",
+                t.id
+            )));
+        }
         let bench = self.bench(&spec.name);
         let site = Site {
             legume: self.legume.clone(),
@@ -243,9 +260,8 @@ impl Cluster<'_> {
             site,
             plan.tasks.clone(),
             plan.grace_secs,
-            budget,
-        )?;
-        let pool = Pool::new(wants, ex.budget())?;
+        );
+        let pool = Pool::new(wants, budget)?;
         let mut r = Runner {
             skipped_said: vec![false; plan.tasks.len()],
             tasks: &plan.tasks,
@@ -329,7 +345,7 @@ impl Runner<'_> {
             }
             let started = self.started;
             let mut clock = || started.elapsed().as_millis() as u64;
-            let round = round(&mut self.pool, &mut self.ex, &mut clock, Duration::ZERO);
+            let round = round(&mut self.pool, &mut self.ex, &mut clock);
             self.record(&round)?;
             // A round the cluster did not answer (a dropped connection) is
             // tried again: what it would have launched is pending again.
@@ -352,6 +368,8 @@ impl Runner<'_> {
             let changed = !round.ended.is_empty() || !round.launched.is_empty();
             wait = match fixed {
                 Some(f) => f,
+                // Stopped tasks end within the wrapper's stop grace.
+                None if stopping => WAIT_STOPPING,
                 None if changed => WAIT_FIRST,
                 None => (wait + WAIT_STEP).clamp(WAIT_FIRST, WAIT_MAX),
             };

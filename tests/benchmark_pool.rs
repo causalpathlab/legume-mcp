@@ -473,15 +473,14 @@ fn resume_adopts_and_reuses() {
     ];
     w[2].upstream = vec![0];
     let mut p = Pool::new(w, budget(2, 100.0)).unwrap();
-    p.reuse(0).unwrap();
-    p.adopt(0, 1, Vec::new()).unwrap();
+    p.resume(0, &[0], &[1]).unwrap();
     assert_eq!(p.booked(), 2);
     // Task 2 is ready (its upstream was reused) but the adopted task
     // holds every core.
     assert!(p.next(0, &calm()).is_empty());
     p.ended(5, 1, Outcome::Done).unwrap();
     assert_eq!(tasks(&p.next(5, &calm())), vec![2]);
-    assert!(p.adopt(5, 1, Vec::new()).is_err(), "only a pending task");
+    assert!(p.resume(5, &[], &[1]).is_err(), "only a pending task");
 }
 
 #[test]
@@ -623,14 +622,6 @@ fn a_cycle_is_refused() {
 }
 
 #[test]
-fn adopting_an_unknown_gpu_is_refused() {
-    let b = gpu_budget(vec![0, 1], 2);
-    let mut p = Pool::new(vec![want(0, None, 0, 1, 1.0)], b).unwrap();
-    let e = p.adopt(0, 0, vec![7]).unwrap_err().to_string();
-    assert!(e.contains("GPU 7"), "{e}");
-}
-
-#[test]
 fn a_method_has_one_cap() {
     let mut a = want(0, Some("M1"), 0, 1, 1.0);
     a.max_running = Some(2);
@@ -676,7 +667,7 @@ fn fake(n: usize) -> Fake {
 /// One [`round`] on `ex`'s clock.
 fn tick(p: &mut Pool, ex: &mut Fake) -> anyhow::Result<Vec<Launch>> {
     let c = ex.clock.clone();
-    let r = round(p, ex, &mut || c.get(), Default::default());
+    let r = round(p, ex, &mut || c.get());
     match r.error {
         Some(e) => Err(e),
         None => Ok(r.launched),
@@ -684,9 +675,6 @@ fn tick(p: &mut Pool, ex: &mut Fake) -> anyhow::Result<Vec<Launch>> {
 }
 
 impl Executor for Fake {
-    fn budget(&self) -> Budget {
-        budget(2, 100.0)
-    }
     fn live(&mut self) -> anyhow::Result<Live> {
         Ok(calm())
     }
@@ -701,7 +689,7 @@ impl Executor for Fake {
         }
         Ok(())
     }
-    fn poll(&mut self, _: std::time::Duration) -> anyhow::Result<Vec<Ended>> {
+    fn poll(&mut self) -> anyhow::Result<Vec<Ended>> {
         self.clock.set(self.clock.get() + self.poll_ms);
         let now = self.clock.get();
         let (ended, running) = self.running.iter().partition(|(at, _)| *at <= now);
@@ -732,7 +720,7 @@ fn round_drives_an_executor_to_the_end() {
     let mut ex = fake(4);
     ex.ms[1] = 5;
     ex.outcome[1] = Outcome::Failed;
-    let mut p = Pool::new(w, ex.budget()).unwrap();
+    let mut p = Pool::new(w, budget(2, 100.0)).unwrap();
     while !p.finished() {
         tick(&mut p, &mut ex).unwrap();
         ex.clock.set(ex.clock.get() + 1);
@@ -748,7 +736,7 @@ fn a_refused_launch_leaves_the_tasks_pending() {
     let mut ex = fake(2);
     ex.refuse = true;
     let w: Vec<_> = (0..2).map(|r| want(0, None, r, 1, 1.0)).collect();
-    let mut p = Pool::new(w, ex.budget()).unwrap();
+    let mut p = Pool::new(w, budget(2, 100.0)).unwrap();
     assert!(tick(&mut p, &mut ex).is_err());
     assert_eq!((p.state(0), p.booked()), (&State::Pending, 0));
     assert_eq!(tasks(&tick(&mut p, &mut ex).unwrap()), vec![0, 1]);
@@ -758,7 +746,7 @@ fn a_refused_launch_leaves_the_tasks_pending() {
 fn a_bad_end_does_not_lose_the_others() {
     let mut ex = fake(2);
     let w: Vec<_> = (0..2).map(|r| want(0, None, r, 1, 1.0)).collect();
-    let mut p = Pool::new(w, ex.budget()).unwrap();
+    let mut p = Pool::new(w, budget(2, 100.0)).unwrap();
     tick(&mut p, &mut ex).unwrap();
     ex.clock.set(10);
     // Task 0 is reported twice: the repeat is an error, and task 1, after
@@ -772,7 +760,7 @@ fn a_bad_end_does_not_lose_the_others() {
 fn ends_are_stamped_when_poll_returns() {
     // The task ends at 10; the poll that reports it waits 30 ms first.
     let mut ex = fake(1);
-    let mut p = Pool::new(vec![want(0, None, 0, 2, 1.0)], ex.budget()).unwrap();
+    let mut p = Pool::new(vec![want(0, None, 0, 2, 1.0)], budget(2, 100.0)).unwrap();
     tick(&mut p, &mut ex).unwrap();
     ex.clock.set(10);
     ex.poll_ms = 30;
