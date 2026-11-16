@@ -6,8 +6,9 @@
 # PREFIX/install/<time>/ and submits it; the job installs each crate with
 # `cargo install --locked` into PREFIX/bin. It does not wait: building
 # them all can take a few hours. Watch PREFIX/install/<time>/status, which
-# goes from "submitted <job id>" to "running", then "done", or "failed"
-# with the crates that did not install (the others still are).
+# goes from "submitted" to "running", then "done", or "failed" with the
+# crates that did not install (the others still are), or "failed: ..."
+# when the job stopped early. The Slurm job id is in job_id beside it.
 #
 # Why a job: login nodes are often older than compute nodes, may have no
 # internet, and should not carry long builds. A program built on a node
@@ -45,7 +46,7 @@
 #
 # libclang: faba's BAM reader (htslib) makes its C bindings with libclang
 # at build time. When faba is to be installed and the node has none (no
-# LIBCLANG_PATH, nothing in ldconfig), the job fetches PyPI's libclang
+# LIBCLANG_PATH, LD_LIBRARY_PATH, llvm-config or ldconfig), the job fetches PyPI's libclang
 # wheel into PREFIX/libclang once, with python3's standard library, and
 # gives bindgen gcc's built-in headers, which the wheel lacks. Nothing
 # that runs afterwards uses it. --no-libclang skips this.
@@ -74,15 +75,21 @@ libclang=1
 dry_run=0
 crates=()
 
+# The value of option $1, which must be given: $2, not empty and not the
+# next option.
+need() {
+    case "${2:-}" in '' | --*) die "$1 needs a value" ;; esac
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
-    --prefix) prefix="${2:-}"; shift 2 ;;
-    --partition) partition="${2:-}"; shift 2 ;;
-    --account) account="${2:-}"; shift 2 ;;
-    --cpus) cpus="${2:-}"; shift 2 ;;
-    --mem) mem="${2:-}"; shift 2 ;;
-    --time) time_limit="${2:-}"; shift 2 ;;
-    --build-tmp) build_tmp="${2:-}"; shift 2 ;;
+    --prefix) need "$@"; prefix="$2"; shift 2 ;;
+    --partition) need "$@"; partition="$2"; shift 2 ;;
+    --account) need "$@"; account="$2"; shift 2 ;;
+    --cpus) need "$@"; cpus="$2"; shift 2 ;;
+    --mem) need "$@"; mem="$2"; shift 2 ;;
+    --time) need "$@"; time_limit="$2"; shift 2 ;;
+    --build-tmp) need "$@"; build_tmp="$2"; shift 2 ;;
     --no-rust-update) rust_update=0; shift ;;
     --no-libclang) libclang=0; shift ;;
     --dry-run) dry_run=1; shift ;;
@@ -96,6 +103,9 @@ done
 case "$cpus" in '' | *[!0-9]* | 0) die "--cpus wants a whole number of cores, not '$cpus'" ;; esac
 case "$mem" in '' | *[!0-9]* | 0) die "--mem wants whole GB, not '$mem'" ;; esac
 case "$time_limit" in '' | *[!0-9:-]*) die "--time wants HH:MM:SS or D-HH:MM:SS, not '$time_limit'" ;; esac
+for v in "$partition" "$account"; do
+    case "$v" in *[!A-Za-z0-9_.,-]*) die "'$v' is not a Slurm partition or account name" ;; esac
+done
 [ ${#crates[@]} -gt 0 ] || crates=(
     "legume-mcp:benchmark" "pinto-rs" "lupin-rs" "senna-rs" "chickpea-rs" "faba" "data-beans"
 )
@@ -114,6 +124,9 @@ esac
 
 q() { printf '%q' "$1"; }
 
+# This install's own folder: its job script, log, status and versions.
+run="$prefix/install/$(date +%Y%m%d-%H%M%S)"
+
 job() {
     echo "#!/bin/bash"
     echo "#SBATCH --job-name=legume-install"
@@ -127,13 +140,26 @@ job() {
     echo "build_tmp=$(q "$build_tmp")"
     echo "rust_update=$rust_update"
     echo "libclang=$libclang"
+    # LEGUME_INSTALL_RUN lets the tests run the job in a folder of theirs.
+    echo "run=\"\${LEGUME_INSTALL_RUN:-$(q "$run")}\""
     printf 'crates=('
     for c in "${crates[@]}"; do printf ' %s' "$(q "$c")"; done
     echo ' )'
     cat <<'EOF'
-run="${LEGUME_INSTALL_RUN:?}"
 say() { echo "[$(date '+%F %T')] $*"; }
 status() { echo "$*" > "$run/status.part" && mv "$run/status.part" "$run/status"; }
+
+# A job Slurm stops (time limit, scancel, node failure) says so: TERM
+# reaches this shell at once because each build runs in the background
+# and is waited for, and the build is stopped with it.
+build=""
+finish() {
+    [ -n "${CARGO_TARGET_DIR:-}" ] && rm -rf "$CARGO_TARGET_DIR"
+    [ "$(cat "$run/status" 2> /dev/null)" = running ] \
+        && status "failed: the job stopped before it finished (time limit, cancel or node failure)"
+}
+trap finish EXIT
+trap '[ -n "$build" ] && kill "$build" 2> /dev/null; exit 143' TERM INT
 status running
 node=$(hostname -s)
 glibc=$(ldd --version 2>&1 | head -1)
@@ -143,7 +169,11 @@ say "node $node, $glibc"
 # into the prefix.
 for d in "${CARGO_HOME:-$HOME/.cargo}/bin" "$prefix/rust/cargo/bin"; do
     cargo --version > /dev/null 2>&1 && break
-    [ -x "$d/cargo" ] && PATH="$d:$PATH"
+    [ -x "$d/cargo" ] || continue
+    PATH="$d:$PATH"
+    # rustup's proxies find the prefix's toolchain only through these.
+    [ "$d" = "$prefix/rust/cargo/bin" ] \
+        && export RUSTUP_HOME="$prefix/rust/rustup" CARGO_HOME="$prefix/rust/cargo"
 done
 if ! cargo --version > /dev/null 2>&1; then
     say "no working cargo here: installing rustup into $prefix/rust"
@@ -158,7 +188,6 @@ fi
 say "$(cargo --version), $(rustc --version)"
 
 export CARGO_TARGET_DIR="$build_tmp/legume-install.${SLURM_JOB_ID:-$$}"
-trap 'rm -rf "$CARGO_TARGET_DIR"' EXIT
 mkdir -p "$CARGO_TARGET_DIR" "$prefix/bin"
 
 # libclang for crates whose C bindings are made at build time (faba).
@@ -166,17 +195,32 @@ needs_libclang=0
 for spec in "${crates[@]}"; do
     case "${spec%%[@:]*}" in faba) needs_libclang=1 ;; esac
 done
-if [ "$needs_libclang" = 1 ] && [ "$libclang" = 1 ] && [ -z "${LIBCLANG_PATH:-}" ] \
-    && ! ldconfig -p 2> /dev/null | grep -q 'libclang[-.0-9]*\.so'; then
+# A libclang the build would find: LIBCLANG_PATH, a folder in
+# LD_LIBRARY_PATH or llvm-config's, or the linker's cache (grep reads all
+# of ldconfig's listing, so pipefail never sees it cut short).
+has_libclang() {
+    [ -n "${LIBCLANG_PATH:-}" ] && return 0
+    local d ld="${LD_LIBRARY_PATH:-}"
+    for d in ${ld//:/ } $(llvm-config --libdir 2> /dev/null); do
+        ls "$d"/libclang*.so* > /dev/null 2>&1 && return 0
+    done
+    PATH="$PATH:/sbin:/usr/sbin" ldconfig -p 2> /dev/null \
+        | grep 'libclang[-.0-9]*\.so' > /dev/null
+}
+if [ "$needs_libclang" = 1 ] && [ "$libclang" = 1 ] && ! has_libclang; then
     lc="$prefix/libclang"
     so=$(find "$lc" -name libclang.so 2> /dev/null | head -1)
     if [ -z "$so" ]; then
         say "no libclang here, which faba's htslib bindings need: fetching PyPI's libclang wheel into $lc"
         python3 - "$lc" << 'PY' || say "fetching libclang failed; faba will not build"
-import io, json, sys, urllib.request, zipfile
+import io, json, platform, sys, urllib.request, zipfile
+arch = platform.machine()
 meta = json.load(urllib.request.urlopen("https://pypi.org/pypi/libclang/json"))
-url = next(f["url"] for f in meta["urls"]
-           if "manylinux" in f["filename"] and "x86_64" in f["filename"])
+urls = [f["url"] for f in meta["urls"]
+        if "manylinux" in f["filename"] and f["filename"].endswith(arch + ".whl")]
+if not urls:
+    sys.exit("no libclang wheel for " + arch)
+url = urls[0]
 zipfile.ZipFile(io.BytesIO(urllib.request.urlopen(url).read())).extractall(sys.argv[1])
 PY
         so=$(find "$lc" -name libclang.so 2> /dev/null | head -1)
@@ -190,6 +234,13 @@ PY
     fi
 fi
 
+# Each binary's checksum, to tell what this job installed.
+sums() {
+    local b
+    for b in "$prefix"/bin/*; do [ -f "$b" ] && cksum "$b"; done
+}
+before=$(sums)
+
 failed=""
 for spec in "${crates[@]}"; do
     name="${spec%%:*}"
@@ -201,14 +252,21 @@ for spec in "${crates[@]}"; do
     [ -n "$version" ] && args+=(--version "$version")
     [ -n "$features" ] && args+=(--features "$features")
     say "cargo ${args[*]} $name"
-    cargo "${args[@]}" "$name" || { failed="$failed $name"; say "failed: $name"; }
+    cargo "${args[@]}" "$name" &
+    build=$!
+    wait "$build" || { failed="$failed $name"; say "failed: $name"; }
+    build=""
 done
 
 {
     echo "node: $node"
     echo "glibc: $glibc"
-    for b in "$prefix"/bin/*; do
-        [ -x "$b" ] && echo "$(basename "$b"): $("$b" --version 2>&1 | head -1)"
+    # Only what this job installed or replaced, each given 10 s to answer.
+    limit=""
+    command -v timeout > /dev/null && limit="timeout 10"
+    sums | while read -r sum size b; do
+        printf '%s\n' "$before" | grep -xF "$sum $size $b" > /dev/null && continue
+        [ -x "$b" ] && echo "$(basename "$b"): $($limit "$b" --version 2>&1 | head -1)"
     done
 } > "$run/versions.txt"
 cat "$run/versions.txt"
@@ -229,16 +287,19 @@ if [ "$dry_run" = 1 ]; then
 fi
 
 command -v sbatch > /dev/null || die "no sbatch here: run this on the cluster's login node"
-run="$prefix/install/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$run"
 job > "$run/install.sbatch"
-jid=$(sbatch --parsable --export=ALL,LEGUME_INSTALL_RUN="$run" \
-    --output="$run/slurm.log" "$run/install.sbatch")
-echo "submitted $jid" > "$run/status"
+# Before sbatch: the job may start, and write "running", before it returns.
+echo submitted > "$run/status"
+jid=$(sbatch --parsable --output="$run/slurm.log" "$run/install.sbatch") || {
+    echo "failed: sbatch refused the job" > "$run/status"
+    die "sbatch refused the job; see above"
+}
+echo "$jid" > "$run/job_id"
 cat <<EOF
 Submitted job $jid: installing ${crates[*]} into $prefix
   log:     $run/slurm.log
-  status:  $run/status   (submitted, running, then done, or failed <crates>)
+  status:  $run/status   (submitted, running, then done, or failed ...)
   watch:   squeue -j $jid    or    tail -f $run/slurm.log
 When it says done, add to your shell's startup file:
   export PATH="$prefix/bin:\$PATH"

@@ -158,7 +158,14 @@ fn bad_options_are_refused() {
 #[test]
 fn submit_writes_the_job_and_its_status() {
     let bin = Bin::new();
-    bin.tool("sbatch", r#"echo "$@" > "$FAKE_SBATCH_ARGS"; echo 4242"#);
+    // The status as sbatch is called: the job may start before it returns.
+    bin.tool(
+        "sbatch",
+        r#"echo "$@" > "$FAKE_SBATCH_ARGS"
+for a in "$@"; do last="$a"; done
+cat "${last%/*}/status" > "$FAKE_SBATCH_ARGS.status"
+echo 4242"#,
+    );
     let prefix = tempfile::tempdir().unwrap();
     let args_file = prefix.path().join("sbatch-args");
     let o = script_cmd(&bin)
@@ -177,15 +184,70 @@ fn submit_writes_the_job_and_its_status() {
     let run = &runs[0];
     assert!(run.join("install.sbatch").is_file());
     let status = std::fs::read_to_string(run.join("status")).unwrap();
-    assert_eq!(status.trim(), "submitted 4242");
+    assert_eq!(status.trim(), "submitted");
+    let at_sbatch = std::fs::read_to_string(prefix.path().join("sbatch-args.status")).unwrap();
+    assert_eq!(at_sbatch.trim(), "submitted", "written before sbatch");
+    let jid = std::fs::read_to_string(run.join("job_id")).unwrap();
+    assert_eq!(jid.trim(), "4242");
     let sent = std::fs::read_to_string(&args_file).unwrap();
     assert!(sent.contains("--parsable"), "{sent}");
     assert!(sent.contains("install.sbatch"), "{sent}");
+    // The run folder is in the job, not passed through --export.
+    assert!(!sent.contains("--export"), "{sent}");
+    let job = std::fs::read_to_string(run.join("install.sbatch")).unwrap();
+    assert!(job.contains(run.to_str().unwrap()), "{job}");
+}
+
+#[test]
+fn a_prefix_with_a_comma_reaches_the_job_whole() {
+    let bin = Bin::new();
+    bin.tool("sbatch", "echo 4242");
+    let top = tempfile::tempdir().unwrap();
+    let prefix = top.path().join("A1,B1");
+    let o = script_cmd(&bin)
+        .args(["--prefix", prefix.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let run = std::fs::read_dir(prefix.join("install"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let job = std::fs::read_to_string(run.join("install.sbatch")).unwrap();
+    assert!(job.contains("A1\\,B1") || job.contains("A1,B1"), "{job}");
+}
+
+#[test]
+fn an_option_without_its_value_is_refused() {
+    let bin = Bin::new();
+    let prefix = tempfile::tempdir().unwrap();
+    let p = prefix.path().to_str().unwrap();
+    for args in [
+        vec!["--dry-run", "--prefix"],
+        vec!["--prefix", "--dry-run"],
+        vec!["--dry-run", "--prefix", p, "--partition"],
+        vec!["--dry-run", "--prefix", p, "--partition", "PART1 --x"],
+    ] {
+        let o = run(&bin, &args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}: {}", text(&o));
+        assert!(!text(&o).contains("#SBATCH"), "{args:?} printed a job");
+    }
+    let o = run(&bin, &["--dry-run", "--prefix"]);
+    assert!(text(&o).contains("--prefix needs a value"), "{}", text(&o));
 }
 
 /// The job, run here as Slurm would, with stand-ins: `cargo install`
 /// writes a script named for the crate into `--root`/bin.
 fn job_run(bin: &Bin, prefix: &Path, scratch: &Path, extra: &[&str]) -> (Output, PathBuf) {
+    let job = job_script(bin, prefix, scratch, extra);
+    let o = job_cmd(bin, prefix, &job).output().unwrap();
+    (o, prefix.join("install").join("RUN1"))
+}
+
+/// The job the script writes for `extra`, saved in `prefix`.
+fn job_script(bin: &Bin, prefix: &Path, scratch: &Path, extra: &[&str]) -> PathBuf {
     let mut args = vec![
         "--dry-run".to_string(),
         "--prefix".into(),
@@ -200,10 +262,16 @@ fn job_run(bin: &Bin, prefix: &Path, scratch: &Path, extra: &[&str]) -> (Output,
     let start = job.find("#!/bin/bash").expect("a job script");
     let file = prefix.join("job.sh");
     std::fs::write(&file, &job[start..]).unwrap();
+    file
+}
+
+/// `job` run as Slurm would, in the run folder `prefix`/install/RUN1, with
+/// only `bin`'s stand-ins and none of this machine's toolchain or libclang.
+fn job_cmd(bin: &Bin, prefix: &Path, job: &Path) -> Command {
     let run = prefix.join("install").join("RUN1");
     std::fs::create_dir_all(&run).unwrap();
-    let o = Command::new("bash")
-        .arg(&file)
+    let mut c = Command::new("bash");
+    c.arg(job)
         .env("PATH", bin.path())
         .env("SLURM_JOB_ID", "77")
         .env("SLURM_CPUS_PER_TASK", "3")
@@ -213,9 +281,11 @@ fn job_run(bin: &Bin, prefix: &Path, scratch: &Path, extra: &[&str]) -> (Output,
         .env_remove("CARGO_HOME")
         .env_remove("RUSTUP_HOME")
         .env_remove("RUSTUP_TOOLCHAIN")
-        .output()
-        .unwrap();
-    (o, run)
+        // Nor this machine's libclang.
+        .env_remove("LIBCLANG_PATH")
+        .env_remove("BINDGEN_EXTRA_CLANG_ARGS")
+        .env_remove("LD_LIBRARY_PATH");
+    c
 }
 
 /// Stand-ins for the Rust toolchain: `cargo install ... --root R ...
@@ -231,7 +301,11 @@ echo "${LIBCLANG_PATH:-}|${BINDGEN_EXTRA_CLANG_ARGS:-}" >> "$HOME/cargo-env"
 [ -n "$CARGO_TARGET_DIR" ] && mkdir -p "$CARGO_TARGET_DIR" && echo "$CARGO_TARGET_DIR" > "$HOME/target-dir"
 root=""; prev=""; for a in "$@"; do [ "$prev" = "--root" ] && root="$a"; prev="$a"; done
 name="$a"
-case "$name" in legume-mcp) b=legume ;; pinto-rs) b=pinto ;; broken*) exit 101 ;; *) b="$name" ;; esac
+case "$name" in
+legume-mcp) b=legume ;; pinto-rs) b=pinto ;; broken*) exit 101 ;;
+stopped) kill -TERM "$PPID"; sleep 1; : > "$HOME/build-finished"; exit 0 ;;
+*) b="$name" ;;
+esac
 mkdir -p "$root/bin"
 printf '#!/bin/sh\necho "%s 9.9.9"\n' "$b" > "$root/bin/$b"
 chmod +x "$root/bin/$b"
@@ -251,6 +325,10 @@ d="$2/libclang-18.data/platlib/clang/native"; mkdir -p "$d" && : > "$d/libclang.
         "gcc",
         r#"[ "$1" = "-print-file-name=include" ] && echo /GCC1/include"#,
     );
+    // No libclang anywhere, and no download.
+    bin.tool("ldconfig", "true");
+    bin.tool("llvm-config", "exit 1");
+    bin.tool("curl", r#"echo "$@" >> "$HOME/curl-calls"; exit 7"#);
 }
 
 /// The libclang variables cargo saw, one line per install.
@@ -382,9 +460,12 @@ fn faba_gets_a_libclang_when_the_node_has_none() {
 fn a_libclang_on_the_node_is_used_as_it_is() {
     let bin = Bin::new();
     fake_toolchain(&bin);
+    // Found early in a long listing: grep must not stop ldconfig short,
+    // which pipefail would read as no match.
     bin.tool(
         "ldconfig",
-        r#"echo "	libclang.so.18 (libc6,x86-64) => /usr/lib64/libclang.so.18""#,
+        r#"echo "	libclang.so.18 (libc6,x86-64) => /usr/lib64/libclang.so.18"
+i=0; while [ $i -lt 4000 ]; do echo "	libfiller$i.so.1 (libc6,x86-64) => /usr/lib64/libfiller$i.so.1"; i=$((i+1)); done"#,
     );
     let prefix = tempfile::tempdir().unwrap();
     let scratch = tempfile::tempdir().unwrap();
@@ -415,4 +496,123 @@ fn no_libclang_is_fetched_without_faba_or_with_no_libclang() {
         assert!(!prefix.path().join("python-calls").exists(), "{extra:?}");
         assert_eq!(cargo_env(prefix.path()), vec!["|".to_string()], "{extra:?}");
     }
+}
+
+#[test]
+fn a_libclang_from_llvm_config_or_ld_library_path_is_used_as_it_is() {
+    for how in ["llvm-config", "LD_LIBRARY_PATH"] {
+        let bin = Bin::new();
+        fake_toolchain(&bin);
+        let lib = tempfile::tempdir().unwrap();
+        std::fs::write(lib.path().join("libclang.so.18"), "").unwrap();
+        if how == "llvm-config" {
+            bin.tool("llvm-config", &format!("echo {}", lib.path().display()));
+        }
+        let prefix = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let job = job_script(
+            &bin,
+            prefix.path(),
+            scratch.path(),
+            &["--no-rust-update", "faba"],
+        );
+        let mut c = job_cmd(&bin, prefix.path(), &job);
+        if how == "LD_LIBRARY_PATH" {
+            c.env("LD_LIBRARY_PATH", lib.path());
+        }
+        let o = c.output().unwrap();
+        assert!(o.status.success(), "{how}: {}", text(&o));
+        assert!(
+            !prefix.path().join("python-calls").exists(),
+            "{how}: fetched"
+        );
+    }
+}
+
+#[test]
+fn a_stopped_job_says_it_failed() {
+    // Slurm's time limit or scancel: TERM to the job while it builds.
+    let bin = Bin::new();
+    fake_toolchain(&bin);
+    let prefix = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let (o, run) = job_run(
+        &bin,
+        prefix.path(),
+        scratch.path(),
+        &["--no-rust-update", "stopped", "legume-mcp:benchmark"],
+    );
+    assert!(!o.status.success(), "{}", text(&o));
+    let status = std::fs::read_to_string(run.join("status")).unwrap();
+    assert!(status.starts_with("failed: the job stopped"), "{status}");
+    // The build was stopped with it, and the crate after it never started.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(
+        !prefix.path().join("build-finished").exists(),
+        "build left running"
+    );
+    let calls = std::fs::read_to_string(prefix.path().join("cargo-calls")).unwrap();
+    assert!(!calls.contains("legume-mcp"), "{calls}");
+}
+
+#[test]
+fn a_toolchain_in_the_prefix_is_used_with_its_rustup_home() {
+    // No cargo on PATH; one rustup put in the prefix on an earlier run,
+    // whose proxy works only with RUSTUP_HOME set.
+    let bin = Bin::new();
+    fake_toolchain(&bin);
+    std::fs::remove_file(bin.dir.path().join("cargo")).unwrap();
+    let prefix = tempfile::tempdir().unwrap();
+    let cargo_bin = prefix.path().join("rust/cargo/bin");
+    std::fs::create_dir_all(&cargo_bin).unwrap();
+    let want = prefix.path().join("rust/rustup");
+    let proxy = format!(
+        "#!/bin/sh\n[ \"$RUSTUP_HOME\" = \"{}\" ] || exit 1\n[ \"$1\" = --version ] && echo cargo 1.95.0\nexit 0\n",
+        want.display()
+    );
+    let cargo = cargo_bin.join("cargo");
+    std::fs::write(&cargo, proxy).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let (o, run) = job_run(
+        &bin,
+        prefix.path(),
+        scratch.path(),
+        &["--no-rust-update", "legume-mcp:benchmark"],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(
+        !prefix.path().join("curl-calls").exists(),
+        "rustup fetched again"
+    );
+    assert_eq!(
+        std::fs::read_to_string(run.join("status")).unwrap().trim(),
+        "done"
+    );
+}
+
+#[test]
+fn versions_name_only_what_this_job_installed() {
+    let bin = Bin::new();
+    fake_toolchain(&bin);
+    let prefix = tempfile::tempdir().unwrap();
+    let other = prefix.path().join("bin/OTHER1");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    let ran = prefix.path().join("other-ran");
+    std::fs::write(&other, format!("#!/bin/sh\n: > {}\n", ran.display())).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let (o, run) = job_run(
+        &bin,
+        prefix.path(),
+        scratch.path(),
+        &["--no-rust-update", "legume-mcp:benchmark"],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let versions = std::fs::read_to_string(run.join("versions.txt")).unwrap();
+    assert!(versions.contains("legume 9.9.9"), "{versions}");
+    assert!(!versions.contains("OTHER1"), "{versions}");
+    assert!(!ran.exists(), "an unrelated program was run");
 }
