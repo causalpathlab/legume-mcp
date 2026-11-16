@@ -55,10 +55,9 @@ pub struct Spec {
     /// By name.
     pub inputs: Vec<Input>,
     pub stages: Vec<Stage>,
-    /// Method/score pairs gather compares; checked here, not read until
-    /// gather is built.
+    /// Method/score pairs gather compares.
     pub compare: Vec<[String; 2]>,
-    /// What gather plots; checked here, not read until gather is built.
+    /// What gather plots.
     pub plot: Option<Plot>,
 }
 

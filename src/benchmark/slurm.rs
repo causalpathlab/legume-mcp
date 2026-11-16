@@ -149,8 +149,8 @@ impl Slurm {
             let f = files.get(&i);
             let done = f
                 .and_then(|f| f.done.as_deref())
-                .and_then(|j| serde_json::from_str::<DoneFile>(j).ok());
-            if done.is_some_and(|d| d.key == t.key) {
+                .and_then(|j| super::plan::done_key(j.as_bytes()));
+            if done.is_some_and(|k| k == t.key) {
                 resumed.done.push(i);
                 continue;
             }
@@ -276,12 +276,6 @@ fn parse_range(s: &str) -> Option<Vec<Job>> {
         }
     }
     Some(jobs)
-}
-
-/// What resume reads of a `done.json`.
-#[derive(Deserialize)]
-struct DoneFile {
-    key: String,
 }
 
 /// A `slurm.json`: the array task a task was put in, for its key.

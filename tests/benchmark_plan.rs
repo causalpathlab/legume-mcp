@@ -546,7 +546,7 @@ fn the_command_line_exits_by_what_went_wrong() {
         ),
         (
             &["nope", "S1.json"],
-            "unknown command nope: benchmark has plan, run, install and task",
+            "unknown command nope: benchmark has plan, run, gather, install and task",
         ),
     ] {
         let o = p.legume(args);

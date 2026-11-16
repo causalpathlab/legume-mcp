@@ -548,7 +548,7 @@ fn clock(time: &str) -> &str {
 }
 
 /// `text` safe in XML text and attributes.
-fn xml(text: &str) -> String {
+pub(crate) fn xml(text: &str) -> String {
     text.chars()
         .filter(|c| !c.is_control())
         .map(|c| match c {

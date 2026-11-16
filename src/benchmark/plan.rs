@@ -65,12 +65,18 @@ impl Context<'_> {
     }
 }
 
-/// What the runner and the wrapper read of `plan.json`.
+/// What the runner, the wrapper and gather read of `plan.json`.
 #[derive(Deserialize)]
 pub struct PlanDoc {
     /// The legume that planned it; none before 0.5.13.
     #[serde(default)]
     pub legume: Option<String>,
+    /// The spec's key.
+    #[serde(default)]
+    pub spec_key: Option<String>,
+    /// The benchmark's folder where it was planned.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
     pub grace_secs: u64,
     pub tasks: Vec<Task>,
 }
@@ -96,6 +102,35 @@ pub struct Task {
     pub makes: Vec<String>,
     pub upstream: Vec<String>,
     pub key: String,
+}
+
+impl Task {
+    /// It is done in `dir`, where its files are: its `done.json` has its
+    /// key.
+    pub fn done_in(&self, dir: &Path) -> bool {
+        std::fs::read(dir.join("done.json"))
+            .is_ok_and(|b| done_key(&b).as_deref() == Some(self.key.as_str()))
+    }
+}
+
+/// The key a `done.json` holds.
+pub fn done_key(done_json: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Done {
+        key: String,
+    }
+    serde_json::from_slice::<Done>(done_json)
+        .ok()
+        .map(|d| d.key)
+}
+
+impl PlanDoc {
+    /// Where task `t`'s files are under `base`: its folder in the plan,
+    /// moved from where the plan was made (a cluster's folder) to `base`;
+    /// none when the plan does not have it in its own.
+    pub fn task_dir(&self, base: &Path, t: &Task) -> Option<PathBuf> {
+        Some(base.join(t.dir.strip_prefix(self.dir.as_ref()?).ok()?))
+    }
 }
 
 /// A run of an argv word: text, or a placeholder's name.
