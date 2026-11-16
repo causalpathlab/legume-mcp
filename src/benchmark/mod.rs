@@ -4,8 +4,12 @@
 //! and writes the benchmark's configuration to `results/benchmarks/<name>/`
 //! in the project, the files [`USAGE`] lists, apart from any output, so it
 //! can be run again. `legume benchmark task` runs one of its tasks under
-//! the [`wrapper`], as a compute node runs it.
+//! the [`wrapper`], as a compute node runs it. `legume benchmark plan SPEC
+//! --edit` shapes the spec in the terminal ([`edit`]).
 
+pub mod edit;
+#[cfg(feature = "tui")]
+pub mod edit_view;
 pub mod executor;
 pub mod gather;
 #[cfg(unix)]
@@ -36,7 +40,7 @@ use std::path::{Path, PathBuf};
 
 /// `legume benchmark`'s usage.
 pub const USAGE: &str = "\
-legume benchmark plan SPEC [--retool]
+legume benchmark plan SPEC [--retool | --edit]
 
 A benchmark's plan: the spec SPEC (JSON) expanded to its tasks, a grid
 of parameters times seeds times stages and their methods, each task with
@@ -55,6 +59,15 @@ It writes results/benchmarks/<name>/ in the project:
 and says what it planned. A later plan lists what changed: the machine,
 and each tool installed since, whose snapshot it keeps. --retool plans
 with the tools installed now, which rekeys their tasks.
+
+legume benchmark plan SPEC --edit
+
+Edits the spec SPEC in the terminal, a new one from a template when there
+is no file: its axes and their values, excluded points, seeds, and each
+stage's and method's threads, mem_gb and timeout, with its points, reps,
+tasks and refusals counted from the spec alone as it changes (no tool is
+looked for and no plan is written, so a spec for a cluster is edited
+here). It saves only SPEC, after showing what changes. Built with tui.
 
 legume benchmark run SPEC --on REMOTE
 
@@ -86,16 +99,24 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
         Some("plan") => {
             let mut spec = None;
             let mut retool = false;
+            let mut edit = false;
             for a in &args[1..] {
                 match a.as_str() {
                     "-h" | "--help" => return Ok(writeln!(out, "{USAGE}")?),
                     "--retool" => retool = true,
+                    "--edit" => edit = true,
                     s if s.starts_with('-') => return Err(usage(format!("unknown argument {s}"))),
                     s if spec.is_none() => spec = Some(PathBuf::from(s)),
                     s => return Err(usage(format!("one SPEC, not also {s}"))),
                 }
             }
             let spec = spec.ok_or_else(|| usage("plan needs SPEC, the spec's JSON file"))?;
+            if edit && retool {
+                return Err(usage("--edit plans nothing, so it takes no --retool"));
+            }
+            if edit {
+                return edit::main(&spec, out);
+            }
             plan_spec(&spec, retool, out, err)
         }
         Some("gather") => gather::main(&args[1..], out, err),

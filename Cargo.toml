@@ -116,3 +116,7 @@ required-features = ["benchmark"]
 [[test]]
 name = "benchmark_run"
 required-features = ["benchmark"]
+
+[[test]]
+name = "benchmark_edit"
+required-features = ["tui", "benchmark"]
