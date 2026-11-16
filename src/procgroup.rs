@@ -38,6 +38,7 @@ impl Group {
     }
 
     /// The leader's pid, the group's id.
+    #[cfg(all(feature = "benchmark", target_os = "linux"))]
     pub fn id(&self) -> u32 {
         self.child.id()
     }
