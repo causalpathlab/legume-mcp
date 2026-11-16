@@ -21,6 +21,7 @@
 
 use super::{key, machine, plan, spec, tools};
 use crate::command::refuse;
+use crate::text;
 use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 use std::io::Write;
@@ -32,11 +33,7 @@ pub type Said = std::result::Result<String, String>;
 /// A row of the editor: one thing the cursor can stand on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Row {
-    Name,
-    Cores,
-    MemGb,
-    SeedsN,
-    SeedsBase,
+    Scalar(Scalar),
     /// The axes, as a heading: an axis is added here.
     Axes,
     Axis(String),
@@ -77,14 +74,92 @@ impl Need {
     }
 }
 
-/// A field the person sets by typing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Field {
+/// One of the spec's own fields, or its seeds', that a row shows and the
+/// person sets by typing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scalar {
     Name,
     Cores,
     MemGb,
     SeedsN,
     SeedsBase,
+}
+
+/// Where a [`Scalar`] is in the spec, and how the editor shows and asks
+/// for it.
+struct Spot {
+    /// In `seeds`, rather than in the spec itself.
+    seeds: bool,
+    key: &'static str,
+    /// What its row and its prompt call it.
+    label: &'static str,
+    /// The field a refusal names for it.
+    path: &'static str,
+    /// What its row says after `-` when the spec gives none.
+    unset: &'static str,
+    /// What an empty answer means, said in the prompt.
+    empty: Option<&'static str>,
+    /// An answer is kept as text, even when it reads as a number.
+    text: bool,
+}
+
+impl Scalar {
+    /// Each, in the order the rows show them.
+    const ALL: [Self; 5] = [
+        Self::Name,
+        Self::Cores,
+        Self::MemGb,
+        Self::SeedsN,
+        Self::SeedsBase,
+    ];
+
+    /// Where it is and how it is shown and asked for: the table of them.
+    fn spot(self) -> Spot {
+        /// At `key`, refused by that name, with nothing more to say.
+        const fn at(seeds: bool, key: &'static str, label: &'static str) -> Spot {
+            Spot {
+                seeds,
+                key,
+                label,
+                path: key,
+                unset: "",
+                empty: None,
+                text: false,
+            }
+        }
+        match self {
+            Self::Name => Spot {
+                text: true,
+                ..at(false, "name", "name")
+            },
+            Self::Cores => Spot {
+                unset: " (the machine's logical CPUs)",
+                empty: Some("the machine's"),
+                ..at(false, "cores", "cores")
+            },
+            Self::MemGb => Spot {
+                unset: " (MemAvailable where it plans)",
+                empty: Some("MemAvailable"),
+                ..at(false, "mem_gb", "mem_gb")
+            },
+            // Its row is the seeds' whole, n or a list: a refusal of any
+            // of it is marked here.
+            Self::SeedsN => Spot {
+                path: "seeds",
+                ..at(true, "n", "seeds n")
+            },
+            Self::SeedsBase => Spot {
+                path: "seeds.base",
+                ..at(true, "base", "seeds base")
+            },
+        }
+    }
+}
+
+/// A field the person sets by typing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Field {
+    Scalar(Scalar),
     /// What stage `stage` needs, or its method `method`.
     Need {
         stage: usize,
@@ -201,6 +276,8 @@ pub struct Editor {
     /// The file's text is laid out otherwise than a save writes it.
     relaid: bool,
     value: Value,
+    /// The spec differs from the file's, as of the last edit or save.
+    changed: bool,
     rows: Vec<Row>,
     cursor: usize,
     report: Report,
@@ -247,6 +324,7 @@ impl Editor {
             saved,
             relaid,
             value,
+            changed: false,
             rows: Vec::new(),
             cursor: 0,
             report: Report::default(),
@@ -309,9 +387,7 @@ impl Editor {
 
     /// The spec differs from the file's (a new file always does).
     pub fn changed(&self) -> bool {
-        self.saved
-            .as_ref()
-            .is_none_or(|s| key::canonical(s) != key::canonical(&self.value))
+        self.changed
     }
 
     /// A save writes the file in another layout than it has.
@@ -337,8 +413,6 @@ impl Editor {
 
     /// Row `row` as the screen shows it.
     pub fn line(&self, row: &Row) -> RowLine {
-        let v = &self.value;
-        let shown = |x: Option<&Value>| x.map_or("-".to_string(), text);
         let line = |depth, text: String| RowLine {
             depth,
             text,
@@ -352,41 +426,24 @@ impl Editor {
             head: true,
         };
         match row {
-            Row::Name => line(0, format!("name        {}", shown(v.get("name")))),
-            Row::Cores => line(
-                0,
-                match v.get("cores") {
-                    Some(c) => format!("cores       {}", text(c)),
-                    None => "cores       - (the machine's logical CPUs)".into(),
-                },
-            ),
-            Row::MemGb => line(
-                0,
-                match v.get("mem_gb") {
-                    Some(m) => format!("mem_gb      {}", text(m)),
-                    None => "mem_gb      - (MemAvailable where it plans)".into(),
-                },
-            ),
-            Row::SeedsN => {
-                let seeds = v.get("seeds");
-                match seeds.and_then(|s| s.get("list")) {
-                    Some(Value::Array(l)) => {
+            Row::Scalar(s) => {
+                let spot = s.spot();
+                let (holder, k) = self.holder(&Field::Scalar(*s));
+                let (label, shown) = match holder.and_then(|h| h.get("list")) {
+                    // The seeds as a list, shown on n's row.
+                    Some(Value::Array(l)) if *s == Scalar::SeedsN => {
                         let l: Vec<String> = l.iter().map(text).collect();
-                        line(0, format!("seeds       list {}", l.join(", ")))
+                        ("seeds", format!("list {}", l.join(", ")))
                     }
-                    _ => line(
-                        0,
-                        format!("seeds n     {}", shown(seeds.and_then(|s| s.get("n")))),
+                    _ => (
+                        spot.label,
+                        holder
+                            .and_then(|h| h.get(k))
+                            .map_or(format!("-{}", spot.unset), text),
                     ),
-                }
+                };
+                line(0, format!("{label:<12}{shown}"))
             }
-            Row::SeedsBase => line(
-                0,
-                format!(
-                    "seeds base  {}",
-                    shown(v.get("seeds").and_then(|s| s.get("base")))
-                ),
-            ),
             Row::Axes => head("axes"),
             Row::Axis(a) => {
                 let values = self.axis(a);
@@ -443,24 +500,7 @@ impl Editor {
 
     /// The text field `field` has now, to start an answer from.
     pub fn current(&self, field: &Field) -> String {
-        let (holder, k) = match field {
-            Field::Name => (Some(&self.value), "name"),
-            Field::Cores => (Some(&self.value), "cores"),
-            Field::MemGb => (Some(&self.value), "mem_gb"),
-            Field::SeedsN => (self.value.get("seeds"), "n"),
-            Field::SeedsBase => (self.value.get("seeds"), "base"),
-            Field::Need {
-                stage,
-                method,
-                need,
-            } => {
-                let holder = match method {
-                    Some(m) => self.method(*stage, m),
-                    None => self.stage(*stage),
-                };
-                (holder, need.field())
-            }
-        };
+        let (holder, k) = self.holder(field);
         holder.and_then(|h| h.get(k)).map_or(String::new(), text)
     }
 
@@ -469,11 +509,7 @@ impl Editor {
     pub fn ask(&self, want: Want) -> Option<(Ask, String)> {
         let row = self.row()?;
         let field = match (want, row) {
-            (Want::Edit, Row::Name) => Field::Name,
-            (Want::Edit, Row::Cores) => Field::Cores,
-            (Want::Edit, Row::MemGb) => Field::MemGb,
-            (Want::Edit, Row::SeedsN) => Field::SeedsN,
-            (Want::Edit, Row::SeedsBase) => Field::SeedsBase,
+            (Want::Edit, Row::Scalar(s)) => Field::Scalar(*s),
             (Want::Edit, Row::Stage(_) | Row::Method { .. }) => {
                 return self.ask(Want::Set(Need::Threads))
             }
@@ -503,11 +539,13 @@ impl Editor {
     /// The prompt for `ask`.
     pub fn prompt(&self, ask: &Ask) -> String {
         match ask {
-            Ask::Set(Field::Name) => "name".into(),
-            Ask::Set(Field::Cores) => "cores (empty: the machine's)".into(),
-            Ask::Set(Field::MemGb) => "mem_gb (empty: MemAvailable)".into(),
-            Ask::Set(Field::SeedsN) => "seeds n".into(),
-            Ask::Set(Field::SeedsBase) => "seeds base".into(),
+            Ask::Set(Field::Scalar(s)) => {
+                let spot = s.spot();
+                match spot.empty {
+                    Some(e) => format!("{} (empty: {e})", spot.label),
+                    None => spot.label.into(),
+                }
+            }
             Ask::Set(Field::Need {
                 stage,
                 method,
@@ -627,6 +665,7 @@ impl Editor {
             .map_err(|e| format!("not saved: writing {}: {e}", self.path.display()))?;
         self.saved = Some(self.value.clone());
         self.relaid = false;
+        self.changed = false;
         let (_, k) = self.keys();
         Ok(format!(
             "saved {}, spec {}",
@@ -637,6 +676,10 @@ impl Editor {
 
     /// The rows and the report made again after an edit.
     fn refresh(&mut self) {
+        self.changed = self
+            .saved
+            .as_ref()
+            .is_none_or(|s| key::canonical(s) != key::canonical(&self.value));
         self.rows = rows(&self.value);
         self.move_to(self.cursor);
         self.report = report(&self.value);
@@ -693,12 +736,12 @@ impl Editor {
 
     /// The excluded points `gone` picks removed; how many.
     fn drop_excluded(&mut self, gone: impl Fn(&Value) -> bool) -> usize {
-        let before = self.excludes().len();
-        if before == 0 {
+        let Some(Value::Array(l)) = self.value.get_mut("exclude") else {
             return 0;
-        }
-        self.excludes_mut().retain(|e| !gone(e));
-        before - self.excludes().len()
+        };
+        let before = l.len();
+        l.retain(|e| !gone(e));
+        before - l.len()
     }
 
     /// No empty `exclude` or `axes` left behind: a spec without them is
@@ -729,76 +772,88 @@ impl Editor {
             .and_then(|ms| ms.get(m))
     }
 
-    /// `field` set to `typed`; empty takes it out.
-    fn set(&mut self, field: &Field, typed: &str) -> Said {
-        let as_text = matches!(
-            field,
-            Field::Name
-                | Field::Need {
-                    need: Need::Timeout,
-                    ..
-                }
-        );
-        let new = (!typed.is_empty()).then(|| typed_value(typed, as_text));
-        let (holder, k): (&mut Map<String, Value>, &str) = match field {
-            Field::Name => (self.root_mut(), "name"),
-            Field::Cores => (self.root_mut(), "cores"),
-            Field::MemGb => (self.root_mut(), "mem_gb"),
-            Field::SeedsN | Field::SeedsBase => {
-                let seeds = object_at(self.root_mut(), "seeds");
-                // A list of seeds is replaced only by a value given for n
-                // or base, and said so; nothing typed keeps it.
-                if let Some(Value::Array(l)) = seeds.get("list") {
-                    let Some(x) = new else {
-                        return Err(
-                            "this spec lists its seeds; the list stays (edit it in the file)"
-                                .into(),
-                        );
-                    };
-                    let n = l.len();
-                    seeds.remove("list");
-                    let said = if *field == Field::SeedsN {
-                        seeds.insert("n".into(), x.clone());
-                        format!("n {}", text(&x))
-                    } else {
-                        seeds.insert("n".into(), json!(n));
-                        seeds.insert("base".into(), x.clone());
-                        format!("n {n}, base {}", text(&x))
-                    };
-                    return Ok(format!(
-                        "the listed seeds are replaced by derived ones: {said}"
-                    ));
-                }
-                let k = if *field == Field::SeedsN { "n" } else { "base" };
-                (seeds, k)
+    /// Where `field` is: the object that holds it, if the spec has one
+    /// there, and its key in it.
+    fn holder(&self, field: &Field) -> (Option<&Value>, &'static str) {
+        match field {
+            Field::Scalar(s) => {
+                let spot = s.spot();
+                let holder = if spot.seeds {
+                    self.value.get("seeds")
+                } else {
+                    Some(&self.value)
+                };
+                (holder, spot.key)
             }
             Field::Need {
                 stage,
                 method,
                 need,
             } => {
-                let Some(s) = self
+                let holder = match method {
+                    Some(m) => self.method(*stage, m),
+                    None => self.stage(*stage),
+                };
+                (holder, need.field())
+            }
+        }
+    }
+
+    /// [`Self::holder`] to change: `seeds` made an object when it is not
+    /// one; refused, a stage or method that is not one.
+    fn holder_mut(
+        &mut self,
+        field: &Field,
+    ) -> std::result::Result<(&mut Map<String, Value>, &'static str), String> {
+        match field {
+            Field::Scalar(s) => {
+                let spot = s.spot();
+                let root = self.root_mut();
+                let holder = if spot.seeds {
+                    object_at(root, "seeds")
+                } else {
+                    root
+                };
+                Ok((holder, spot.key))
+            }
+            Field::Need {
+                stage,
+                method,
+                need,
+            } => {
+                let s = self
                     .root_mut()
                     .get_mut("stages")
                     .and_then(|s| s.get_mut(*stage))
                     .and_then(Value::as_object_mut)
-                else {
-                    return Err(format!("stages[{stage}] is not an object"));
-                };
+                    .ok_or_else(|| format!("stages[{stage}] is not an object"))?;
                 let holder = match method {
                     None => s,
-                    Some(m) => match s
+                    Some(m) => s
                         .get_mut("methods")
                         .and_then(|ms| ms.get_mut(m))
                         .and_then(Value::as_object_mut)
-                    {
-                        Some(o) => o,
-                        None => return Err(format!("method {m} is not an object")),
-                    },
+                        .ok_or_else(|| format!("method {m} is not an object"))?,
                 };
-                (holder, need.field())
+                Ok((holder, need.field()))
             }
+        }
+    }
+
+    /// `field` set to `typed`; empty takes it out.
+    fn set(&mut self, field: &Field, typed: &str) -> Said {
+        let as_text = match field {
+            Field::Scalar(s) => s.spot().text,
+            Field::Need { need, .. } => *need == Need::Timeout,
         };
+        let new = (!typed.is_empty()).then(|| typed_value(typed, as_text));
+        if let Field::Scalar(s) = field {
+            let listed = self.value.get("seeds").and_then(|x| x.get("list"));
+            if s.spot().seeds && listed.is_some_and(Value::is_array) {
+                return self.replace_seed_list(*s, new);
+            }
+        }
+        let (holder, k) = self.holder_mut(field)?;
         match new {
             Some(x) => {
                 let said = format!("{k} {}", text(&x));
@@ -810,6 +865,30 @@ impl Editor {
                 Ok(format!("{k} left out"))
             }
         }
+    }
+
+    /// The seeds' list replaced by derived ones, as `new` gives seeds n or
+    /// base (`scalar`), and said so; nothing given keeps the list.
+    fn replace_seed_list(&mut self, scalar: Scalar, new: Option<Value>) -> Said {
+        let Some(x) = new else {
+            return Err("this spec lists its seeds; the list stays (edit it in the file)".into());
+        };
+        let seeds = object_at(self.root_mut(), "seeds");
+        let n = seeds
+            .remove("list")
+            .and_then(|l| l.as_array().map(Vec::len))
+            .unwrap_or_default();
+        let said = if scalar == Scalar::SeedsN {
+            seeds.insert("n".into(), x.clone());
+            format!("n {}", text(&x))
+        } else {
+            seeds.insert("n".into(), json!(n));
+            seeds.insert("base".into(), x.clone());
+            format!("n {n}, base {}", text(&x))
+        };
+        Ok(format!(
+            "the listed seeds are replaced by derived ones: {said}"
+        ))
     }
 
     /// `typed`'s values added to axis `a`: plain words, or on a tuple axis
@@ -824,12 +903,7 @@ impl Editor {
             let label = words.next().unwrap_or_default();
             let mut m = Map::new();
             m.insert("label".into(), json!(label));
-            for w in words {
-                let (k, x) = w
-                    .split_once('=')
-                    .ok_or_else(|| format!("{w:?}: a tuple value is LABEL NAME=VALUE ..."))?;
-                m.insert(k.into(), json!(x));
-            }
+            m.extend(pairs(words, "a tuple value is LABEL NAME=VALUE ...")?);
             vec![Value::Object(m)]
         } else {
             typed.split_whitespace().map(|w| json!(w)).collect()
@@ -870,13 +944,7 @@ impl Editor {
 
     /// The excluded point `AXIS=VALUE ...` added.
     fn add_excluded(&mut self, typed: &str) -> Said {
-        let mut m = Map::new();
-        for w in typed.split_whitespace() {
-            let (k, x) = w
-                .split_once('=')
-                .ok_or_else(|| format!("{w:?}: a point is AXIS=VALUE ..."))?;
-            m.insert(k.into(), json!(x));
-        }
+        let m = pairs(typed.split_whitespace(), "a point is AXIS=VALUE ...")?;
         if m.is_empty() {
             return Err("no point given: AXIS=VALUE ...".into());
         }
@@ -902,20 +970,26 @@ pub fn main(_: &Path, _: &mut dyn Write) -> Result<()> {
     ))
 }
 
+/// `words`, each `KEY=VALUE`, as an object of text values; refused, a
+/// word without `=`, saying it is not what `shape` says.
+fn pairs<'a>(
+    words: impl IntoIterator<Item = &'a str>,
+    shape: &str,
+) -> std::result::Result<Map<String, Value>, String> {
+    words
+        .into_iter()
+        .map(|w| match w.split_once('=') {
+            Some((k, x)) => Ok((k.to_string(), json!(x))),
+            None => Err(format!("{w:?}: {shape}")),
+        })
+        .collect()
+}
+
 /// The spec a new file starts from: one axis, three seeds, a stage that
 /// makes data and one method that scores it, named after the file.
 fn template(path: &Path) -> Value {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-    let name: String = stem
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        .take(40)
-        .collect();
-    let name = if name.is_empty() || name.starts_with('.') {
-        "bench".to_string()
-    } else {
-        name
-    };
+    let name = spec::benchmark_name(&stem).unwrap_or_else(|_| "bench".into());
     json!({
         "name": name,
         "seeds": {"n": 3, "base": 0},
@@ -936,14 +1010,6 @@ fn template(path: &Path) -> Value {
 /// [`crate::pretty`] writes a file; a JSON value always writes.
 fn pretty(v: &Value) -> String {
     crate::pretty(v).unwrap_or_default()
-}
-
-/// `v` as a row shows it: a string bare, anything else as JSON.
-fn text(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
 }
 
 /// An axis value's label: the value on a plain axis, its `label` on a
@@ -1007,11 +1073,7 @@ fn needs_text(holder: Option<&Value>) -> String {
 /// The field of the spec row `r` stands for, as a refusal names it.
 fn row_path(r: &Row) -> Option<String> {
     Some(match r {
-        Row::Name => "name".into(),
-        Row::Cores => "cores".into(),
-        Row::MemGb => "mem_gb".into(),
-        Row::SeedsN => "seeds".into(),
-        Row::SeedsBase => "seeds.base".into(),
+        Row::Scalar(s) => s.spot().path.into(),
         Row::Axes => "axes".into(),
         Row::Axis(a) => format!("axes.{a}"),
         Row::Value { axis, index } => format!("axes.{axis}[{index}]"),
@@ -1026,14 +1088,8 @@ fn row_path(r: &Row) -> Option<String> {
 /// The rows of spec `v`: its fields, then its axes and their values, its
 /// excluded points, and its stages and their methods.
 fn rows(v: &Value) -> Vec<Row> {
-    let mut rows = vec![
-        Row::Name,
-        Row::Cores,
-        Row::MemGb,
-        Row::SeedsN,
-        Row::SeedsBase,
-        Row::Axes,
-    ];
+    let mut rows: Vec<Row> = Scalar::ALL.map(Row::Scalar).into();
+    rows.push(Row::Axes);
     if let Some(Value::Object(axes)) = v.get("axes") {
         for (a, values) in axes {
             rows.push(Row::Axis(a.clone()));
@@ -1282,6 +1338,14 @@ mod tests {
         assert_eq!(c.core_hours, 12.0 * 4.0);
     }
 
+    // A file named as no benchmark is starts as one named `bench`.
+    #[test]
+    fn a_stem_that_is_no_benchmark_name_starts_as_bench() {
+        let d = tempfile::tempdir().unwrap();
+        let ed = Editor::open(&d.path().join("my spec.json")).unwrap();
+        assert_eq!(ed.value()["name"], "bench");
+    }
+
     #[test]
     fn counts_come_from_the_spec_alone() {
         let (_d, ed) = editor(TWO_AXES);
@@ -1442,7 +1506,8 @@ mod tests {
     fn threads_and_memory_are_checked_against_what_it_books() {
         let (_d, mut ed) = editor(TWO_AXES);
         assert_eq!(ed.report().refusal, None);
-        ed.answer(&Ask::Set(Field::Cores), "4").unwrap();
+        ed.answer(&Ask::Set(Field::Scalar(Scalar::Cores)), "4")
+            .unwrap();
         assert_eq!(
             ed.report().refusal.as_deref(),
             Some("stages[1].methods.M2.threads: 8 is more than the benchmark's cores, 4")
@@ -1454,8 +1519,10 @@ mod tests {
                 name: "M2".into()
             }
         );
-        ed.answer(&Ask::Set(Field::Cores), "16").unwrap();
-        ed.answer(&Ask::Set(Field::MemGb), "2").unwrap();
+        ed.answer(&Ask::Set(Field::Scalar(Scalar::Cores)), "16")
+            .unwrap();
+        ed.answer(&Ask::Set(Field::Scalar(Scalar::MemGb)), "2")
+            .unwrap();
         assert!(ed
             .report()
             .refusal
@@ -1471,35 +1538,49 @@ mod tests {
     #[test]
     fn seeds_take_n_and_base_in_place_of_a_list() {
         let (_d, mut ed) = editor(&TWO_AXES.replace(r#""n": 2, "base": 5"#, r#""list": [7, 3]"#));
-        assert_eq!(ed.line(&Row::SeedsN).text, "seeds       list 7, 3");
+        assert_eq!(
+            ed.line(&Row::Scalar(Scalar::SeedsN)).text,
+            "seeds       list 7, 3"
+        );
         assert_eq!(counts(&ed).reps, 2);
         // Nothing typed keeps the list, for n and for base.
         let keeps = Err("this spec lists its seeds; the list stays (edit it in the file)".into());
-        assert_eq!(ed.answer(&Ask::Set(Field::SeedsN), ""), keeps);
-        assert_eq!(ed.answer(&Ask::Set(Field::SeedsBase), " "), keeps);
+        assert_eq!(
+            ed.answer(&Ask::Set(Field::Scalar(Scalar::SeedsN)), ""),
+            keeps
+        );
+        assert_eq!(
+            ed.answer(&Ask::Set(Field::Scalar(Scalar::SeedsBase)), " "),
+            keeps
+        );
         assert_eq!(ed.value()["seeds"], json!({"list": [7, 3]}));
         assert!(!ed.changed());
         // A base given replaces it, and says so.
         assert_eq!(
-            ed.answer(&Ask::Set(Field::SeedsBase), "11"),
+            ed.answer(&Ask::Set(Field::Scalar(Scalar::SeedsBase)), "11"),
             Ok("the listed seeds are replaced by derived ones: n 2, base 11".into())
         );
         assert_eq!(ed.value()["seeds"], json!({"n": 2, "base": 11}));
-        ed.answer(&Ask::Set(Field::SeedsN), "5").unwrap();
+        ed.answer(&Ask::Set(Field::Scalar(Scalar::SeedsN)), "5")
+            .unwrap();
         assert_eq!(counts(&ed).reps, 5);
-        ed.answer(&Ask::Set(Field::SeedsN), "0").unwrap();
+        ed.answer(&Ask::Set(Field::Scalar(Scalar::SeedsN)), "0")
+            .unwrap();
         assert_eq!(
             ed.report().refusal.as_deref(),
             Some("seeds.n: is 0, so nothing would run")
         );
-        assert_eq!(ed.rows()[ed.refused_row().unwrap()], Row::SeedsN);
+        assert_eq!(
+            ed.rows()[ed.refused_row().unwrap()],
+            Row::Scalar(Scalar::SeedsN)
+        );
     }
 
     #[test]
     fn an_n_given_replaces_a_seed_list_and_says_so() {
         let (_d, mut ed) = editor(&TWO_AXES.replace(r#""n": 2, "base": 5"#, r#""list": [7, 3]"#));
         assert_eq!(
-            ed.answer(&Ask::Set(Field::SeedsN), "4"),
+            ed.answer(&Ask::Set(Field::Scalar(Scalar::SeedsN)), "4"),
             Ok("the listed seeds are replaced by derived ones: n 4".into())
         );
         assert_eq!(ed.value()["seeds"], json!({"n": 4}));
@@ -1512,7 +1593,8 @@ mod tests {
     fn a_save_writes_only_the_spec_after_its_diff() {
         let (d, mut ed) = editor(TWO_AXES);
         assert!(ed.relaid());
-        ed.answer(&Ask::Set(Field::SeedsN), "4").unwrap();
+        ed.answer(&Ask::Set(Field::Scalar(Scalar::SeedsN)), "4")
+            .unwrap();
         let lines = ed.diff();
         let changed: Vec<(Mark, &str)> = lines
             .iter()

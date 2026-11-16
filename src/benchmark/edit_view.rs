@@ -9,8 +9,9 @@
 //! one; s saves, after the diff (y saves); q quits, asking first when
 //! there are changes.
 
-use super::edit::{duration_text, hunks, Ask, Editor, Mark, Need, Row, Said, Want};
+use super::edit::{duration_text, hunks, Ask, DiffLine, Editor, Mark, Need, Row, Said, Want};
 use super::tools;
+use crate::watch::view::list;
 use anyhow::Result;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
@@ -20,7 +21,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, List, ListItem, ListState, Paragraph, StatefulWidget, Widget, Wrap,
+    Block, Borders, ListItem, ListState, Paragraph, StatefulWidget, Widget, Wrap,
 };
 use std::time::Duration;
 
@@ -33,10 +34,19 @@ enum Mode {
     Browse,
     /// An answer being typed.
     Typing { ask: Ask, text: String },
-    /// The diff of a save, scrolled this far, waiting for y.
-    Diff { scroll: u16 },
+    /// The diff of a save, waiting for y.
+    Diff(Saving),
     /// Quit asked with changes unsaved.
     Leaving,
+}
+
+/// A save's diff as the screen shows it, made once when it is asked for.
+struct Saving {
+    /// How far it is scrolled, in lines.
+    scroll: u16,
+    lines: Vec<DiffLine>,
+    /// The spec key of the file's spec, if there is one, and of this one.
+    keys: (Option<String>, String),
 }
 
 /// What became of a key.
@@ -107,39 +117,31 @@ impl EditView {
                 }
                 _ => self.mode = Mode::Typing { ask, text },
             },
-            Mode::Diff { scroll } => match key.code {
-                KeyCode::Char('y') => {
-                    let said = self.ed.save();
-                    if let Ok(s) = &said {
-                        self.saved = Some(s.clone());
+            Mode::Diff(mut d) => {
+                let step = match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => -1,
+                    KeyCode::Down | KeyCode::Char('j') => 1,
+                    KeyCode::PageUp => -10,
+                    KeyCode::PageDown => 10,
+                    KeyCode::Char('y') => {
+                        let said = self.ed.save();
+                        if let Ok(s) = &said {
+                            self.saved = Some(s.clone());
+                        }
+                        self.said = Some(said);
+                        return Handled::Consumed;
                     }
-                    self.said = Some(said);
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.mode = Mode::Diff {
-                        scroll: scroll.saturating_sub(1),
+                    _ => {
+                        self.said = Some(Err("not saved".into()));
+                        return Handled::Consumed;
                     }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.mode = Mode::Diff {
-                        scroll: scroll.saturating_add(1),
-                    }
-                }
-                KeyCode::PageUp => {
-                    self.mode = Mode::Diff {
-                        scroll: scroll.saturating_sub(10),
-                    }
-                }
-                KeyCode::PageDown => {
-                    self.mode = Mode::Diff {
-                        scroll: scroll.saturating_add(10),
-                    }
-                }
-                _ => self.said = Some(Err("not saved".into())),
-            },
+                };
+                d.scroll = d.scroll.saturating_add_signed(step);
+                self.mode = Mode::Diff(d);
+            }
             Mode::Leaving => match key.code {
                 KeyCode::Char('y') => return Handled::Quit,
-                KeyCode::Char('s') => self.mode = Mode::Diff { scroll: 0 },
+                KeyCode::Char('s') => self.mode = self.diff(),
                 _ => {}
             },
             Mode::Browse => return self.browse(key, ctrl_c),
@@ -168,12 +170,21 @@ impl EditView {
             KeyCode::Char('a') => ask(self, Want::Add),
             KeyCode::Char(' ') => self.said = Some(self.ed.toggle()),
             KeyCode::Char('d') | KeyCode::Delete => self.said = Some(self.ed.remove()),
-            KeyCode::Char('s') if self.ed.changed() => self.mode = Mode::Diff { scroll: 0 },
+            KeyCode::Char('s') if self.ed.changed() => self.mode = self.diff(),
             KeyCode::Char('s') => self.said = Some(Ok("nothing to save".into())),
             KeyCode::Char('q') | KeyCode::Esc => return self.quit(),
             _ => {}
         }
         Handled::Consumed
+    }
+
+    /// The diff of a save, at its top.
+    fn diff(&self) -> Mode {
+        Mode::Diff(Saving {
+            scroll: 0,
+            lines: self.ed.diff(),
+            keys: self.ed.keys(),
+        })
     }
 
     /// Quit, or ask first when there are changes.
@@ -195,8 +206,8 @@ impl EditView {
         ])
         .areas(area);
         self.render_head(head, buf);
-        if let Mode::Diff { scroll } = self.mode {
-            self.render_diff(body, buf, scroll);
+        if let Mode::Diff(d) = &self.mode {
+            self.render_diff(body, buf, d);
         } else {
             let [rows, side] =
                 Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
@@ -251,10 +262,7 @@ impl EditView {
             })
             .collect();
         self.list.select(Some(self.ed.cursor()));
-        let list = List::new(items)
-            .block(Block::new().borders(Borders::ALL).title(" spec "))
-            .highlight_style(Style::new().reversed());
-        StatefulWidget::render(list, area, buf, &mut self.list);
+        StatefulWidget::render(list(items, " spec ".into()), area, buf, &mut self.list);
     }
 
     fn render_plan(&self, area: Rect, buf: &mut Buffer) {
@@ -328,16 +336,14 @@ impl EditView {
             .render(area, buf);
     }
 
-    fn render_diff(&self, area: Rect, buf: &mut Buffer, scroll: u16) {
+    fn render_diff(&self, area: Rect, buf: &mut Buffer, d: &Saving) {
         let block = Block::new().borders(Borders::ALL).title(format!(
             " save {}? y saves · any other key goes back ",
             self.ed.path().display()
         ));
-        let (old, new) = self.ed.keys();
-        let old = old.map_or("none (a new file)".to_string(), |k| {
-            tools::short(&k).to_string()
-        });
-        let mut lines = vec![Line::from(format!("spec {old} -> {}", tools::short(&new))).bold()];
+        let (old, new) = &d.keys;
+        let old = old.as_deref().map_or("none (a new file)", tools::short);
+        let mut lines = vec![Line::from(format!("spec {old} -> {}", tools::short(new))).bold()];
         if self.ed.relaid() {
             lines.push(
                 Line::from("the file is written again as pretty JSON, its keys sorted").dim(),
@@ -349,8 +355,7 @@ impl EditView {
                 Style::new().red(),
             ));
         }
-        let diff = self.ed.diff();
-        for l in hunks(&diff, CONTEXT) {
+        for l in hunks(&d.lines, CONTEXT) {
             lines.push(match l {
                 None => Line::from("  …").dim(),
                 Some(l) => match l.mark {
@@ -361,7 +366,7 @@ impl EditView {
             });
         }
         Paragraph::new(lines)
-            .scroll((scroll, 0))
+            .scroll((d.scroll, 0))
             .block(block)
             .render(area, buf);
     }
@@ -379,9 +384,7 @@ impl EditView {
                 "unsaved changes: y quits without saving · s saves · any other key stays",
                 Style::new().yellow(),
             ),
-            (Mode::Diff { .. }, _) => {
-                Line::from("↑↓ scroll · y saves · any other key goes back").dim()
-            }
+            (Mode::Diff(_), _) => Line::from("↑↓ scroll · y saves · any other key goes back").dim(),
             (Mode::Browse, Some(Ok(s))) => Line::from(s.as_str()),
             (Mode::Browse, Some(Err(s))) => Line::styled(s.as_str(), Style::new().red()),
             (Mode::Browse, None) => Line::from(self.row_keys()).dim(),
@@ -397,9 +400,7 @@ impl EditView {
     /// The keys that act on the cursor's row.
     fn row_keys(&self) -> String {
         let keys = match self.ed.row() {
-            Some(Row::Name | Row::Cores | Row::MemGb | Row::SeedsN | Row::SeedsBase) => {
-                "Enter sets"
-            }
+            Some(Row::Scalar(_)) => "Enter sets",
             Some(Row::Axes) => "a adds an axis",
             Some(Row::Axis(_)) => "a adds values · d removes the axis",
             Some(Row::Value { .. }) => "Space on/off · a adds values · d removes it",

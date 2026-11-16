@@ -150,7 +150,7 @@ fn who(m: &Meta) -> String {
 }
 
 /// A bordered, titled list whose selected line is shown reversed.
-fn list<'a>(items: Vec<ListItem<'a>>, title: String) -> List<'a> {
+pub(crate) fn list<'a>(items: Vec<ListItem<'a>>, title: String) -> List<'a> {
     List::new(items)
         .block(Block::new().borders(Borders::ALL).title(title))
         .highlight_style(Style::new().reversed())

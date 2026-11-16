@@ -803,6 +803,16 @@ pub(crate) fn pretty<T: serde::Serialize + ?Sized>(v: &T) -> Result<String> {
     Ok(serde_json::to_string_pretty(v)? + "\n")
 }
 
+/// `v` as words: a string bare, anything else as JSON. For a command
+/// line's values and the spec editor's rows.
+#[cfg(any(feature = "clap", feature = "benchmark"))]
+pub(crate) fn text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// `p` absolute, against the working directory, without touching the disk.
 pub(crate) fn absolute(p: &Path) -> PathBuf {
     std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
