@@ -12,6 +12,8 @@ pub mod gather;
 pub mod install;
 pub mod key;
 pub mod machine;
+#[cfg(unix)]
+pub(crate) mod mcp;
 pub mod plan;
 pub mod pool;
 #[cfg(unix)]
@@ -96,7 +98,8 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
                 }
             }
             let spec = spec.ok_or_else(|| usage("plan needs SPEC, the spec's JSON file"))?;
-            plan_spec(&spec, retool, out, err)
+            let root = crate::project::root().context("finding the project's folder")?;
+            plan_spec(&root, &spec, retool, out, err)
         }
         Some("gather") => gather::main(&args[1..], out, err),
         #[cfg(unix)]
@@ -137,8 +140,15 @@ fn check_name(path: &Path, spec_key: &str) -> Result<()> {
     Ok(())
 }
 
-/// `legume benchmark plan`.
-fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
+/// `legume benchmark plan` of the spec at `path` in the project at `root`:
+/// what it planned said on `out`, its warnings on `err`.
+pub(crate) fn plan_spec(
+    root: &Path,
+    path: &Path,
+    retool: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<()> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let (spec, value) = spec::parse(&text)?;
@@ -151,8 +161,7 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
     let words = plan::tool_words(&spec)?;
     let legume = std::env::current_exe().context("finding this legume")?;
     let path_env = std::env::var_os("PATH");
-    let root = crate::project::root().context("finding the project's folder")?;
-    let (found, missing) = tools::find(&words, path_env.as_deref(), &legume, &root);
+    let (found, missing) = tools::find(&words, path_env.as_deref(), &legume, root);
     if !missing.is_empty() {
         let names: Vec<String> = missing
             .iter()
@@ -162,7 +171,7 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
     }
     let rel = bench_rel(&spec.name);
     let dir = root.join(&rel);
-    let inputs = resolve_inputs(&spec, &root, &rel, &dir)?;
+    let inputs = resolve_inputs(&spec, root, &rel, &dir)?;
     // The last refusal, before any tool is snapshot: what a refusal stops
     // writes nothing but this spec, named by its content.
     let spec_file = dir.join("specs").join(format!("{spec_key}.json"));
@@ -216,7 +225,7 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
         tasks: &tasks,
         tools: &resolved,
         drift: &drift,
-        dir: crate::rel_path(&root, &dir),
+        dir: crate::rel_path(root, &dir),
         spec_key: &spec_key,
         cores,
         mem_gb,

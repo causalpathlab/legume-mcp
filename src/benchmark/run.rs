@@ -249,6 +249,10 @@ impl Cluster<'_> {
                 t.id
             )));
         }
+        // plan.json here from the start, so a status read while the run
+        // goes on knows every task; the end writes it again with the scores.
+        std::fs::create_dir_all(local).with_context(|| format!("making {}", local.display()))?;
+        super::gather::write(local, "plan.json", &plan_text)?;
         let bench = self.bench(&spec.name);
         let site = Site {
             legume: self.legume.clone(),

@@ -826,10 +826,15 @@ fn the_notebook_is_the_legume_servers_alone() {
     );
     let listed = by_id(&msgs, 99)["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = listed.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    let mut want = vec!["guide", "status", "report"];
+    if cfg!(all(feature = "benchmark", unix)) {
+        want.extend(["benchmark_plan", "benchmark_start", "benchmark_status"]);
+    }
+    want.push("notebook");
     assert_eq!(
-        names,
-        ["guide", "status", "report", "notebook"],
-        "no job tools: the legume server runs no steps"
+        names, want,
+        "no job tools: the legume server's one background run, a benchmark's, is \
+         followed by benchmark_status"
     );
     assert_eq!(listed[0]["annotations"], json!({ "readOnlyHint": true }));
     assert_eq!(
@@ -837,11 +842,11 @@ fn the_notebook_is_the_legume_servers_alone() {
         json!({ "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true })
     );
     assert_eq!(
-        listed[3]["annotations"],
+        listed[names.len() - 1]["annotations"],
         json!({ "readOnlyHint": false, "destructiveHint": false })
     );
     assert_eq!(
-        listed[3]["inputSchema"]["properties"]["kind"]["enum"],
+        listed[names.len() - 1]["inputSchema"]["properties"]["kind"]["enum"],
         json!([
             "plan",
             "data",
@@ -863,7 +868,11 @@ fn the_notebook_is_the_legume_servers_alone() {
         .iter()
         .map(|p| p["name"].as_str().unwrap())
         .collect();
-    assert_eq!(prompts, ["explore", "triangulate"]);
+    let mut want = vec!["explore", "triangulate"];
+    if cfg!(all(feature = "benchmark", unix)) {
+        want.push("benchmark");
+    }
+    assert_eq!(prompts, want);
     let explore = by_id(&msgs, 12)["result"]["messages"][0]["content"]["text"]
         .as_str()
         .unwrap();
