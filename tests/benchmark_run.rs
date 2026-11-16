@@ -571,3 +571,35 @@ fn a_detached_run_returns_at_once_and_stop_cancels_its_tasks() {
         said(&o)
     );
 }
+
+#[test]
+fn a_detached_run_refused_at_once_still_notes_its_exit() {
+    let w = World::new(MAKES_SIM).with_remote();
+    let spec = SPEC.replace(
+        r#""makes": ["sim.tsv"]"#,
+        r#""makes": ["sim.tsv"], "gpus": 1"#,
+    );
+    std::fs::write(
+        w.project().join("spec.json"),
+        spec.replace(r#""seeds""#, r#""gpus": [0], "seeds""#),
+    )
+    .unwrap();
+    let o = w
+        .command()
+        .arg("--detach")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", said(&o));
+    let start = Instant::now();
+    let exit = loop {
+        if let Some(code) = runner_json(&w).and_then(|r| r["exit"].as_i64()) {
+            break code;
+        }
+        assert!(start.elapsed() < Duration::from_secs(30), "no exit noted");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(exit, 3);
+    let log = std::fs::read_to_string(w.project().join("results/benchmarks/N1/run.log")).unwrap();
+    assert!(log.contains("wants GPUs"), "{log}");
+}

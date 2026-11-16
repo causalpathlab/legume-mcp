@@ -95,7 +95,7 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
     let spec = spec.ok_or_else(|| usage("run needs SPEC, the spec's JSON file"))?;
     let on = required(on, "--on")?;
     if detach {
-        return super::runner::detach(&spec, &on, out);
+        return super::runner::detach_main(&spec, &on, out);
     }
     let result = run(&spec, &on, out, err).and_then(|code| match code {
         0 => Ok(()),
