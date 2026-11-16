@@ -518,8 +518,11 @@ impl Editor {
                     None => format!("stages[{stage}]"),
                 };
                 let hint = match need {
-                    Need::Timeout => " (such as 30m or 1h30m; empty: the default)",
-                    _ => " (empty: the stage's, or the default)",
+                    Need::Timeout => format!(
+                        " (such as 30m or 1h30m; empty: the stage's, or {})",
+                        duration_text(spec::DEFAULT_TIMEOUT_SECS)
+                    ),
+                    _ => " (empty: the stage's, or the default)".to_string(),
                 };
                 format!("{} of {whose}{hint}", need.field())
             }
@@ -743,11 +746,28 @@ impl Editor {
             Field::MemGb => (self.root_mut(), "mem_gb"),
             Field::SeedsN | Field::SeedsBase => {
                 let seeds = object_at(self.root_mut(), "seeds");
-                // n and base are in place of a list.
-                if let Some(Value::Array(l)) = seeds.remove("list") {
-                    if *field == Field::SeedsBase {
-                        seeds.insert("n".into(), json!(l.len()));
-                    }
+                // A list of seeds is replaced only by a value given for n
+                // or base, and said so; nothing typed keeps it.
+                if let Some(Value::Array(l)) = seeds.get("list") {
+                    let Some(x) = new else {
+                        return Err(
+                            "this spec lists its seeds; the list stays (edit it in the file)"
+                                .into(),
+                        );
+                    };
+                    let n = l.len();
+                    seeds.remove("list");
+                    let said = if *field == Field::SeedsN {
+                        seeds.insert("n".into(), x.clone());
+                        format!("n {}", text(&x))
+                    } else {
+                        seeds.insert("n".into(), json!(n));
+                        seeds.insert("base".into(), x.clone());
+                        format!("n {n}, base {}", text(&x))
+                    };
+                    return Ok(format!(
+                        "the listed seeds are replaced by derived ones: {said}"
+                    ));
                 }
                 let k = if *field == Field::SeedsN { "n" } else { "base" };
                 (seeds, k)
@@ -912,9 +932,10 @@ fn template(path: &Path) -> Value {
     })
 }
 
-/// `v` as pretty JSON, its keys sorted, ending in a newline.
+/// `v` as pretty JSON, its keys sorted, ending in a newline, as
+/// [`crate::pretty`] writes a file; a JSON value always writes.
 fn pretty(v: &Value) -> String {
-    serde_json::to_string_pretty(v).unwrap_or_default() + "\n"
+    crate::pretty(v).unwrap_or_default()
 }
 
 /// `v` as a row shows it: a string bare, anything else as JSON.
@@ -1045,8 +1066,9 @@ fn rows(v: &Value) -> Vec<Row> {
 }
 
 /// What spec `v` plans and its first refusal, from the spec alone: no
-/// tool is looked for, nothing is written.
-pub fn report(v: &Value) -> Report {
+/// tool is looked for, nothing is written. For anything that shows a spec
+/// before it is planned (the editor, the MCP tools).
+pub(crate) fn report(v: &Value) -> Report {
     let (spec, canonical) = match spec::parse(&v.to_string()) {
         Ok(x) => x,
         Err(e) => {
@@ -1066,9 +1088,10 @@ pub fn report(v: &Value) -> Report {
     }
 }
 
-/// The spec's tasks counted from its structure: every method runs at
-/// every point for every rep.
-fn counts(spec: &spec::Spec, canonical: &Value) -> Counts {
+/// The spec's tasks counted from its structure, each stage's method on
+/// its own: every method runs at every point for every rep. `canonical`
+/// is the spec as [`spec::parse`] gives it, for its key.
+pub(crate) fn counts(spec: &spec::Spec, canonical: &Value) -> Counts {
     let grid = spec
         .axes
         .iter()
@@ -1128,8 +1151,9 @@ fn booked(spec: &spec::Spec) -> machine::Machine {
     }
 }
 
-/// A duration as a spec writes it: `4h`, `1h30m`, `45s`.
-pub fn duration_text(secs: u64) -> String {
+/// A duration as a spec writes it (`4h`, `1h30m`, `45s`), as a task's
+/// timeout is shown wherever one is.
+pub(crate) fn duration_text(secs: u64) -> String {
     let mut out = String::new();
     let mut rest = secs;
     for (unit, n) in [("d", 86_400), ("h", 3600), ("m", 60), ("s", 1)] {
@@ -1384,6 +1408,10 @@ mod tests {
         assert_eq!(ed.answer(&ask, ""), Ok("threads left out".into()));
         assert_eq!(counts(&ed).methods[2].threads, 2);
         let (ask, _) = ed.ask(Want::Set(Need::Timeout)).unwrap();
+        assert_eq!(
+            ed.prompt(&ask),
+            "timeout of method M2 (such as 30m or 1h30m; empty: the stage's, or 4h)"
+        );
         ed.answer(&ask, "1h30m").unwrap();
         assert_eq!(counts(&ed).methods[2].timeout_secs, 5400);
         assert_eq!(
@@ -1445,7 +1473,17 @@ mod tests {
         let (_d, mut ed) = editor(&TWO_AXES.replace(r#""n": 2, "base": 5"#, r#""list": [7, 3]"#));
         assert_eq!(ed.line(&Row::SeedsN).text, "seeds       list 7, 3");
         assert_eq!(counts(&ed).reps, 2);
-        ed.answer(&Ask::Set(Field::SeedsBase), "11").unwrap();
+        // Nothing typed keeps the list, for n and for base.
+        let keeps = Err("this spec lists its seeds; the list stays (edit it in the file)".into());
+        assert_eq!(ed.answer(&Ask::Set(Field::SeedsN), ""), keeps);
+        assert_eq!(ed.answer(&Ask::Set(Field::SeedsBase), " "), keeps);
+        assert_eq!(ed.value()["seeds"], json!({"list": [7, 3]}));
+        assert!(!ed.changed());
+        // A base given replaces it, and says so.
+        assert_eq!(
+            ed.answer(&Ask::Set(Field::SeedsBase), "11"),
+            Ok("the listed seeds are replaced by derived ones: n 2, base 11".into())
+        );
         assert_eq!(ed.value()["seeds"], json!({"n": 2, "base": 11}));
         ed.answer(&Ask::Set(Field::SeedsN), "5").unwrap();
         assert_eq!(counts(&ed).reps, 5);
@@ -1455,6 +1493,17 @@ mod tests {
             Some("seeds.n: is 0, so nothing would run")
         );
         assert_eq!(ed.rows()[ed.refused_row().unwrap()], Row::SeedsN);
+    }
+
+    #[test]
+    fn an_n_given_replaces_a_seed_list_and_says_so() {
+        let (_d, mut ed) = editor(&TWO_AXES.replace(r#""n": 2, "base": 5"#, r#""list": [7, 3]"#));
+        assert_eq!(
+            ed.answer(&Ask::Set(Field::SeedsN), "4"),
+            Ok("the listed seeds are replaced by derived ones: n 4".into())
+        );
+        assert_eq!(ed.value()["seeds"], json!({"n": 4}));
+        assert_eq!(counts(&ed).reps, 4);
     }
 
     // Saving shows the diff first: old and new canonical JSON. It writes
