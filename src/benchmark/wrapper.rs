@@ -458,20 +458,18 @@ fn oom_kills() -> Option<u64> {
 /// it and its parents up to the one named for its Slurm job (`job_N`),
 /// or only it when none is.
 fn oom_groups(path: &str) -> Vec<&str> {
+    let Some(job) = path.find("/job_") else {
+        return vec![path];
+    };
+    // The job's group ends at the next `/`, or is the whole path.
+    let job_end = path[job + 1..].find('/').map_or(path.len(), |i| job + 1 + i);
     let mut groups = vec![path];
     let mut at = path;
-    while let Some((parent, name)) = at.rsplit_once('/') {
-        if name.starts_with("job_") || parent.is_empty() {
-            break;
-        }
-        groups.push(parent);
-        at = parent;
+    while at.len() > job_end {
+        at = &at[..at.rfind('/').unwrap_or(job_end)];
+        groups.push(at);
     }
-    if at.rsplit('/').next().is_some_and(|n| n.starts_with("job_")) {
-        groups
-    } else {
-        vec![path]
-    }
+    groups
 }
 
 /// The `oom_kill` count in a `memory.events` or `memory.oom_control`.
