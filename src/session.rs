@@ -370,20 +370,7 @@ fn age(path: &Path) -> Option<Duration> {
 /// The lock on job folder `dir` that its follower holds while it follows
 /// it, when no one holds it; the system lets it go with the process.
 fn try_lock(dir: &Path) -> std::io::Result<Option<File>> {
-    use std::os::fd::AsRawFd;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join("following"))?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(Some(file));
-    }
-    let e = std::io::Error::last_os_error();
-    match e.kind() {
-        std::io::ErrorKind::WouldBlock => Ok(None),
-        _ => Err(e),
-    }
+    crate::lock::try_lock(&dir.join("following"))
 }
 
 /// A session job followed by this server; its lock goes with it.

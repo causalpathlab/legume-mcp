@@ -106,6 +106,12 @@ pub fn spec_file(v: &Value) -> String {
     format!("{}\n", canonical(v))
 }
 
+/// The spec key of spec `v` (as [`super::spec::parse`] gives it): the key
+/// of its file, [`spec_file`].
+pub fn spec_key(v: &Value) -> String {
+    key(spec_file(v).as_bytes())
+}
+
 /// The key of `v`'s canonical JSON.
 pub fn key_of(v: &Value) -> String {
     key(canonical(v).as_bytes())

@@ -82,11 +82,18 @@ fn absolute(p: &str) -> bool {
     p.starts_with('/')
 }
 
+/// `remotes.toml` and the remotes it keeps (none before it is made).
+pub fn kept() -> Result<(PathBuf, Vec<Remote>)> {
+    let file = config_file()
+        .ok_or_else(|| refuse("no config folder for remotes.toml: set HOME, or LEGUME_REMOTES"))?;
+    let all = read(&file)?;
+    Ok((file, all))
+}
+
 /// Remote `name`, from `remotes.toml`, or asked for on stdin and kept.
 pub fn named(name: &str, out: &mut dyn Write) -> Result<Remote> {
-    let file =
-        config_file().ok_or_else(|| refuse("no config folder: set HOME, or LEGUME_REMOTES"))?;
-    if let Some(r) = read(&file)?.into_iter().find(|r| r.name == name) {
+    let (file, all) = kept()?;
+    if let Some(r) = all.into_iter().find(|r| r.name == name) {
         return Ok(r);
     }
     let r = ask(name, &mut std::io::stdin().lock(), out)?;

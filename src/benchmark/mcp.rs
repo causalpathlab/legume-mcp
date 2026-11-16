@@ -17,15 +17,17 @@
 //! A refusal comes back as the tool's error, naming the spec's field. Each
 //! reply stays under [`REPLY_MAX`] bytes.
 
-use super::{bench_rel, key, plan, remote, runner, spec, tools};
+use super::{bench_rel, edit, key, plan, remote, runner, spec, tools};
 use crate::command::{refuse, Exit};
 use crate::{Call, ToolSpec};
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// The most a reply says, in bytes.
 pub(crate) const REPLY_MAX: usize = 4000;
@@ -48,14 +50,6 @@ const LOG_READ: u64 = 64 * 1024;
 
 /// The most a status shows of one line, in bytes.
 const LINE_MAX: usize = 160;
-
-/// The names of the benchmark tools.
-pub(crate) const TOOLS: [&str; 4] = [
-    "benchmark_plan",
-    "benchmark_start",
-    "benchmark_status",
-    "benchmark_stop",
-];
 
 /// The benchmark tools, as `tools/list` shows them.
 pub(crate) fn tools() -> Vec<ToolSpec> {
@@ -116,19 +110,19 @@ pub(crate) fn tools() -> Vec<ToolSpec> {
 
 /// Benchmark tool `name` called with `args`: its reply.
 pub(crate) fn call(name: &str, args: &Value, cx: &Call) -> Result<String> {
-    let root = project_root(cx)?;
+    let root = || project_root(cx);
     let said = match name {
-        "benchmark_plan" => plan_tool(&root, args, cx),
-        "benchmark_start" => start(&root, args, cx),
+        "benchmark_plan" => plan_tool(&root()?, args, cx),
+        "benchmark_start" => start(&root()?, args, cx),
         "benchmark_status" => match args["name"].as_str() {
-            Some(n) => named(&root, n).map(|(rel, dir)| status_text(&rel, &dir)),
-            None => listed(&root),
+            Some(n) => named(&root()?, n).map(|(rel, dir)| status_text(&rel, &dir)),
+            None => listed(&root()?),
         },
         "benchmark_stop" => {
             let n = args["name"]
                 .as_str()
                 .context("`name` is required: the benchmark's name")?;
-            named(&root, n).and_then(|(_, dir)| runner::stop_runner(&dir, n))
+            named(&root()?, n).and_then(|(_, dir)| runner::stop_runner(&dir, n))
         }
         _ => anyhow::bail!("no tool `{name}`"),
     }?;
@@ -144,19 +138,23 @@ fn start(root: &Path, args: &Value, cx: &Call) -> Result<String> {
         .filter(|s| !s.is_empty())
         .context("`on` is required: the remote to run on, as remotes.toml names it")?;
     let given = given_spec(root, &args["spec"])?;
-    plan::check(&given.spec).map_err(fix_hint)?;
+    reported(&given)?;
     let d = runner::Detach {
         root,
         spec_file: &given.file,
-        text: &given.text,
+        spec: &given.spec,
+        spec_key: &given.key,
         on,
     };
     let started = runner::detach(&d, None, &mut || keep(&given, cx)).map_err(reworded)?;
-    // The driver script repeats the run in the foreground, skipped once
-    // it has gathered.
+    // The driver script repeats the run in the foreground, from the
+    // project, skipped once it has gathered.
     if let Some(p) = &cx.records {
-        let exe = crate::own_exe().context("finding this server's binary")?;
-        let bare = p.command(&run_command(Command::new(exe), root, &given.rel, on));
+        let mut cmd = runner::run_command(&given.rel, on)?;
+        if std::env::current_dir().ok().as_deref() != Some(root) {
+            cmd.current_dir(root);
+        }
+        let bare = p.command(&cmd);
         let summary = root.join(bench_rel(&started.name)).join("summary.tsv");
         let line = p.guarded(&bare, &[summary]);
         p.script_step(&format!("{line}\n"), Some(&bare));
@@ -232,13 +230,14 @@ fn project_root(cx: &Call) -> Result<PathBuf> {
 }
 
 /// A spec a call gives: its file, from the project and absolute, its
-/// text, the spec read, its key, and whether it was given as JSON (and is
-/// to be kept in its file, [`keep`]).
+/// text, the spec read and as JSON ([`spec::parse`]), its key, and whether
+/// it was given as JSON (and is to be kept in its file, [`keep`]).
 struct Given {
     rel: PathBuf,
     file: PathBuf,
     text: String,
     spec: spec::Spec,
+    value: Value,
     key: String,
     given_as_json: bool,
 }
@@ -246,21 +245,13 @@ struct Given {
 /// The spec `v` a call gives, in the project at `root`: a JSON object, for
 /// `specs-in/<name>.json`, or the path of a spec file inside the project.
 fn given_spec(root: &Path, v: &Value) -> Result<Given> {
-    let (rel, text, given_as_json) = match v {
-        Value::Object(_) => {
-            let text = format!("{}\n", serde_json::to_string_pretty(v)?);
-            let (s, _) = spec::parse(&text).map_err(fix_hint)?;
-            (
-                Path::new(SPECS_IN).join(format!("{}.json", s.name)),
-                text,
-                true,
-            )
-        }
+    let (rel, text) = match v {
+        Value::Object(_) => (None, format!("{}\n", serde_json::to_string_pretty(v)?)),
         Value::String(p) if !p.is_empty() => {
             let rel = inside(root, p)?;
             let text = std::fs::read_to_string(root.join(&rel))
                 .with_context(|| format!("reading the spec {p}"))?;
-            (rel, text, false)
+            (Some(rel), text)
         }
         _ => {
             return Err(refuse(
@@ -269,12 +260,15 @@ fn given_spec(root: &Path, v: &Value) -> Result<Given> {
         }
     };
     let (spec, value) = spec::parse(&text).map_err(fix_hint)?;
+    let given_as_json = rel.is_none();
+    let rel = rel.unwrap_or_else(|| Path::new(SPECS_IN).join(format!("{}.json", spec.name)));
     Ok(Given {
         file: root.join(&rel),
         rel,
         text,
+        key: key::spec_key(&value),
         spec,
-        key: key::key(key::spec_file(&value).as_bytes()),
+        value,
         given_as_json,
     })
 }
@@ -347,7 +341,7 @@ fn planned_here(root: &Path, given: &Given) -> Result<String> {
         }
     })?;
     let mut said = String::from_utf8_lossy(&out).into_owned();
-    said.push_str(&needs(&given.spec));
+    said.push_str(&needs(&edit::counts(&given.spec, &given.value)));
     said.push_str(&String::from_utf8_lossy(&err));
     let _ = writeln!(
         said,
@@ -362,7 +356,7 @@ fn planned_here(root: &Path, given: &Given) -> Result<String> {
 /// its tasks, what each method books, and the tools and inputs it names.
 fn checked(given: &Given, on: &str) -> Result<String> {
     let s = &given.spec;
-    plan::check(s).map_err(fix_hint)?;
+    let c = reported(given)?;
     let words = plan::tool_words(s).map_err(fix_hint)?;
     known_remote(on)?;
     let mut said = format!(
@@ -370,8 +364,15 @@ fn checked(given: &Given, on: &str) -> Result<String> {
         s.name,
         tools::short(&given.key)
     );
-    said.push_str(&counts(s));
-    said.push_str(&needs(s));
+    let _ = writeln!(
+        said,
+        "tasks {}: {} points x {} reps x {} stage methods",
+        c.tasks,
+        c.points,
+        c.reps,
+        c.methods.len()
+    );
+    said.push_str(&needs(&c));
     let names: Vec<&str> = words
         .iter()
         .map(|(w, _, _)| if w == plan::LEGUME { "legume" } else { w })
@@ -402,43 +403,38 @@ fn checked(given: &Given, on: &str) -> Result<String> {
     Ok(said)
 }
 
-/// The spec's task count, as points x replicates x methods.
-fn counts(s: &spec::Spec) -> String {
-    let points = plan::points(s).len();
-    let reps = plan::reps(&s.seeds).len();
-    let methods: usize = s.stages.iter().map(|st| st.methods.len()).sum();
-    format!(
-        "tasks {}: {points} points x {reps} reps x {methods} stage methods\n",
-        points * reps * methods
-    )
+/// What the spec plans, counted, as the editor checks it
+/// ([`edit::report`]): refused as it refuses, a method's threads past
+/// the cores the spec books among it.
+fn reported(given: &Given) -> Result<edit::Counts> {
+    let r = edit::report(&given.value);
+    if let Some(why) = r.refusal {
+        return Err(fix_hint(refuse(why)));
+    }
+    r.counts.context("a spec read and not counted")
 }
 
 /// What each stage's methods book, a line each.
-fn needs(s: &spec::Spec) -> String {
-    let per = plan::points(s).len() * plan::reps(&s.seeds).len();
+fn needs(c: &edit::Counts) -> String {
     let mut out = String::from("each task books\n");
-    for st in &s.stages {
-        for m in &st.methods {
-            let name = match &m.name {
-                Some(n) => format!("{}-{n}", st.name),
-                None => st.name.clone(),
-            };
-            let _ = write!(
-                out,
-                "  {name}: {per} tasks, {} thread{}, {} GB, timeout {}",
-                m.threads,
-                if m.threads == 1 { "" } else { "s" },
-                m.mem_gb,
-                super::edit::duration_text(m.timeout_secs)
-            );
-            if m.gpus > 0 {
-                let _ = write!(out, ", {} GPUs", m.gpus);
-            }
-            if let Some(n) = m.max_running {
-                let _ = write!(out, ", at most {n} at once");
-            }
-            let _ = writeln!(out, ", runs {}", m.tool_word());
+    for m in &c.methods {
+        let _ = write!(
+            out,
+            "  {}: {} tasks, {} thread{}, {} GB, timeout {}",
+            m.name,
+            m.tasks,
+            m.threads,
+            edit::plural(m.threads as usize),
+            m.mem_gb,
+            edit::duration_text(m.timeout_secs)
+        );
+        if m.gpus > 0 {
+            let _ = write!(out, ", {} GPUs", m.gpus);
         }
+        if let Some(n) = m.max_running {
+            let _ = write!(out, ", at most {n} at once");
+        }
+        let _ = writeln!(out, ", runs {}", m.tool);
     }
     out
 }
@@ -449,33 +445,106 @@ fn known_remote(on: &str) -> Result<remote::Remote> {
     runner::kept_remote(on, None).map_err(reworded)
 }
 
-/// The command `benchmark_start` runs: `legume`, as `exe` runs it, with
-/// `benchmark run SPEC --on ON`, from the project at `root`, the spec
-/// `spec` from there.
-fn run_command(mut exe: Command, root: &Path, spec: &Path, on: &str) -> Command {
-    exe.arg("benchmark")
-        .arg("run")
-        .arg(spec)
-        .arg("--on")
-        .arg(on);
-    // From the project, which a server in it already is.
-    let here = std::env::current_dir().ok();
-    if here.as_deref() != Some(root) {
-        exe.current_dir(root);
-    }
-    exe
+/// What a status reads of `plan.json`: its tasks' ids.
+#[derive(Deserialize)]
+struct PlannedIds {
+    tasks: Vec<IdOnly>,
 }
 
-/// What one task's latest event says it is.
-fn state_of(event: &str) -> Option<&'static str> {
-    Some(match event {
-        "start" | "adopted" => "running",
-        "done" | "reused" => "done",
-        "failed" | "timeout" | "oom" | "lost" => "failed",
-        "stopped" => "stopped",
-        "skipped" => "skipped",
-        _ => return None,
-    })
+/// A task of `plan.json`, by its id alone.
+#[derive(Deserialize)]
+struct IdOnly {
+    id: String,
+}
+
+/// A task as `events.tsv` has it: its latest state, and its latest
+/// failure, if any.
+struct Seen<'a> {
+    state: &'static str,
+    failed: Option<Failure<'a>>,
+}
+
+/// A failure's row of `events.tsv`: where it is among the rows, and its
+/// time, event, attempt and node.
+struct Failure<'a> {
+    row: usize,
+    time: &'a str,
+    event: &'a str,
+    attempt: &'a str,
+    node: &'a str,
+}
+
+/// The tasks of `events` (the text of `events.tsv`), by id: each one's
+/// latest state ([`super::run::event_state`]) and latest failure. A row
+/// whose event says no state, or that names no task, is passed over.
+fn tasks_seen(events: &str) -> HashMap<&str, Seen<'_>> {
+    let mut lines = events.lines();
+    let head = lines.next().unwrap_or_default();
+    let col = |name: &str| head.split('\t').position(|h| h == name);
+    let cols = [
+        col("time"),
+        col("task"),
+        col("attempt"),
+        col("event"),
+        col("node"),
+    ];
+    let mut seen: HashMap<&str, Seen> = HashMap::new();
+    for (row, line) in lines.enumerate() {
+        let mut f = [""; 5];
+        for (i, field) in line.split('\t').enumerate() {
+            if let Some(k) = cols.iter().position(|c| *c == Some(i)) {
+                f[k] = field;
+            }
+        }
+        let [time, id, attempt, event, node] = f;
+        let Some(state) = super::run::event_state(event) else {
+            continue;
+        };
+        if id.is_empty() {
+            continue;
+        }
+        let task = seen.entry(id).or_insert(Seen {
+            state,
+            failed: None,
+        });
+        task.state = state;
+        if state == "failed" {
+            task.failed = Some(Failure {
+                row,
+                time,
+                event,
+                attempt,
+                node,
+            });
+        }
+    }
+    seen
+}
+
+/// The first [`SUMMARY_LINES`] lines of the file at `path`, and how many
+/// it has, the rest counted and not kept.
+fn head_lines(path: &Path) -> std::io::Result<(Vec<String>, usize)> {
+    let mut r = BufReader::new(File::open(path)?);
+    let mut head = Vec::new();
+    let mut line = String::new();
+    while head.len() < SUMMARY_LINES && r.read_line(&mut line)? > 0 {
+        head.push(line.trim_end_matches(['\n', '\r']).to_string());
+        line.clear();
+    }
+    let (mut n, mut last) = (head.len(), b'\n');
+    loop {
+        let buf = r.fill_buf()?;
+        let Some(&end) = buf.last() else { break };
+        n += buf.iter().filter(|&&b| b == b'\n').count();
+        last = end;
+        let len = buf.len();
+        r.consume(len);
+    }
+    // A last line without its newline.
+    if last != b'\n' {
+        n += 1;
+    }
+    Ok((head, n))
 }
 
 /// A benchmark's status, from its folder `dir` (`rel` from the project):
@@ -489,7 +558,7 @@ fn status_text(rel: &Path, dir: &Path) -> String {
                     "ended {}, exit {code}",
                     r.ended.as_deref().unwrap_or("at a time not noted")
                 ),
-                None if runner::alive(&r) => "alive".to_string(),
+                None if runner::alive(dir) => "alive".to_string(),
                 None => "gone, without noting how it ended (see run.log)".to_string(),
             };
             let _ = writeln!(
@@ -500,57 +569,26 @@ fn status_text(rel: &Path, dir: &Path) -> String {
         }
         None => out.push_str("runner: none started with --detach (no runner.json)\n"),
     }
-    let planned: Option<Vec<String>> = std::fs::read(dir.join("plan.json"))
+    let planned: Option<PlannedIds> = std::fs::read(dir.join("plan.json"))
         .ok()
-        .and_then(|b| serde_json::from_slice::<plan::PlanDoc>(&b).ok())
-        .map(|p| p.tasks.into_iter().map(|t| t.id).collect());
+        .and_then(|b| serde_json::from_slice(&b).ok());
     let events = std::fs::read_to_string(dir.join("events.tsv")).unwrap_or_default();
-    let mut latest: BTreeMap<String, &'static str> = BTreeMap::new();
-    // Each task's latest failure: the task and what to say of it, in the
-    // order they failed.
-    let mut failures: Vec<(String, String)> = Vec::new();
-    let mut lines = events.lines();
-    let head: Vec<&str> = lines.next().unwrap_or_default().split('\t').collect();
-    let col = |name: &str| head.iter().position(|h| *h == name);
-    let (time, task, attempt, event, node) = (
-        col("time"),
-        col("task"),
-        col("attempt"),
-        col("event"),
-        col("node"),
-    );
-    for line in lines {
-        let row: Vec<&str> = line.split('\t').collect();
-        let get = |i: Option<usize>| i.and_then(|i| row.get(i)).copied().unwrap_or("");
-        let (id, ev) = (get(task), get(event));
-        let Some(state) = state_of(ev) else { continue };
-        if id.is_empty() {
-            continue;
-        }
-        latest.insert(id.to_string(), state);
-        if state == "failed" {
-            let mut f = format!("{} {id} {ev}", get(time));
-            if !get(attempt).is_empty() {
-                let _ = write!(f, ", attempt {}", get(attempt));
-            }
-            if !get(node).is_empty() {
-                let _ = write!(f, ", on {}", get(node));
-            }
-            failures.retain(|(t, _)| t != id);
-            failures.push((id.to_string(), f));
-        }
-    }
+    let seen = tasks_seen(&events);
     let mut by: BTreeMap<&str, usize> = BTreeMap::new();
-    for s in latest.values() {
-        *by.entry(s).or_default() += 1;
+    for t in seen.values() {
+        *by.entry(t.state).or_default() += 1;
     }
     let total = match &planned {
-        Some(ids) => {
-            let pending = ids.iter().filter(|id| !latest.contains_key(*id)).count();
+        Some(p) => {
+            let pending = p
+                .tasks
+                .iter()
+                .filter(|t| !seen.contains_key(t.id.as_str()))
+                .count();
             by.insert("pending", pending);
-            ids.len()
+            p.tasks.len()
         }
-        None => latest.len(),
+        None => seen.len(),
     };
     let mut said: Vec<String> = ["done", "failed", "skipped", "running", "pending"]
         .iter()
@@ -572,26 +610,34 @@ fn status_text(rel: &Path, dir: &Path) -> String {
     } else {
         let _ = writeln!(out, "tasks {total}: {}", said.join(", "));
     }
-    // A task's failure is listed while its latest event is a failure.
-    let still: Vec<&String> = failures
+    // A task's failure is listed while its latest event is a failure, in
+    // the order they failed.
+    let mut still: Vec<(&str, &Failure)> = seen
         .iter()
-        .filter(|(id, _)| latest.get(id) == Some(&"failed"))
-        .map(|(_, f)| f)
+        .filter(|(_, t)| t.state == "failed")
+        .filter_map(|(id, t)| Some((*id, t.failed.as_ref()?)))
         .collect();
     if !still.is_empty() {
+        still.sort_by_key(|(_, f)| f.row);
         let _ = writeln!(
             out,
             "failed, latest {} of {}:",
             still.len().min(FAILURES_SHOWN),
             still.len()
         );
-        for f in &still[still.len().saturating_sub(FAILURES_SHOWN)..] {
-            let _ = writeln!(out, "  {}", clip(f, LINE_MAX));
+        for (id, f) in &still[still.len().saturating_sub(FAILURES_SHOWN)..] {
+            let mut line = format!("{} {id} {}", f.time, f.event);
+            if !f.attempt.is_empty() {
+                let _ = write!(line, ", attempt {}", f.attempt);
+            }
+            if !f.node.is_empty() {
+                let _ = write!(line, ", on {}", f.node);
+            }
+            let _ = writeln!(out, "  {}", clip(&line, LINE_MAX));
         }
     }
-    match std::fs::read_to_string(dir.join("summary.tsv")) {
-        Ok(text) => {
-            let n = text.lines().count();
+    match head_lines(&dir.join("summary.tsv")) {
+        Ok((head, n)) => {
             let _ = writeln!(
                 out,
                 "summary.tsv ({n} lines{}):",
@@ -601,7 +647,7 @@ fn status_text(rel: &Path, dir: &Path) -> String {
                     String::new()
                 }
             );
-            for l in text.lines().take(SUMMARY_LINES) {
+            for l in &head {
                 let _ = writeln!(out, "  {}", clip(l, LINE_MAX));
             }
         }
@@ -610,7 +656,7 @@ fn status_text(rel: &Path, dir: &Path) -> String {
     let log = super::tail::tail(&dir.join(runner::LOG_FILE), LOG_READ);
     if !log.is_empty() {
         let _ = writeln!(out, "{}, the last lines:", runner::LOG_FILE);
-        for l in tail(&log, LOG_LINES) {
+        for l in last_lines(&log, LOG_LINES) {
             let _ = writeln!(out, "  {}", clip(l, LINE_MAX));
         }
     }
@@ -618,7 +664,7 @@ fn status_text(rel: &Path, dir: &Path) -> String {
 }
 
 /// The last `n` lines of `text`.
-fn tail(text: &str, n: usize) -> Vec<&str> {
+fn last_lines(text: &str, n: usize) -> Vec<&str> {
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..].to_vec()
 }
@@ -626,8 +672,8 @@ fn tail(text: &str, n: usize) -> Vec<&str> {
 /// The benchmarks of the project at `root`: the folders under
 /// `results/benchmarks`.
 fn listed(root: &Path) -> Result<String> {
-    let base = root.join("results").join("benchmarks");
-    let mut names: Vec<String> = std::fs::read_dir(&base)
+    let rel = bench_rel("");
+    let mut names: Vec<String> = std::fs::read_dir(root.join(&rel))
         .map(|d| {
             d.flatten()
                 .filter(|e| e.path().is_dir())
@@ -637,10 +683,11 @@ fn listed(root: &Path) -> Result<String> {
         .unwrap_or_default();
     names.sort();
     if names.is_empty() {
-        return Ok("no benchmarks yet in results/benchmarks/\n".into());
+        return Ok(format!("no benchmarks yet in {}\n", rel.display()));
     }
     Ok(format!(
-        "benchmarks in results/benchmarks/: {}\nbenchmark_status with `name` says where one stands\n",
+        "benchmarks in {}: {}\nbenchmark_status with `name` says where one stands\n",
+        rel.display(),
         names.join(", ")
     ))
 }
@@ -663,20 +710,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_run_is_legume_benchmark_run_from_the_project() {
-        let root = Path::new("/P1");
-        let cmd = run_command(
-            Command::new("legume"),
-            root,
-            Path::new("specs-in/N1.json"),
-            "REMOTE1",
-        );
-        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+    fn a_summary_shows_its_head_and_counts_every_line() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("summary.tsv");
+        let lines: Vec<String> = (1..=12).map(|i| format!("L{i}")).collect();
+        for text in [lines.join("\n"), format!("{}\n", lines.join("\n"))] {
+            std::fs::write(&path, text).unwrap();
+            let (head, n) = head_lines(&path).unwrap();
+            assert_eq!(head, lines[..SUMMARY_LINES]);
+            assert_eq!(n, 12);
+        }
+        std::fs::write(&path, "L1\nL2").unwrap();
         assert_eq!(
-            args,
-            ["benchmark", "run", "specs-in/N1.json", "--on", "REMOTE1"]
+            head_lines(&path).unwrap(),
+            (vec!["L1".into(), "L2".into()], 2)
         );
-        assert_eq!(cmd.get_current_dir(), Some(root));
     }
 
     #[test]

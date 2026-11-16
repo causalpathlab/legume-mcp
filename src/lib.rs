@@ -56,6 +56,8 @@ pub use hints::{Annotations, Next, Prompt, PromptArg};
 mod graph;
 pub mod job;
 mod jobs;
+#[cfg(all(unix, any(feature = "sessions", feature = "benchmark")))]
+mod lock;
 pub mod metric;
 mod notebook;
 mod procgroup;

@@ -169,7 +169,7 @@ pub fn guide(id: Option<&str>) -> Result<String> {
 /// The recipes for whole pieces of work, as MCP prompts: what a person
 /// starts with (`/mcp__legume__explore` in Claude Code).
 pub(crate) fn prompts() -> Vec<Prompt> {
-    let mut prompts = vec![
+    let prompts = vec![
         Prompt::new(
             "explore",
             "Explore a data set",
@@ -186,39 +186,19 @@ pub(crate) fn prompts() -> Vec<Prompt> {
         )
         .arg("hypothesis", "The hypothesis, as H1, H2, ... (`status` lists them)", false),
     ];
-    prompts.extend(benchmark_prompts());
+    // The benchmark recipe, when legume has the benchmark tools.
+    #[cfg(all(feature = "benchmark", unix))]
+    let prompts: Vec<Prompt> = prompts.into_iter().chain([
+        Prompt::new(
+            "benchmark",
+            "Run a benchmark",
+            "Turn the person's description of a benchmark into a spec, check and plan it with them, start it on a cluster and follow it (guide section `benchmark`).",
+            BENCHMARK,
+        )
+        .arg("what", "What the person wants to compare, in their words", false)
+        .arg("on", "The remote to run on, as remotes.toml names it", false),
+    ]).collect();
     prompts
-}
-
-/// The benchmark recipe, when legume has the benchmark tools.
-#[cfg(all(feature = "benchmark", unix))]
-fn benchmark_prompts() -> Vec<Prompt> {
-    vec![Prompt::new(
-        "benchmark",
-        "Run a benchmark",
-        "Turn the person's description of a benchmark into a spec, check and plan it with them, start it on a cluster and follow it (guide section `benchmark`).",
-        BENCHMARK,
-    )
-    .arg("what", "What the person wants to compare, in their words", false)
-    .arg("on", "The remote to run on, as remotes.toml names it", false)]
-}
-
-/// No benchmark recipe: legume is built without the benchmark tools.
-#[cfg(not(all(feature = "benchmark", unix)))]
-fn benchmark_prompts() -> Vec<Prompt> {
-    Vec::new()
-}
-
-/// The benchmark tools, when legume has them.
-#[cfg(all(feature = "benchmark", unix))]
-fn benchmark_tools() -> Vec<ToolSpec> {
-    crate::benchmark::mcp::tools()
-}
-
-/// No benchmark tools: legume is built without them.
-#[cfg(not(all(feature = "benchmark", unix)))]
-fn benchmark_tools() -> Vec<ToolSpec> {
-    Vec::new()
 }
 
 /// The `benchmark` prompt.
@@ -300,7 +280,7 @@ struct Brain;
 
 impl Handler for Brain {
     fn tools(&self) -> Vec<ToolSpec> {
-        let mut tools = vec![
+        let tools = vec![
             ToolSpec::new(
                 "guide",
                 "The guide to working with the legume tools and the user: without `section`, its sections; with one (e.g. \"8.3\", \"quick\"), that section's text.",
@@ -332,7 +312,12 @@ impl Handler for Brain {
             .writes()
             .idempotent(),
         ];
-        tools.extend(benchmark_tools());
+        // The benchmark tools, when legume has them.
+        #[cfg(all(feature = "benchmark", unix))]
+        let tools: Vec<ToolSpec> = tools
+            .into_iter()
+            .chain(crate::benchmark::mcp::tools())
+            .collect();
         tools
     }
 
@@ -353,9 +338,7 @@ impl Handler for Brain {
                 crate::report::said(p.root(), &built)
             }
             #[cfg(all(feature = "benchmark", unix))]
-            n if crate::benchmark::mcp::TOOLS.contains(&n) => {
-                crate::benchmark::mcp::call(n, &args, cx)?
-            }
+            n if n.starts_with("benchmark_") => crate::benchmark::mcp::call(n, &args, cx)?,
             _ => anyhow::bail!("no tool `{name}`"),
         };
         Ok(vec![Content::Text(text)])

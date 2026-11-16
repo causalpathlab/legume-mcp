@@ -25,7 +25,7 @@ use super::plan::{PlanDoc, Task};
 use super::pool::{Budget, Pool, State, Want};
 use super::remote::{self, Remote, Shell};
 use super::slurm::{srun, Site, Slurm};
-use crate::command::{canonical_flags, failed, flag_pairs, refuse, required, usage, Flag};
+use crate::command::{failed, flags, refuse, required, usage, Flag};
 use crate::project::quote;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -56,7 +56,7 @@ benchmark's folder, and its pid to runner.json there. legume benchmark
 stop NAME stops it as Ctrl-C would. A remote not kept yet is asked for
 first.";
 
-const FLAGS: &[Flag] = &[Flag::once(&["--on"])];
+const FLAGS: &[Flag] = &[Flag::once(&["--on"]), Flag::switch(&["--detach"])];
 
 /// Cores the pool may book at once on a cluster: Slurm's scheduler and
 /// each method's max_running are the real limits.
@@ -83,20 +83,22 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
         Some(s) if s.starts_with('-') => (None, args),
         Some(s) => (Some(PathBuf::from(s)), &args[1..]),
     };
-    let detach = rest.iter().any(|a| a == "--detach");
-    let rest: Vec<String> = rest.iter().filter(|a| *a != "--detach").cloned().collect();
-    let Some(pairs) = flag_pairs(&rest)? else {
+    let Some(given) = flags(FLAGS, rest)? else {
         return Ok(writeln!(out, "{USAGE}")?);
     };
-    let mut on = None;
-    for (_, v) in canonical_flags(FLAGS, pairs)? {
-        on = Some(v.to_string());
+    let (mut on, mut detach) = (None, false);
+    for (flag, v) in given {
+        match flag {
+            "--detach" => detach = true,
+            _ => on = Some(v.to_string()),
+        }
     }
     let spec = spec.ok_or_else(|| usage("run needs SPEC, the spec's JSON file"))?;
     let on = required(on, "--on")?;
     if detach {
         return super::runner::detach_main(&spec, &on, out);
     }
+    super::runner::keep_alive_lock();
     let result = run(&spec, &on, out, err).and_then(|code| match code {
         0 => Ok(()),
         code => Err(failed(code, "not every task is done")),
@@ -114,7 +116,7 @@ fn run(spec_file: &Path, on: &str, out: &mut dyn Write, err: &mut dyn Write) -> 
     let text = std::fs::read_to_string(spec_file)
         .with_context(|| format!("reading {}", spec_file.display()))?;
     let (spec, value) = super::spec::parse(&text)?;
-    let spec_key = super::key::key(super::key::spec_file(&value).as_bytes());
+    let spec_key = super::key::spec_key(&value);
     let root = crate::project::root().context("finding the project's folder")?;
     // Named for the project and its place here, so two projects of one
     // name keep apart there.
@@ -389,7 +391,7 @@ impl Runner<'_> {
     fn resume(&mut self, out: &mut dyn Write) -> Result<()> {
         let resumed = self.ex.resume()?;
         self.pool.resume(0, &resumed.done, &resumed.adopted)?;
-        for (list, event) in [(&resumed.done, "reused"), (&resumed.adopted, "adopted")] {
+        for (list, event) in [(&resumed.done, REUSED), (&resumed.adopted, ADOPTED)] {
             for &i in list {
                 self.events.mark(&self.tasks[i], event)?;
             }
@@ -476,7 +478,7 @@ impl Runner<'_> {
             running.len()
         )?;
         for &i in &running {
-            self.events.mark(&self.tasks[i], "stop-requested")?;
+            self.events.mark(&self.tasks[i], STOP_REQUESTED)?;
         }
         self.events.flush()?;
         self.ex.cancel(&running)
@@ -497,7 +499,7 @@ impl Runner<'_> {
         let at = unix_secs();
         for l in &round.launched {
             self.submitted.insert(l.task, at);
-            self.events.mark(&self.tasks[l.task], "start")?;
+            self.events.mark(&self.tasks[l.task], START)?;
         }
         // A task is skipped only when an end (its upstream's, or its
         // method's halt) says so.
@@ -505,7 +507,7 @@ impl Runner<'_> {
             for (i, said) in self.skipped_said.iter_mut().enumerate() {
                 if !*said && matches!(self.pool.state(i), State::Skipped { .. }) {
                     *said = true;
-                    self.events.mark(&self.tasks[i], "skipped")?;
+                    self.events.mark(&self.tasks[i], SKIPPED)?;
                 }
             }
         }
@@ -553,6 +555,29 @@ struct Events {
 }
 
 const EVENTS_HEADER: &str = "time\ttask\tattempt\tevent\twall_secs\tcpu_secs\tqueue_secs\tnode\n";
+
+/// The words of `events.tsv`'s `event` column besides an end's
+/// ([`Outcome::word`]): a task submitted, done in an earlier run, still
+/// in the queue from one, skipped, or asked to stop.
+const START: &str = "start";
+const REUSED: &str = "reused";
+const ADOPTED: &str = "adopted";
+const SKIPPED: &str = "skipped";
+const STOP_REQUESTED: &str = "stop-requested";
+
+/// The state a task is in when `word` is its latest event in
+/// `events.tsv`: running, done, failed, stopped or skipped; `None` for a
+/// word that does not change it (a stop asked for).
+pub(crate) fn event_state(word: &str) -> Option<&'static str> {
+    Some(match word {
+        START | ADOPTED => "running",
+        "done" | REUSED => "done",
+        "failed" | "timeout" | "oom" | "lost" => "failed",
+        "stopped" => "stopped",
+        SKIPPED => "skipped",
+        _ => return None,
+    })
+}
 
 impl Events {
     fn open(dir: &Path) -> Result<Self> {
@@ -616,5 +641,31 @@ impl Events {
 
     fn flush(&mut self) -> Result<()> {
         Ok(self.file.flush()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::pool::Outcome;
+    use super::*;
+
+    #[test]
+    fn every_word_events_tsv_writes_says_a_state_but_a_stop_asked_for() {
+        let ends = [
+            (Outcome::Done, "done"),
+            (Outcome::Failed, "failed"),
+            (Outcome::Timeout, "failed"),
+            (Outcome::Oom, "failed"),
+            (Outcome::Lost, "failed"),
+            (Outcome::Stopped, "stopped"),
+        ];
+        for (o, state) in ends {
+            assert_eq!(event_state(o.word()), Some(state), "{o:?}");
+        }
+        assert_eq!(event_state(START), Some("running"));
+        assert_eq!(event_state(ADOPTED), Some("running"));
+        assert_eq!(event_state(REUSED), Some("done"));
+        assert_eq!(event_state(SKIPPED), Some("skipped"));
+        assert_eq!(event_state(STOP_REQUESTED), None);
     }
 }
