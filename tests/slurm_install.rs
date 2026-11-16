@@ -187,6 +187,18 @@ fn a_prefix_with_a_comma_reaches_the_job_whole() {
     assert!(job.contains("A1\\,B1") || job.contains("A1,B1"), "{job}");
 }
 
+// --help prints the header's usage, from its first line, and no job.
+#[test]
+fn help_prints_the_usage() {
+    let bin = Bin::new();
+    let o = run(&bin, &["--help"]);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    let t = text(&o);
+    assert!(t.starts_with("Install the legume tools"), "{t}");
+    assert!(t.contains("--prefix DIR"), "{t}");
+    assert!(!t.contains("#SBATCH"), "{t}");
+}
+
 #[test]
 fn an_option_without_its_value_is_refused() {
     let bin = Bin::new();
