@@ -5,13 +5,15 @@
 //! never in a project: each is a section named for the remote, with the
 //! SSH target (a host or an alias from `~/.ssh/config`, using this
 //! person's own keys; no password is kept), the folder on the cluster
-//! the benchmarks go in, and the Slurm partition and account, when the
-//! cluster wants them:
+//! the benchmarks go in, the folder of legume's tools there (an install's
+//! `bin`, when they are not on PATH), and the Slurm partition and account,
+//! when the cluster wants them:
 //!
 //! ```toml
 //! [R1]
 //! ssh = "HOST1"
 //! folder = "/path/on/the/cluster"
+//! bin = "/path/on/the/cluster/legume/bin"
 //! partition = "PART1"
 //! account = "ACCT1"
 //! ```
@@ -31,6 +33,9 @@ pub struct Remote {
     pub ssh: String,
     /// The folder on the cluster that benchmarks go in.
     pub folder: String,
+    /// The folder of legume's tools on the cluster; `None` when they are
+    /// on its PATH.
+    pub bin: Option<String>,
     pub partition: Option<String>,
     pub account: Option<String>,
 }
@@ -78,6 +83,7 @@ pub fn parse(text: &str) -> Result<Vec<Remote>> {
         match key.trim() {
             "ssh" => r.ssh = value,
             "folder" => r.folder = value,
+            "bin" => r.bin = Some(value),
             "partition" => r.partition = Some(value),
             "account" => r.account = Some(value),
             k => bail!("{}: unknown key {k}", at()),
@@ -147,7 +153,11 @@ pub fn to_toml(remotes: &[Remote]) -> String {
         out.push_str(&format!("[{}]\n", r.name));
         out.push_str(&format!("ssh = {}\n", quote_toml(&r.ssh)));
         out.push_str(&format!("folder = {}\n", quote_toml(&r.folder)));
-        for (key, v) in [("partition", &r.partition), ("account", &r.account)] {
+        for (key, v) in [
+            ("bin", &r.bin),
+            ("partition", &r.partition),
+            ("account", &r.account),
+        ] {
             if let Some(v) = v {
                 out.push_str(&format!("{key} = {}\n", quote_toml(v)));
             }
@@ -207,12 +217,17 @@ pub fn ask(name: &str, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<R
     let ssh = answer("SSH target (a host or an alias from ~/.ssh/config)", true)?;
     let folder = answer("Folder on the cluster for benchmarks", true)?;
     let some = |s: String| Some(s).filter(|s| !s.is_empty());
+    let bin = some(answer(
+        "Folder of legume's tools on the cluster, an install's bin (empty if on PATH)",
+        false,
+    )?);
     let partition = some(answer("Slurm partition (empty for the default)", false)?);
     let account = some(answer("Slurm account (empty for none)", false)?);
     Ok(Remote {
         name: name.to_string(),
         ssh,
         folder,
+        bin,
         partition,
         account,
     })
@@ -221,6 +236,7 @@ pub fn ask(name: &str, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<R
 /// Where a benchmark's commands run: this machine, or a remote over one
 /// SSH connection that every call shares (OpenSSH's ControlMaster, kept
 /// 10 minutes after the last).
+#[derive(Clone)]
 pub struct Shell {
     /// The SSH target and the shared connection's socket; `None` for this
     /// machine.
@@ -281,7 +297,7 @@ impl Shell {
     }
 
     fn command(&self) -> Command {
-        match &self.ssh {
+        let mut c = match &self.ssh {
             None => {
                 let mut c = Command::new("bash");
                 c.arg("-s").envs(self.env.iter().map(|(k, v)| (k, v)));
@@ -303,7 +319,11 @@ impl Shell {
                 ]);
                 c
             }
-        }
+        };
+        // A group of its own: Ctrl-C at the terminal is the runner's to
+        // act on, not the end of the call it is making.
+        std::os::unix::process::CommandExt::process_group(&mut c, 0);
+        c
     }
 
     /// `script` run by bash, fed on its stdin: what it printed and how it
@@ -381,6 +401,7 @@ mod tests {
             name: "R1".into(),
             ssh: "HOST1".into(),
             folder: "/a/b \"c\"".into(),
+            bin: Some("/a/bin".into()),
             partition: Some("PART1".into()),
             account: None,
         }
@@ -394,6 +415,7 @@ mod tests {
                 name: "R2".into(),
                 ssh: "u@h".into(),
                 folder: "/x".into(),
+                bin: None,
                 partition: None,
                 account: Some("ACCT1".into()),
             },
@@ -429,7 +451,7 @@ mod tests {
 
     #[test]
     fn asking_repeats_until_a_needed_answer_and_leaves_optional_ones_empty() {
-        let mut input: &[u8] = b"\nHOST1\n/x\n\nACCT1\n";
+        let mut input: &[u8] = b"\nHOST1\n/x\n\n\nACCT1\n";
         let mut said = Vec::new();
         let r = ask("R1", &mut input, &mut said).unwrap();
         assert_eq!(
@@ -438,6 +460,7 @@ mod tests {
                 name: "R1".into(),
                 ssh: "HOST1".into(),
                 folder: "/x".into(),
+                bin: None,
                 partition: None,
                 account: Some("ACCT1".into()),
             }

@@ -14,8 +14,12 @@ pub mod pool;
 #[cfg(unix)]
 pub mod remote;
 #[cfg(unix)]
+pub mod run;
+#[cfg(unix)]
 pub mod slurm;
 pub mod spec;
+#[cfg(unix)]
+mod stop;
 pub mod tools;
 #[cfg(target_os = "linux")]
 pub mod wrapper;
@@ -49,6 +53,11 @@ and says what it planned. A later plan lists what changed: the machine,
 and each tool installed since, whose snapshot it keeps. --retool plans
 with the tools installed now, which rekeys their tasks.
 
+legume benchmark run SPEC --on REMOTE
+
+Runs the benchmark on the cluster REMOTE, over SSH from here: planned on
+a compute node, its tasks Slurm array tasks (legume benchmark run --help).
+
 legume benchmark task --plan PLAN (--task ID | --list FILE [--index N])
 
 Runs one task of a plan under the wrapper, as a compute node runs it
@@ -75,14 +84,21 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
             let spec = spec.ok_or_else(|| usage("plan needs SPEC, the spec's JSON file"))?;
             plan_spec(&spec, retool, out, err)
         }
+        #[cfg(unix)]
+        Some("run") => run::main(&args[1..], out, err),
         #[cfg(target_os = "linux")]
         Some("task") => wrapper::main(&args[1..], out, err),
         #[cfg(not(target_os = "linux"))]
         Some("task") => Err(usage("benchmark task runs on Linux only")),
         Some(other) => Err(usage(format!(
-            "unknown command {other}: benchmark has plan and task"
+            "unknown command {other}: benchmark has plan, run and task"
         ))),
     }
+}
+
+/// Benchmark `name`'s folder in a project.
+pub(crate) fn bench_rel(name: &str) -> PathBuf {
+    Path::new("results").join("benchmarks").join(name)
 }
 
 /// A spec under a benchmark's `specs/` is named by its key: refused when
@@ -127,7 +143,7 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
             .collect();
         return Err(refuse(format!("not found on PATH: {}", names.join(", "))));
     }
-    let rel = Path::new("results").join("benchmarks").join(&spec.name);
+    let rel = bench_rel(&spec.name);
     let dir = root.join(&rel);
     let inputs = resolve_inputs(&spec, &root, &rel, &dir)?;
     // The last refusal, before any tool is snapshot: what a refusal stops

@@ -146,6 +146,20 @@ pub enum Outcome {
     Stopped,
 }
 
+impl Outcome {
+    /// Its name, as `exit.json` and `events.tsv` write it.
+    pub fn word(self) -> &'static str {
+        match self {
+            Outcome::Done => "done",
+            Outcome::Failed => "failed",
+            Outcome::Timeout => "timeout",
+            Outcome::Oom => "oom",
+            Outcome::Lost => "lost",
+            Outcome::Stopped => "stopped",
+        }
+    }
+}
+
 /// Where a task is.
 #[derive(Clone, Debug, PartialEq)]
 pub enum State {
@@ -320,6 +334,30 @@ impl Pool {
     /// Where task `i` is.
     pub fn state(&self, i: usize) -> &State {
         &self.state[i]
+    }
+
+    /// The tasks running now.
+    pub fn running(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.state.len()).filter(|&i| self.is_running(i))
+    }
+
+    /// On resume, in one change: the pending tasks `done` were done in an
+    /// earlier run, and the pending tasks `adopted` are still running from
+    /// one, on no GPU.
+    pub fn resume(&mut self, now: u64, done: &[usize], adopted: &[usize]) -> Result<()> {
+        for &i in done.iter().chain(adopted) {
+            self.pending(i)?;
+        }
+        self.event(now, |p| {
+            for &i in done {
+                p.state[i] = State::Ended(Outcome::Done);
+            }
+            for &i in adopted {
+                p.ready_since.remove(&i);
+                p.state[i] = State::Running(Vec::new());
+            }
+        });
+        Ok(())
     }
 
     /// Threads booked by running tasks.

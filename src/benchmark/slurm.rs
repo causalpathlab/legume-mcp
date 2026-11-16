@@ -23,12 +23,13 @@
 //! Slurm 17.02 and later: no `--gpus`, and nothing run on the login node
 //! but bash, coreutils and Slurm's own commands.
 
-use super::executor::{Executor, TaskExit};
+use super::executor::{Ended, Executor, TaskExit};
 use super::plan::Task;
 use super::pool::{Budget, Launch, Live, Outcome};
 use super::remote::Shell;
 use crate::project::quote;
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
@@ -121,14 +122,79 @@ impl Slurm {
     pub fn adopt(&mut self, task: usize, job: &str) -> Result<()> {
         let job = parse_job(job).with_context(|| format!("adopting {job}"))?;
         self.task(task)?;
+        self.watch(task, job);
+        Ok(())
+    }
+
+    /// On resume, one shell call: the tasks done in an earlier run (their
+    /// `done.json` has the task's key), and the tasks of an earlier run
+    /// still in the queue (`slurm.json` names an array task the queue
+    /// has, and no `exit.json` says it ended), which are adopted. The
+    /// script is the same size for any number of tasks: one `find` under
+    /// the tasks' folders, and one `awk` that prints each file found.
+    pub fn resume(&mut self) -> Result<Resumed> {
+        let root = common_folder(self.tasks.iter().map(|t| t.dir.as_path()))
+            .context("a plan with no tasks")?;
+        let script = format!(
+            "{}find {} \\( -name done.json -o -name slurm.json -o -name exit.json \\) -type f \
+             -print0 2>/dev/null | xargs -0 -r awk 'FNR == 1 {{ if (NR > 1) print \"\"; \
+             printf \"f\\t%s\\t\", FILENAME }} {{ printf \"%s\", $0 }} \
+             END {{ if (NR > 0) print \"\" }}'\nexit 0\n",
+            squeue_line(&self.site.run),
+            quote(&root.display().to_string())
+        );
+        let ran = self.shell.run(&script)?;
+        let poll = parse_poll(&ran.stdout);
+        if !ran.ok() || !poll.queue_ok {
+            bail!(
+                "reading the benchmark's tasks on the cluster: {}",
+                ran.stderr.trim()
+            );
+        }
+        let files = task_files(&ran.stdout, &self.tasks);
+        let mut resumed = Resumed::default();
+        for (i, t) in self.tasks.iter().enumerate() {
+            let f = files.get(&i);
+            let done = f
+                .and_then(|f| f.done.as_deref())
+                .and_then(|j| serde_json::from_str::<DoneFile>(j).ok());
+            if done.is_some_and(|d| d.key == t.key) {
+                resumed.done.push(i);
+                continue;
+            }
+            let job = f
+                .filter(|f| !f.exit)
+                .and_then(|f| f.slurm.as_deref())
+                .and_then(|j| serde_json::from_str::<Placed>(j).ok())
+                .map(|p| Job {
+                    array_job: p.array_job_id,
+                    index: p.index,
+                })
+                .filter(|j| poll.queued.contains(j) || poll.pending.contains(j));
+            if let Some(job) = job {
+                self.running.insert(
+                    i,
+                    Running {
+                        job,
+                        gone_since: None,
+                    },
+                );
+                resumed.adopted.push(i);
+            }
+        }
+        self.pending = poll.pending;
+        Ok(resumed)
+    }
+
+    /// Task `i` watched as array task `job`.
+    fn watch(&mut self, i: usize, job: Job) {
         self.running.insert(
-            task,
+            i,
             Running {
                 job,
                 gone_since: None,
             },
         );
-        Ok(())
     }
 
     fn task(&self, i: usize) -> Result<&Task> {
@@ -160,13 +226,21 @@ impl Slurm {
             quote(&format!("{}/{name}_%a.log", s.slurm_dir)),
             quote(&wrap)
         );
-        for (flag, v) in [("--partition", &s.partition), ("--account", &s.account)] {
-            if let Some(v) = v {
-                let _ = write!(args, " {flag}={}", quote(v));
-            }
-        }
+        args.push_str(&place_flags(s.partition.as_deref(), s.account.as_deref()));
         args
     }
+}
+
+/// The `--partition` and `--account` flags of `srun` or `sbatch`, each
+/// with a space before it; nothing for one not given.
+fn place_flags(partition: Option<&str>, account: Option<&str>) -> String {
+    let mut f = String::new();
+    for (flag, v) in [("--partition", partition), ("--account", account)] {
+        if let Some(v) = v {
+            let _ = write!(f, " {flag}={}", quote(v));
+        }
+    }
+    f
 }
 
 /// `<array job>_<index>`.
@@ -202,6 +276,111 @@ fn parse_range(s: &str) -> Option<Vec<Job>> {
         }
     }
     Some(jobs)
+}
+
+/// What resume reads of a `done.json`.
+#[derive(Deserialize)]
+struct DoneFile {
+    key: String,
+}
+
+/// A `slurm.json`: the array task a task was put in.
+#[derive(Deserialize)]
+struct Placed {
+    array_job_id: String,
+    index: usize,
+}
+
+/// The files of one task's folder that resume reads.
+#[derive(Default)]
+struct TaskFiles {
+    done: Option<String>,
+    slurm: Option<String>,
+    exit: bool,
+}
+
+/// The folder every path in `dirs` is under.
+fn common_folder<'a>(
+    mut dirs: impl Iterator<Item = &'a std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let mut common = dirs.next()?.to_path_buf();
+    for d in dirs {
+        while !d.starts_with(&common) {
+            if !common.pop() {
+                break;
+            }
+        }
+    }
+    Some(common)
+}
+
+/// The `f <path> <text>` lines of a resume, by task: each task's
+/// `done.json` and `slurm.json` text and whether its `exit.json` is
+/// there. A file in no task's own folder is not the task's.
+fn task_files(out: &str, tasks: &[Task]) -> HashMap<usize, TaskFiles> {
+    let by_dir: HashMap<&std::path::Path, usize> = tasks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.dir.as_path(), i))
+        .collect();
+    let mut files: HashMap<usize, TaskFiles> = HashMap::new();
+    for line in out.lines() {
+        let Some((path, text)) = line.strip_prefix("f\t").and_then(|r| r.split_once('\t')) else {
+            continue;
+        };
+        let path = std::path::Path::new(path);
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            continue;
+        };
+        let Some(&i) = by_dir.get(dir) else {
+            continue;
+        };
+        let f = files.entry(i).or_default();
+        match name.to_str() {
+            Some("done.json") => f.done = Some(text.to_string()),
+            Some("slurm.json") => f.slurm = Some(text.to_string()),
+            Some("exit.json") => f.exit = true,
+            _ => {}
+        }
+    }
+    files
+}
+
+/// `srun` of `command` on a compute node, as the run's job `run`, with
+/// one core and `mem_gb` of memory for at most `minutes`. Its stdin is
+/// none: srun passes its own on to the command, and a script fed to bash
+/// on stdin would lose its lines after it.
+pub fn srun(
+    run: &str,
+    partition: Option<&str>,
+    account: Option<&str>,
+    (mem_gb, minutes): (u32, u32),
+    command: &str,
+) -> String {
+    format!(
+        "srun --job-name={} --cpus-per-task=1 --mem={mem_gb}G --time={minutes}{} {command} \
+         < /dev/null",
+        quote(run),
+        place_flags(partition, account)
+    )
+}
+
+/// What [`Slurm::resume`] found.
+#[derive(Debug, Default, PartialEq)]
+pub struct Resumed {
+    /// Tasks done in an earlier run, with their key.
+    pub done: Vec<usize>,
+    /// Tasks of an earlier run still queued or running, now watched.
+    pub adopted: Vec<usize>,
+}
+
+/// `squeue` of the run's array jobs, each row a `q` line, or `qfail`.
+fn squeue_line(run: &str) -> String {
+    format!(
+        "if q=$(squeue -h --name={} -o '%i %t'); then printf '%s\\n' \"$q\" | sed 's/^/q /'; \
+         else echo qfail; fi\n",
+        quote(run)
+    )
 }
 
 /// Tasks of one shape go in as one array job.
@@ -307,19 +486,13 @@ impl Executor for Slurm {
                     array_job: array_job.clone(),
                     index,
                 };
-                self.running.insert(
-                    i,
-                    Running {
-                        job,
-                        gone_since: None,
-                    },
-                );
+                self.watch(i, job);
             }
         }
         Ok(())
     }
 
-    fn poll(&mut self, wait: Duration) -> Result<Vec<(usize, Outcome)>> {
+    fn poll(&mut self, wait: Duration) -> Result<Vec<Ended>> {
         if self.running.is_empty() {
             return Ok(Vec::new());
         }
@@ -327,11 +500,7 @@ impl Executor for Slurm {
         std::thread::sleep(wait);
         // What is queued, then the exit.json of each task that may have
         // one: every line one record.
-        let mut script = format!(
-            "if q=$(squeue -h --name={} -o '%i %t'); then printf '%s\\n' \"$q\" | sed 's/^/q /'; \
-             else echo qfail; fi\n",
-            quote(&self.site.run)
-        );
+        let mut script = squeue_line(&self.site.run);
         for (i, r) in &self.running {
             if self.pending.contains(&r.job) {
                 continue;
@@ -358,12 +527,19 @@ impl Executor for Slurm {
             // read again next round; one that never reads is waited for
             // as if not there, so the task is lost rather than watched
             // forever.
+            // One of another key is an earlier plan's attempt (a task
+            // rekeyed since), not this task's end.
             if let Some(exit) = poll
                 .exits
                 .get(&i)
                 .and_then(|text| serde_json::from_str::<TaskExit>(text).ok())
+                .filter(|e| self.tasks.get(i).is_some_and(|t| t.key == e.key))
             {
-                ended.push((i, exit.outcome));
+                ended.push(Ended {
+                    task: i,
+                    outcome: exit.outcome,
+                    exit: Some(exit),
+                });
                 continue;
             }
             if !poll.queue_ok || poll.queued.contains(&r.job) || self.pending.contains(&r.job) {
@@ -377,12 +553,12 @@ impl Executor for Slurm {
                 } else {
                     Outcome::Lost
                 };
-                ended.push((i, outcome));
+                ended.push(Ended::bare(i, outcome));
             }
         }
-        for (i, _) in &ended {
-            self.running.remove(i);
-            self.stopping.remove(i);
+        for e in &ended {
+            self.running.remove(&e.task);
+            self.stopping.remove(&e.task);
         }
         Ok(ended)
     }
@@ -418,7 +594,7 @@ struct Poll {
 }
 
 /// `q <job> <state>` lines from `squeue`, or `qfail`; `x <task> <json>`
-/// lines, each a task's `exit.json`.
+/// lines, each a task's `exit.json`; other lines are not the poll's.
 fn parse_poll(out: &str) -> Poll {
     let mut p = Poll {
         queue_ok: true,

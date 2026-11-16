@@ -1,7 +1,7 @@
 //! The pool: which tasks may start, on a simulated clock. No process
 //! runs here; the tests play the executor, saying when each task ends.
 
-use legume_mcp::benchmark::executor::{round, Executor};
+use legume_mcp::benchmark::executor::{round, Ended, Executor};
 use legume_mcp::benchmark::key::splitmix64;
 use legume_mcp::benchmark::plan::Task;
 use legume_mcp::benchmark::pool::{Acct, Budget, Launch, Live, Outcome, Pool, State, Want};
@@ -676,7 +676,11 @@ fn fake(n: usize) -> Fake {
 /// One [`round`] on `ex`'s clock.
 fn tick(p: &mut Pool, ex: &mut Fake) -> anyhow::Result<Vec<Launch>> {
     let c = ex.clock.clone();
-    round(p, ex, &mut || c.get(), Default::default())
+    let r = round(p, ex, &mut || c.get(), Default::default());
+    match r.error {
+        Some(e) => Err(e),
+        None => Ok(r.launched),
+    }
 }
 
 impl Executor for Fake {
@@ -697,16 +701,19 @@ impl Executor for Fake {
         }
         Ok(())
     }
-    fn poll(&mut self, _: std::time::Duration) -> anyhow::Result<Vec<(usize, Outcome)>> {
+    fn poll(&mut self, _: std::time::Duration) -> anyhow::Result<Vec<Ended>> {
         self.clock.set(self.clock.get() + self.poll_ms);
         let now = self.clock.get();
         let (ended, running) = self.running.iter().partition(|(at, _)| *at <= now);
         self.running = running;
-        let mut out = std::mem::take(&mut self.extra);
+        let mut out: Vec<Ended> = std::mem::take(&mut self.extra)
+            .into_iter()
+            .map(|(c, o)| Ended::bare(c, o))
+            .collect();
         out.extend(
             ended
                 .into_iter()
-                .map(|(_, c): (u64, usize)| (c, self.outcome[c])),
+                .map(|(_, c): (u64, usize)| Ended::bare(c, self.outcome[c])),
         );
         Ok(out)
     }
@@ -827,4 +834,19 @@ fn two_plan_tasks_with_one_id_are_refused() {
     ];
     let e = Want::of_plan(&plan, &["sim"]).unwrap_err().to_string();
     assert!(e.contains("two tasks"), "{e}");
+}
+
+#[test]
+fn resume_reuses_and_adopts_in_one_change() {
+    let mut d = want(1, None, 0, 1, 1.0);
+    d.upstream = vec![0];
+    let w = vec![want(0, None, 0, 1, 1.0), want(0, None, 1, 1, 1.0), d];
+    let mut p = Pool::new(w, budget(4, 100.0)).unwrap();
+    p.resume(0, &[0], &[1]).unwrap();
+    assert_eq!(p.state(0), &State::Ended(Outcome::Done));
+    assert_eq!(p.state(1), &State::Running(Vec::new()));
+    assert_eq!(p.running().collect::<Vec<_>>(), vec![1]);
+    // Its upstream done, task 2 is ready.
+    assert_eq!(tasks(&p.next(1, &calm())), vec![2]);
+    assert!(p.resume(2, &[0], &[]).is_err());
 }
