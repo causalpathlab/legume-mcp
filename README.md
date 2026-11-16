@@ -39,7 +39,9 @@ bash slurm-install.sh --prefix ~/tools [--partition NAME] [--cpus 8] [--mem 16]
 It returns at once; building them all can take a few hours.
 `PREFIX/install/<time>/status` says `submitted`, `running`, then `done`, or
 `failed` with the crates that did not install (the rest still are), beside
-the job's log. Other crates go after the options (`CRATE[@VERSION][:FEATURES]`),
+the job's log. faba's BAM reader makes its C bindings with libclang at build
+time; on a node without one, the job fetches PyPI's libclang wheel into
+`PREFIX/libclang` for the build (`--no-libclang` skips it). Other crates go after the options (`CRATE[@VERSION][:FEATURES]`),
 and `--dry-run` prints the job without submitting it.
 
 ```rust

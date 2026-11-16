@@ -227,6 +227,7 @@ fn fake_toolchain(bin: &Bin) {
         r#"
 if [ "$1" = "--version" ]; then echo "cargo 1.95.0"; exit 0; fi
 echo "$@" >> "$HOME/cargo-calls"
+echo "${LIBCLANG_PATH:-}|${BINDGEN_EXTRA_CLANG_ARGS:-}" >> "$HOME/cargo-env"
 [ -n "$CARGO_TARGET_DIR" ] && mkdir -p "$CARGO_TARGET_DIR" && echo "$CARGO_TARGET_DIR" > "$HOME/target-dir"
 root=""; prev=""; for a in "$@"; do [ "$prev" = "--root" ] && root="$a"; prev="$a"; done
 name="$a"
@@ -238,6 +239,24 @@ chmod +x "$root/bin/$b"
     );
     bin.tool("rustc", r#"echo "rustc 1.95.0""#);
     bin.tool("rustup", r#"echo "$@" >> "$HOME/rustup-calls""#);
+    // Never the real ones: python3 would fetch from PyPI. This python3
+    // unpacks a libclang the way PyPI's wheel lays it out.
+    bin.tool(
+        "python3",
+        r#"echo "$@" >> "$HOME/python-calls"
+cat > /dev/null
+d="$2/libclang-18.data/platlib/clang/native"; mkdir -p "$d" && : > "$d/libclang.so""#,
+    );
+    bin.tool(
+        "gcc",
+        r#"[ "$1" = "-print-file-name=include" ] && echo /GCC1/include"#,
+    );
+}
+
+/// The libclang variables cargo saw, one line per install.
+fn cargo_env(prefix: &Path) -> Vec<String> {
+    let t = std::fs::read_to_string(prefix.join("cargo-env")).unwrap();
+    t.lines().map(str::to_string).collect()
 }
 
 #[test]
@@ -315,4 +334,85 @@ fn a_failed_crate_fails_the_job_and_the_rest_install() {
     assert!(prefix.path().join("bin/legume").is_file());
     let versions = std::fs::read_to_string(run.join("versions.txt")).unwrap();
     assert!(versions.contains("legume 9.9.9"), "{versions}");
+}
+
+#[test]
+fn faba_gets_a_libclang_when_the_node_has_none() {
+    // faba's htslib bindings need libclang; the node has none (no
+    // ldconfig entry, no LIBCLANG_PATH), so the wheel is fetched into the
+    // prefix once, and bindgen gets gcc's built-in headers.
+    let bin = Bin::new();
+    fake_toolchain(&bin);
+    let prefix = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let (o, run) = job_run(
+        &bin,
+        prefix.path(),
+        scratch.path(),
+        &["--no-rust-update", "legume-mcp:benchmark", "faba"],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let fetches = std::fs::read_to_string(prefix.path().join("python-calls")).unwrap();
+    assert_eq!(fetches.lines().count(), 1, "{fetches}");
+    let want = prefix
+        .path()
+        .join("libclang/libclang-18.data/platlib/clang/native");
+    let env = cargo_env(prefix.path());
+    assert_eq!(env.len(), 2);
+    for line in &env {
+        assert_eq!(line, &format!("{}|-I/GCC1/include", want.display()));
+    }
+    assert_eq!(
+        std::fs::read_to_string(run.join("status")).unwrap().trim(),
+        "done"
+    );
+    // A second run finds the one already fetched.
+    let (o, _) = job_run(
+        &bin,
+        prefix.path(),
+        scratch.path(),
+        &["--no-rust-update", "faba"],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let fetches = std::fs::read_to_string(prefix.path().join("python-calls")).unwrap();
+    assert_eq!(fetches.lines().count(), 1, "fetched again: {fetches}");
+}
+
+#[test]
+fn a_libclang_on_the_node_is_used_as_it_is() {
+    let bin = Bin::new();
+    fake_toolchain(&bin);
+    bin.tool(
+        "ldconfig",
+        r#"echo "	libclang.so.18 (libc6,x86-64) => /usr/lib64/libclang.so.18""#,
+    );
+    let prefix = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let (o, _) = job_run(
+        &bin,
+        prefix.path(),
+        scratch.path(),
+        &["--no-rust-update", "faba"],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(!prefix.path().join("python-calls").exists());
+    // Nothing is added to the node's own clang.
+    assert_eq!(cargo_env(prefix.path()), vec!["|".to_string()]);
+}
+
+#[test]
+fn no_libclang_is_fetched_without_faba_or_with_no_libclang() {
+    for extra in [
+        &["--no-rust-update", "legume-mcp:benchmark"][..],
+        &["--no-rust-update", "--no-libclang", "faba"][..],
+    ] {
+        let bin = Bin::new();
+        fake_toolchain(&bin);
+        let prefix = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let (o, _) = job_run(&bin, prefix.path(), scratch.path(), extra);
+        assert!(o.status.success(), "{extra:?}: {}", text(&o));
+        assert!(!prefix.path().join("python-calls").exists(), "{extra:?}");
+        assert_eq!(cargo_env(prefix.path()), vec!["|".to_string()], "{extra:?}");
+    }
 }

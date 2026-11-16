@@ -29,6 +29,7 @@
 #   --time HH:MM:SS     time limit (default 8:00:00)
 #   --build-tmp DIR     node-local scratch for the build (default /tmp)
 #   --no-rust-update    use the Rust toolchain as it is
+#   --no-libclang       never fetch a libclang (see below)
 #   --dry-run           print the job script and do nothing
 #
 # Crates default to the legume tools: legume-mcp:benchmark (legume),
@@ -41,6 +42,13 @@
 # Rust: when `cargo` runs on the node it is used, and `rustup update
 # stable` brings it up to date (unless --no-rust-update). Otherwise rustup
 # installs a toolchain into PREFIX/rust.
+#
+# libclang: faba's BAM reader (htslib) makes its C bindings with libclang
+# at build time. When faba is to be installed and the node has none (no
+# LIBCLANG_PATH, nothing in ldconfig), the job fetches PyPI's libclang
+# wheel into PREFIX/libclang once, with python3's standard library, and
+# gives bindgen gcc's built-in headers, which the wheel lacks. Nothing
+# that runs afterwards uses it. --no-libclang skips this.
 
 set -euo pipefail
 
@@ -62,6 +70,7 @@ mem=16
 time_limit="8:00:00"
 build_tmp="/tmp"
 rust_update=1
+libclang=1
 dry_run=0
 crates=()
 
@@ -75,6 +84,7 @@ while [ $# -gt 0 ]; do
     --time) time_limit="${2:-}"; shift 2 ;;
     --build-tmp) build_tmp="${2:-}"; shift 2 ;;
     --no-rust-update) rust_update=0; shift ;;
+    --no-libclang) libclang=0; shift ;;
     --dry-run) dry_run=1; shift ;;
     -h | --help) usage ;;
     -*) die "no option $1 (see --help)" ;;
@@ -116,6 +126,7 @@ job() {
     echo "prefix=$(q "$prefix")"
     echo "build_tmp=$(q "$build_tmp")"
     echo "rust_update=$rust_update"
+    echo "libclang=$libclang"
     printf 'crates=('
     for c in "${crates[@]}"; do printf ' %s' "$(q "$c")"; done
     echo ' )'
@@ -149,6 +160,35 @@ say "$(cargo --version), $(rustc --version)"
 export CARGO_TARGET_DIR="$build_tmp/legume-install.${SLURM_JOB_ID:-$$}"
 trap 'rm -rf "$CARGO_TARGET_DIR"' EXIT
 mkdir -p "$CARGO_TARGET_DIR" "$prefix/bin"
+
+# libclang for crates whose C bindings are made at build time (faba).
+needs_libclang=0
+for spec in "${crates[@]}"; do
+    case "${spec%%[@:]*}" in faba) needs_libclang=1 ;; esac
+done
+if [ "$needs_libclang" = 1 ] && [ "$libclang" = 1 ] && [ -z "${LIBCLANG_PATH:-}" ] \
+    && ! ldconfig -p 2> /dev/null | grep -q 'libclang[-.0-9]*\.so'; then
+    lc="$prefix/libclang"
+    so=$(find "$lc" -name libclang.so 2> /dev/null | head -1)
+    if [ -z "$so" ]; then
+        say "no libclang here, which faba's htslib bindings need: fetching PyPI's libclang wheel into $lc"
+        python3 - "$lc" << 'PY' || say "fetching libclang failed; faba will not build"
+import io, json, sys, urllib.request, zipfile
+meta = json.load(urllib.request.urlopen("https://pypi.org/pypi/libclang/json"))
+url = next(f["url"] for f in meta["urls"]
+           if "manylinux" in f["filename"] and "x86_64" in f["filename"])
+zipfile.ZipFile(io.BytesIO(urllib.request.urlopen(url).read())).extractall(sys.argv[1])
+PY
+        so=$(find "$lc" -name libclang.so 2> /dev/null | head -1)
+    fi
+    if [ -n "$so" ]; then
+        export LIBCLANG_PATH="${so%/*}"
+        # The wheel has no clang built-in headers (stddef.h); gcc's serve.
+        command -v gcc > /dev/null \
+            && export BINDGEN_EXTRA_CLANG_ARGS="-I$(gcc -print-file-name=include)"
+        say "libclang: $LIBCLANG_PATH"
+    fi
+fi
 
 failed=""
 for spec in "${crates[@]}"; do
