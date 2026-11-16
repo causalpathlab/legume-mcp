@@ -410,30 +410,6 @@ impl Pool {
         Ok(())
     }
 
-    /// On resume: pending task `i` was done in an earlier run.
-    pub fn reuse(&mut self, i: usize) -> Result<()> {
-        self.pending(i)?;
-        self.event(self.at, |p| p.state[i] = State::Ended(Outcome::Done));
-        Ok(())
-    }
-
-    /// On resume at `now`: pending task `i` is still running from an
-    /// earlier run, on devices `gpus`, which must be in the budget.
-    pub fn adopt(&mut self, now: u64, i: usize, gpus: Vec<u32>) -> Result<()> {
-        self.pending(i)?;
-        if let Some(d) = gpus.iter().find(|d| !self.budget.gpus.contains(d)) {
-            bail!(
-                "{} runs on GPU {d}, which is not in the budget",
-                self.wants[i].id
-            );
-        }
-        self.event(now, |p| {
-            p.ready_since.remove(&i);
-            p.state[i] = State::Running(gpus);
-        });
-        Ok(())
-    }
-
     /// Running task `i` is resident at `gb`.
     pub fn rss(&mut self, i: usize, gb: f64) {
         self.event(self.at, |p| {

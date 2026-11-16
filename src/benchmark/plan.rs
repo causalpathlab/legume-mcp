@@ -65,6 +65,16 @@ impl Context<'_> {
     }
 }
 
+/// What the runner and the wrapper read of `plan.json`.
+#[derive(Deserialize)]
+pub struct PlanDoc {
+    /// The legume that planned it; none before 0.5.13.
+    #[serde(default)]
+    pub legume: Option<String>,
+    pub grace_secs: u64,
+    pub tasks: Vec<Task>,
+}
+
 /// One task, as `plan.json` lists it, and as the wrapper reads it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Task {

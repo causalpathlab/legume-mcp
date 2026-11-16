@@ -2,10 +2,9 @@
 //! an executor runs it, on this machine or through a batch scheduler,
 //! and says when each task ends. The runner loops on [`round`].
 
-use super::pool::{Budget, Launch, Live, Outcome, Pool};
+use super::pool::{Launch, Live, Outcome, Pool};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 /// A task's `exit.json`: how its attempt ended, as the wrapper writes it
 /// and every executor reads it.
@@ -33,8 +32,6 @@ pub struct TaskExit {
 
 /// Runs a plan's tasks, by their index in the plan.
 pub trait Executor {
-    /// What the pool may book.
-    fn budget(&self) -> Budget;
     /// The machine now. An executor whose scheduler places memory itself
     /// leaves `mem_available_gb` empty.
     fn live(&mut self) -> Result<Live>;
@@ -42,9 +39,8 @@ pub trait Executor {
     /// all of them, or on an error none (an executor that started some
     /// cancels them).
     fn launch(&mut self, tasks: &[Launch]) -> Result<()>;
-    /// The tasks that ended since the last call, waiting up to `wait`
-    /// for the first.
-    fn poll(&mut self, wait: Duration) -> Result<Vec<Ended>>;
+    /// The tasks that ended since the last call.
+    fn poll(&mut self) -> Result<Vec<Ended>>;
     /// Stops `tasks`; each ends later through [`Executor::poll`] as
     /// [`Outcome::Stopped`].
     fn cancel(&mut self, tasks: &[usize]) -> Result<()>;
@@ -90,14 +86,9 @@ pub struct Round {
 /// launched. Every end is applied before an error stops the round; tasks
 /// the executor refuses to launch are pending again. A round that fails
 /// may be tried again.
-pub fn round(
-    pool: &mut Pool,
-    ex: &mut dyn Executor,
-    clock: &mut dyn FnMut() -> u64,
-    wait: Duration,
-) -> Round {
+pub fn round(pool: &mut Pool, ex: &mut dyn Executor, clock: &mut dyn FnMut() -> u64) -> Round {
     let mut r = Round::default();
-    match ex.poll(wait) {
+    match ex.poll() {
         Ok(ended) => r.ended = ended,
         Err(e) => {
             r.error = Some(e);
@@ -124,11 +115,7 @@ pub fn round(
         return r;
     }
     if let Err(e) = ex.launch(&launch) {
-        if let Err(u) = pool.unlaunch(now, &launch) {
-            r.error = Some(u);
-            return r;
-        }
-        r.error = Some(e);
+        r.error = Some(pool.unlaunch(now, &launch).err().unwrap_or(e));
         return r;
     }
     r.launched = launch;

@@ -40,6 +40,18 @@ pub struct Remote {
     pub account: Option<String>,
 }
 
+impl Remote {
+    /// The install its bin is the bin of, when bin is `PREFIX/bin`, as
+    /// `legume benchmark install` makes it.
+    pub fn prefix(&self) -> Option<&str> {
+        self.bin
+            .as_deref()
+            .map(|b| b.trim_end_matches('/'))
+            .and_then(|b| b.strip_suffix("/bin"))
+            .filter(|p| !p.is_empty())
+    }
+}
+
 /// `remotes.toml`: `$LEGUME_REMOTES`, or in `$XDG_CONFIG_HOME/legume`,
 /// or in `~/.config/legume`.
 pub fn config_file() -> Option<PathBuf> {
@@ -268,14 +280,21 @@ pub fn ask(name: &str, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<R
         Answer::Optional,
     )?);
     let account = some(answer("Slurm account (empty for none)", Answer::Optional)?);
-    Ok(Remote {
+    let r = Remote {
         name: name.to_string(),
         ssh,
         folder,
         bin,
         partition,
         account,
-    })
+    };
+    if r.bin.is_some() && r.prefix().is_none() {
+        writeln!(
+            out,
+            "Runs find legume there; legume benchmark install wants PREFIX/bin, to install into."
+        )?;
+    }
+    Ok(r)
 }
 
 /// Where a benchmark's commands run: this machine, or a remote over one
@@ -496,6 +515,22 @@ mod tests {
             let e = format!("{:#}", parse(text).unwrap_err());
             assert!(e.contains(says), "{text:?}: {e}");
         }
+    }
+
+    #[test]
+    fn a_bin_outside_an_install_is_kept_and_said() {
+        let mut input: &[u8] = b"HOST1\n/x\n/x/tools\n\n\n";
+        let mut said = Vec::new();
+        let r = ask("R1", &mut input, &mut said).unwrap();
+        assert_eq!((r.bin.as_deref(), r.prefix()), (Some("/x/tools"), None));
+        assert!(String::from_utf8(said)
+            .unwrap()
+            .contains("wants PREFIX/bin"));
+        let r = Remote {
+            bin: Some("/x/bin/".into()),
+            ..r
+        };
+        assert_eq!(r.prefix(), Some("/x"));
     }
 
     #[test]
