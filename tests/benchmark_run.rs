@@ -503,12 +503,12 @@ fn a_detached_run_returns_at_once_and_stop_cancels_its_tasks() {
     assert!(started.elapsed() < Duration::from_secs(10));
     let s = said(&o);
     assert!(
-        s.contains("started benchmark N1 on R1 in the background, as pid "),
+        s.contains("started benchmark N1 on REMOTE1 in the background, as pid "),
         "{s}"
     );
     assert!(s.contains("log: results/benchmarks/N1/run.log"), "{s}");
     let r = runner_json(&w).unwrap();
-    assert_eq!(r["remote"], "R1");
+    assert_eq!(r["remote"], "REMOTE1");
     assert_eq!(r["spec_key"].as_str().unwrap().len(), 32);
     assert!(r["exit"].is_null(), "{r}");
     // Another, while it is alive, is refused.
@@ -560,7 +560,7 @@ fn a_detached_run_returns_at_once_and_stop_cancels_its_tasks() {
     assert_eq!(cancelled.split_whitespace().count(), 2, "{cancelled}");
     assert_eq!(w.count("stopped"), 2);
     let log = std::fs::read_to_string(w.project().join("results/benchmarks/N1/run.log")).unwrap();
-    assert!(log.contains("planning N1 on R1"), "{log}");
+    assert!(log.contains("planning N1 on REMOTE1"), "{log}");
     assert!(log.contains("the run ended, exit 130"), "{log}");
     // Nothing is left to stop.
     let o = w.legume(&["benchmark", "stop", "N1"]).output().unwrap();
