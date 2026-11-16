@@ -112,7 +112,7 @@ fn os() -> Option<String> {
 }
 
 /// MemAvailable in `/proc/meminfo`, in GB.
-fn mem_available_gb() -> Option<f64> {
+pub(crate) fn mem_available_gb() -> Option<f64> {
     let kb: f64 = read("/proc/meminfo")?
         .lines()
         .find_map(|l| l.strip_prefix("MemAvailable:"))?

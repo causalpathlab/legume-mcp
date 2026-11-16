@@ -15,6 +15,8 @@ pub mod gather;
 #[cfg(unix)]
 pub mod install;
 pub mod key;
+#[cfg(target_os = "linux")]
+pub mod local;
 pub mod machine;
 #[cfg(unix)]
 pub(crate) mod mcp;

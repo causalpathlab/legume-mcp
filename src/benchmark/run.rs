@@ -25,7 +25,7 @@ use super::plan::{PlanDoc, Task};
 use super::pool::{Budget, Pool, State, Want};
 use super::remote::{self, Remote, Shell};
 use super::slurm::{srun, Site, Slurm};
-use crate::command::{failed, flags, refuse, required, usage, Flag};
+use crate::command::{failed, flags, refuse, usage, Flag};
 use crate::project::quote;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -35,9 +35,15 @@ use std::time::{Duration, Instant};
 
 /// `legume benchmark run`'s usage.
 pub const USAGE: &str = "\
-legume benchmark run SPEC --on REMOTE [--detach]
+legume benchmark run SPEC [--on REMOTE] [--detach]
 
-Runs the benchmark of the spec SPEC on the cluster REMOTE, from here:
+Without --on, runs the benchmark of the spec SPEC on this machine: the
+spec is planned here (as legume benchmark plan does), and each task
+runs under the wrapper, as many at once as the cores, memory and GPUs
+the plan books, and each method's max_running, allow. Tasks done in an
+earlier run are reused; at the end the scores are gathered.
+
+With --on, runs it on the cluster REMOTE, from here:
 the spec is planned on a compute node there, and each task runs as a
 Slurm array task under the wrapper, as many at once as Slurm and each
 method's max_running allow. A remote not in remotes.toml (in
@@ -62,13 +68,35 @@ const FLAGS: &[Flag] = &[Flag::once(&["--on"]), Flag::switch(&["--detach"])];
 /// each method's max_running are the real limits.
 const CLUSTER_CORES: u32 = 100_000;
 
-/// How long a round waits when something changed, growing by
-/// [`WAIT_STEP`] each quiet round up to [`WAIT_MAX`].
-const WAIT_FIRST: Duration = Duration::from_secs(40);
-const WAIT_STEP: Duration = Duration::from_secs(10);
-const WAIT_MAX: Duration = Duration::from_secs(180);
-/// How long a round waits once the run is stopping.
-const WAIT_STOPPING: Duration = Duration::from_secs(10);
+/// How long a round waits: `first` when something changed, growing by
+/// `step` each quiet round up to `max`, and `stopping` once the run is.
+#[derive(Clone, Copy)]
+struct Pace {
+    first: Duration,
+    step: Duration,
+    max: Duration,
+    stopping: Duration,
+    /// What a runner that leaves early says of the tasks it leaves.
+    leaving: &'static str,
+}
+
+/// A cluster's pace: Slurm's queue changes in tens of seconds.
+const CLUSTER_PACE: Pace = Pace {
+    first: Duration::from_secs(40),
+    step: Duration::from_secs(10),
+    max: Duration::from_secs(180),
+    stopping: Duration::from_secs(10),
+    leaving: "tasks not seen to end may still run on the cluster, and a run again adopts them",
+};
+
+/// This machine's pace: a child's end is seen at once.
+const LOCAL_PACE: Pace = Pace {
+    first: Duration::from_secs(1),
+    step: Duration::from_millis(500),
+    max: Duration::from_secs(5),
+    stopping: Duration::from_millis(500),
+    leaving: "its tasks are stopped as it leaves, and a run again runs them",
+};
 
 /// Rounds in a row the cluster may leave unanswered before the run ends.
 const MAX_FAILURES: u32 = 5;
@@ -94,12 +122,15 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
         }
     }
     let spec = spec.ok_or_else(|| usage("run needs SPEC, the spec's JSON file"))?;
-    let on = required(on, "--on")?;
     if detach {
-        return super::runner::detach_main(&spec, &on, out);
+        return super::runner::detach_main(&spec, on.as_deref(), out);
     }
     super::runner::keep_alive_lock();
-    let result = run(&spec, &on, out, err).and_then(|code| match code {
+    let ran = match &on {
+        Some(on) => run(&spec, on, out, err),
+        None => run_here(&spec, out, err),
+    };
+    let result = ran.and_then(|code| match code {
         0 => Ok(()),
         code => Err(failed(code, "not every task is done")),
     });
@@ -140,6 +171,54 @@ fn run(spec_file: &Path, on: &str, out: &mut dyn Write, err: &mut dyn Write) -> 
     let result = c.run(&spec, &spec_key, &text, &local, out, err);
     shell.close();
     result
+}
+
+/// The run of spec `spec_file` on this machine: planned here, each task
+/// under the wrapper as a child of this process, the scores gathered
+/// here: its exit code.
+#[cfg(target_os = "linux")]
+fn run_here(spec_file: &Path, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32> {
+    let text = std::fs::read_to_string(spec_file)
+        .with_context(|| format!("reading {}", spec_file.display()))?;
+    let (spec, value) = super::spec::parse(&text)?;
+    let spec_key = super::key::spec_key(&value);
+    let root = crate::project::root().context("finding the project's folder")?;
+    super::plan_spec(&root, spec_file, false, out, err)?;
+    let dir = root.join(super::bench_rel(&spec.name));
+    let plan_file = dir.join("plan.json");
+    let plan: PlanDoc = serde_json::from_slice(
+        &std::fs::read(&plan_file).with_context(|| format!("reading {}", plan_file.display()))?,
+    )
+    .with_context(|| format!("reading {}", plan_file.display()))?;
+    let ex = super::local::Local::new(plan_file, plan.tasks.clone(), dir.join("local.log"))?;
+    let mut r = Runner::start(
+        &plan.tasks,
+        &spec,
+        plan.budget()?,
+        Box::new(ex),
+        LOCAL_PACE,
+        &dir,
+        out,
+    )?;
+    let code = r.finish(&dir, out, err)?;
+    // Its wrappers are gone before the scores are read.
+    drop(r);
+    if !super::stop::asked() {
+        let rel = super::bench_rel(&spec.name).display().to_string();
+        match super::gather::gather(&dir, &spec, &spec_key, &plan) {
+            Ok(g) => g.say(&rel, out, err)?,
+            Err(e) => writeln!(err, "warning: gathering: {e:#}")?,
+        }
+    }
+    Ok(code)
+}
+
+/// A run here needs the wrapper, which runs on Linux only.
+#[cfg(not(target_os = "linux"))]
+fn run_here(_: &Path, _: &mut dyn Write, _: &mut dyn Write) -> Result<i32> {
+    Err(usage(
+        "a run on this machine needs Linux (its wrapper does); use --on REMOTE",
+    ))
 }
 
 /// What starts the planning call's output when the cluster's install
@@ -280,8 +359,6 @@ impl Cluster<'_> {
             account: self.remote.account.clone(),
             max_array: 1000,
         };
-        let stages: Vec<&str> = spec.stages.iter().map(|s| s.name.as_str()).collect();
-        let wants = Want::of_plan(&plan.tasks, &stages)?;
         let budget = Budget {
             cores: CLUSTER_CORES,
             mem_gb: f64::from(CLUSTER_CORES) * 64.0,
@@ -294,19 +371,16 @@ impl Cluster<'_> {
             plan.tasks.clone(),
             plan.grace_secs,
         );
-        let pool = Pool::new(wants, budget)?;
-        let mut r = Runner {
-            skipped_said: vec![false; plan.tasks.len()],
-            tasks: &plan.tasks,
-            pool,
-            ex,
-            events: Events::open(local)?,
-            submitted: HashMap::new(),
-            started: Instant::now(),
-        };
-        r.resume(out)?;
-        let code = r.drive(err)?;
-        let code = summary(&r.pool, plan.tasks.len(), code, local, out)?;
+        let mut r = Runner::start(
+            &plan.tasks,
+            spec,
+            budget,
+            Box::new(ex),
+            CLUSTER_PACE,
+            local,
+            out,
+        )?;
+        let code = r.finish(local, out, err)?;
         // A run stopped by hand ends now; the next run gathers.
         if super::stop::asked() {
             return Ok(code);
@@ -372,7 +446,8 @@ impl Cluster<'_> {
 struct Runner<'a> {
     tasks: &'a [Task],
     pool: Pool,
-    ex: Slurm,
+    ex: Box<dyn Executor>,
+    pace: Pace,
     events: Events,
     /// When each task launched here was submitted, in seconds since 1970.
     submitted: HashMap<usize, f64>,
@@ -381,13 +456,48 @@ struct Runner<'a> {
     started: Instant,
 }
 
-impl Runner<'_> {
+impl<'a> Runner<'a> {
+    /// The runner of `tasks`, the plan of `spec`, within `budget`, by
+    /// `ex` at `pace`, its events kept in `dir`; what an earlier run left
+    /// resumed, as said on `out`.
+    fn start(
+        tasks: &'a [Task],
+        spec: &super::spec::Spec,
+        budget: Budget,
+        ex: Box<dyn Executor>,
+        pace: Pace,
+        dir: &Path,
+        out: &mut dyn Write,
+    ) -> Result<Self> {
+        let stages: Vec<&str> = spec.stages.iter().map(|s| s.name.as_str()).collect();
+        let pool = Pool::new(Want::of_plan(tasks, &stages)?, budget)?;
+        let mut r = Runner {
+            skipped_said: vec![false; tasks.len()],
+            tasks,
+            pool,
+            ex,
+            pace,
+            events: Events::open(dir)?,
+            submitted: HashMap::new(),
+            started: Instant::now(),
+        };
+        r.resume(out)?;
+        Ok(r)
+    }
+
+    /// Rounds until the pool is finished, then how it ended, said on
+    /// `out` (`dir` is where its events are): its exit code.
+    fn finish(&mut self, dir: &Path, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32> {
+        let code = self.drive(err)?;
+        summary(&self.pool, self.tasks.len(), code, dir, out)
+    }
+
     fn now(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
     }
 
-    /// What an earlier run left: tasks done reused, tasks still queued
-    /// adopted.
+    /// What an earlier run left, as the executor finds it: tasks done
+    /// reused, tasks still queued adopted.
     fn resume(&mut self, out: &mut dyn Write) -> Result<()> {
         let resumed = self.ex.resume()?;
         self.pool.resume(0, &resumed.done, &resumed.adopted)?;
@@ -421,11 +531,7 @@ impl Runner<'_> {
         loop {
             sleep_unless_stopped(wait, stopping);
             if super::stop::asked_times() > 1 {
-                writeln!(
-                    err,
-                    "stopped again: leaving now; tasks not seen to end may still run on \
-                     the cluster, and a run again adopts them"
-                )?;
+                writeln!(err, "stopped again: leaving now; {}", self.pace.leaving)?;
                 return Ok(Some(130));
             }
             // Checked after the wait, so nothing launches once a stop is
@@ -436,7 +542,7 @@ impl Runner<'_> {
             }
             let started = self.started;
             let mut clock = || started.elapsed().as_millis() as u64;
-            let round = round(&mut self.pool, &mut self.ex, &mut clock);
+            let round = round(&mut self.pool, self.ex.as_mut(), &mut clock);
             self.record(&round)?;
             // A round the cluster did not answer (a dropped connection) is
             // tried again: what it would have launched is pending again.
@@ -444,25 +550,27 @@ impl Runner<'_> {
                 failures += 1;
                 if failures >= MAX_FAILURES {
                     return Err(e.context(format!(
-                        "the cluster did not answer {MAX_FAILURES} rounds in a row; its tasks \
-                         keep running, and a run again adopts them"
+                        "the executor failed {MAX_FAILURES} rounds in a row; {}",
+                        self.pace.leaving
                     )));
                 }
                 writeln!(err, "warning: {e:#}; trying again")?;
-                wait = fixed.unwrap_or(WAIT_FIRST);
+                wait = fixed.unwrap_or(self.pace.first);
                 continue;
             }
             failures = 0;
-            if self.pool.running().next().is_none() {
+            // Not merely nothing running: a task held for memory (another
+            // job's, on a shared machine) waits for it.
+            if self.pool.finished() {
                 return Ok(stopping.then_some(130));
             }
             let changed = !round.ended.is_empty() || !round.launched.is_empty();
             wait = match fixed {
                 Some(f) => f,
                 // Stopped tasks end within the wrapper's stop grace.
-                None if stopping => WAIT_STOPPING,
-                None if changed => WAIT_FIRST,
-                None => (wait + WAIT_STEP).clamp(WAIT_FIRST, WAIT_MAX),
+                None if stopping => self.pace.stopping,
+                None if changed => self.pace.first,
+                None => (wait + self.pace.step).clamp(self.pace.first, self.pace.max),
             };
         }
     }

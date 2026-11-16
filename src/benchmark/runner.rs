@@ -34,8 +34,9 @@ pub const STOP_USAGE: &str = "\
 legume benchmark stop NAME
 
 Stops the runner of benchmark NAME that legume benchmark run --detach
-started: it is sent TERM, so it cancels its Slurm array tasks and ends,
-as Ctrl-C ends a run in a terminal. A run again resumes.";
+started: it is sent TERM, so it stops its tasks (its Slurm array tasks,
+on a cluster) and ends, as Ctrl-C ends a run in a terminal. A run again
+resumes.";
 
 /// Set in a detached runner's environment, to its `runner.json`: it notes
 /// there how it ended.
@@ -64,7 +65,9 @@ pub(crate) struct RunnerFile {
     /// When it started (RFC 3339).
     pub(crate) started: String,
     pub(crate) spec_key: String,
-    pub(crate) remote: String,
+    /// The remote it runs on; none for this machine.
+    #[serde(default)]
+    pub(crate) remote: Option<String>,
     /// Its exit code, once it ended.
     #[serde(default)]
     pub(crate) exit: Option<i32>,
@@ -95,7 +98,9 @@ impl std::fmt::Display for Refused {
                 f,
                 "benchmark {name} is running already, as pid {} (since {}, on {}): \
                  legume benchmark stop {name} stops it",
-                r.pid, r.started, r.remote
+                r.pid,
+                r.started,
+                place(r.remote.as_deref())
             ),
             Refused::UnknownRemote { on, file, .. } => {
                 write!(f, "no remote {on} in {}", file.display())
@@ -180,21 +185,33 @@ pub(crate) fn kept_remote(on: &str, ask: Option<&mut dyn Write>) -> Result<Remot
     }
 }
 
-/// `legume benchmark run SPEC --on ON`, run by this legume's own binary.
-pub(crate) fn run_command(spec_file: &Path, on: &str) -> Result<Command> {
+/// `legume benchmark run SPEC [--on ON]`, run by this legume's own
+/// binary: on remote `on`, or on this machine.
+pub(crate) fn run_command(spec_file: &Path, on: Option<&str>) -> Result<Command> {
     let mut cmd = crate::own_command(["benchmark", "run"])?;
-    cmd.arg(spec_file).arg("--on").arg(on);
+    cmd.arg(spec_file);
+    if let Some(on) = on {
+        cmd.arg("--on").arg(on);
+    }
     Ok(cmd)
 }
 
+/// Where a run goes, as said: remote `on`, or this machine.
+pub(crate) fn place(on: Option<&str>) -> &str {
+    on.unwrap_or(HERE)
+}
+
+/// How a run on this machine is named where a remote would be.
+pub(crate) const HERE: &str = "this machine";
+
 /// A detached start: the project, the spec's file (as the runner reads
-/// it), the spec read and its key, and the remote.
+/// it), the spec read and its key, and the remote (none: this machine).
 pub(crate) struct Detach<'a> {
     pub(crate) root: &'a Path,
     pub(crate) spec_file: &'a Path,
     pub(crate) spec: &'a Spec,
     pub(crate) spec_key: &'a str,
-    pub(crate) on: &'a str,
+    pub(crate) on: Option<&'a str>,
 }
 
 /// A runner started.
@@ -249,7 +266,9 @@ pub(crate) fn detach(
                 alive_path.display()
             )
         })?;
-    kept_remote(d.on, ask)?;
+    if let Some(on) = d.on {
+        kept_remote(on, ask)?;
+    }
     before()?;
     let log_path = dir.join(LOG_FILE);
     let mut log = std::fs::OpenOptions::new()
@@ -260,9 +279,9 @@ pub(crate) fn detach(
     let started = crate::project::rfc3339();
     writeln!(
         log,
-        "== {started}: legume benchmark run {} --on {}",
+        "== {started}: legume benchmark run {}{}",
         d.spec_file.display(),
-        d.on
+        d.on.map_or(String::new(), |on| format!(" --on {on}"))
     )?;
     let mut cmd = run_command(d.spec_file, d.on)?;
     cmd.current_dir(d.root)
@@ -283,21 +302,21 @@ pub(crate) fn detach(
         pid,
         started,
         spec_key: d.spec_key.to_string(),
-        remote: d.on.to_string(),
+        remote: d.on.map(str::to_string),
         exit: None,
         ended: None,
     };
     super::gather::write(&dir, RUNNER_FILE, crate::pretty(&file)?)?;
     Ok(Started {
         name: name.clone(),
-        on: d.on.to_string(),
+        on: place(d.on).to_string(),
         pid,
     })
 }
 
 /// `legume benchmark run SPEC --on ON --detach`, said on `out`: a refusal
 /// is the command's (exit 3).
-pub(super) fn detach_main(spec_file: &Path, on: &str, out: &mut dyn Write) -> Result<()> {
+pub(super) fn detach_main(spec_file: &Path, on: Option<&str>, out: &mut dyn Write) -> Result<()> {
     let text = std::fs::read_to_string(spec_file)
         .with_context(|| format!("reading {}", spec_file.display()))?;
     let (spec, value) = super::spec::parse(&text)?;
@@ -367,8 +386,8 @@ pub(crate) fn stop_runner(dir: &Path, name: &str) -> Result<String> {
         return Err(std::io::Error::last_os_error()).context(format!("stopping pid {pid}"));
     }
     Ok(format!(
-        "sent TERM to the runner of benchmark {name}, pid {pid}: it cancels its Slurm tasks, \
-         waits for them to stop, and ends (exit 130); its log is {}\n",
+        "sent TERM to the runner of benchmark {name}, pid {pid}: it stops its tasks, waits \
+         for them to stop, and ends (exit 130); its log is {}\n",
         bench_rel(name).join(LOG_FILE).display()
     ))
 }
@@ -422,11 +441,14 @@ mod tests {
 
     #[test]
     fn a_run_is_legume_benchmark_run_spec_on_remote() {
-        let cmd = run_command(Path::new("specs-in/N1.json"), "REMOTE1").unwrap();
+        let cmd = run_command(Path::new("specs-in/N1.json"), Some("REMOTE1")).unwrap();
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         assert_eq!(
             args,
             ["benchmark", "run", "specs-in/N1.json", "--on", "REMOTE1"]
         );
+        let here = run_command(Path::new("specs-in/N1.json"), None).unwrap();
+        let args: Vec<&std::ffi::OsStr> = here.get_args().collect();
+        assert_eq!(args, ["benchmark", "run", "specs-in/N1.json"]);
     }
 }

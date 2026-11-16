@@ -346,8 +346,6 @@ fn a_start_refuses_a_remote_it_does_not_know_with_how_to_add_it() {
     // Nothing went over ssh, and the spec was not kept.
     assert!(!w.root().join("state/ssh.log").exists());
     assert!(!w.project().join("specs-in/N1.json").exists());
-    let (text, error) = s.call("benchmark_start", json!({ "spec": spec() }));
-    assert!(error && text.contains("`on` is required"), "{text}");
 }
 
 /// `runner.json` in benchmark N1's folder, read, when it is there.

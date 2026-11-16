@@ -23,7 +23,7 @@
 //! Slurm 17.02 and later: no `--gpus`, and nothing run on the login node
 //! but bash, coreutils and Slurm's own commands.
 
-use super::executor::{Ended, Executor, TaskExit};
+use super::executor::{Ended, Executor, Resumed, TaskExit};
 use super::plan::Task;
 use super::pool::{Launch, Live, Outcome};
 use super::remote::Shell;
@@ -114,7 +114,7 @@ impl Slurm {
     /// is cancelled. The script is the same size for any number of
     /// tasks: one `find` at the tasks' depth under their common folder,
     /// and one `awk` that prints each file found.
-    pub fn resume(&mut self) -> Result<Resumed> {
+    fn resumed(&mut self) -> Result<Resumed> {
         let root = common_folder(self.tasks.iter().map(|t| t.dir.as_path()))
             .context("a plan with no tasks")?;
         let depths = self.tasks.iter().map(|t| {
@@ -372,15 +372,6 @@ pub fn srun(
     )
 }
 
-/// What [`Slurm::resume`] found.
-#[derive(Debug, Default, PartialEq)]
-pub struct Resumed {
-    /// Tasks done in an earlier run, with their key.
-    pub done: Vec<usize>,
-    /// Tasks of an earlier run still queued or running, now watched.
-    pub adopted: Vec<usize>,
-}
-
 /// `squeue` of the run's array jobs, each row a `q` line, or `qfail`.
 fn squeue_line(run: &str) -> String {
     format!(
@@ -399,6 +390,10 @@ fn shape(t: &Task) -> (u32, u64, u64) {
 const GROUP: &str = "@@group ";
 
 impl Executor for Slurm {
+    fn resume(&mut self) -> Result<Resumed> {
+        self.resumed()
+    }
+
     fn live(&mut self) -> Result<Live> {
         // The scheduler places memory; the cluster's disk is not watched.
         Ok(Live::default())
