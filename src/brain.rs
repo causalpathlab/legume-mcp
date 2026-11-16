@@ -243,8 +243,9 @@ fewer points) when the benchmark is large.
 6. Call `benchmark_start` and tell me plainly what is running and where. If it \
 refuses the remote, tell me what to add to my remotes.toml.
 7. Follow it with `benchmark_status` now and then; tell me of failures as they \
-come. Once it ends, show me summary.tsv and ask me what I see in it; record my \
-words in the notebook.";
+come. It runs on after this conversation ends; if I ask to stop it, call \
+`benchmark_stop`, and a start again resumes it. Once it ends, show me \
+summary.tsv and ask me what I see in it; record my words in the notebook.";
 
 const EXPLORE: &str = "\
 Let us explore a data set together, the way the legume guide says (its sections 4 and 13).

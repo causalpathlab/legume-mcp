@@ -420,7 +420,7 @@ fn children_usage() -> (f64, f64) {
 /// it ("memory allocation of N bytes failed"). Evidence only: a kill by
 /// Slurm for memory is not said here.
 fn oom_said(log: &Path) -> bool {
-    tail(log)
+    super::tail::tail(log, TAIL)
         .lines()
         .any(|l| l.contains("memory allocation of ") && l.ends_with(" bytes failed"))
 }
@@ -492,7 +492,7 @@ fn job_output() -> Option<(std::path::PathBuf, u64)> {
 /// attempt's part), that it ended the job for its memory: slurmstepd
 /// writes that there before it stops the job.
 fn slurm_said_oom(from: u64) -> bool {
-    job_output().is_some_and(|(path, _)| slurm_oom_in(&tail_from(&path, from)))
+    job_output().is_some_and(|(path, _)| slurm_oom_in(&super::tail::tail_from(&path, from, TAIL)))
 }
 
 /// Whether `text` has slurmstepd's word that a job went over its memory.
@@ -505,30 +505,8 @@ fn slurm_oom_in(text: &str) -> bool {
     })
 }
 
-/// The last 64 KiB of the file at `path`, as text; empty when it cannot
-/// be read.
-fn tail(path: &Path) -> String {
-    tail_from(path, 0)
-}
-
-/// The last 64 KiB of the file at `path` past byte `from`, as text; empty
-/// when it cannot be read.
-fn tail_from(path: &Path, from: u64) -> String {
-    use std::io::{Read, Seek, SeekFrom};
-    const TAIL: u64 = 64 << 10;
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return String::new();
-    };
-    let len = f.metadata().map_or(0, |m| m.len());
-    let mut tail = Vec::new();
-    if f.seek(SeekFrom::Start(len.saturating_sub(TAIL).max(from)))
-        .is_err()
-        || f.read_to_end(&mut tail).is_err()
-    {
-        return String::new();
-    }
-    String::from_utf8_lossy(&tail).into_owned()
-}
+/// How much of the end of a log is read for what it says.
+const TAIL: u64 = 64 << 10;
 
 #[cfg(test)]
 mod tests {
@@ -575,8 +553,17 @@ mod tests {
     fn a_tail_starts_past_what_an_earlier_attempt_wrote() {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("out.log");
-        std::fs::write(&f, "old: exceeded\nnew\n").unwrap();
-        assert_eq!(tail_from(&f, 14), "new\n");
-        assert_eq!(tail(&f), "old: exceeded\nnew\n");
+        std::fs::write(
+            &f,
+            "old: exceeded
+new
+",
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::tail::tail_from(&f, 14, TAIL),
+            "new
+"
+        );
     }
 }

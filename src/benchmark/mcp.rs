@@ -429,7 +429,7 @@ fn needs(s: &spec::Spec) -> String {
                 m.threads,
                 if m.threads == 1 { "" } else { "s" },
                 m.mem_gb,
-                duration(m.timeout_secs)
+                super::edit::duration_text(m.timeout_secs)
             );
             if m.gpus > 0 {
                 let _ = write!(out, ", {} GPUs", m.gpus);
@@ -439,22 +439,6 @@ fn needs(s: &spec::Spec) -> String {
             }
             let _ = writeln!(out, ", runs {}", m.tool_word());
         }
-    }
-    out
-}
-
-/// `secs` as the spec writes a duration: `4h`, `1h30m`, `45s`.
-fn duration(secs: u64) -> String {
-    let mut out = String::new();
-    let mut left = secs;
-    for (unit, n) in [("d", 86_400), ("h", 3600), ("m", 60), ("s", 1)] {
-        if left >= n {
-            let _ = write!(out, "{}{unit}", left / n);
-            left %= n;
-        }
-    }
-    if out.is_empty() {
-        out.push_str("0s");
     }
     out
 }
@@ -693,14 +677,6 @@ mod tests {
             ["benchmark", "run", "specs-in/N1.json", "--on", "REMOTE1"]
         );
         assert_eq!(cmd.get_current_dir(), Some(root));
-    }
-
-    #[test]
-    fn durations_read_as_the_spec_writes_them() {
-        assert_eq!(duration(4 * 3600), "4h");
-        assert_eq!(duration(5400), "1h30m");
-        assert_eq!(duration(45), "45s");
-        assert_eq!(duration(0), "0s");
     }
 
     #[test]
