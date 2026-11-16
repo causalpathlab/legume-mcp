@@ -462,7 +462,9 @@ fn oom_groups(path: &str) -> Vec<&str> {
         return vec![path];
     };
     // The job's group ends at the next `/`, or is the whole path.
-    let job_end = path[job + 1..].find('/').map_or(path.len(), |i| job + 1 + i);
+    let job_end = path[job + 1..]
+        .find('/')
+        .map_or(path.len(), |i| job + 1 + i);
     let mut groups = vec![path];
     let mut at = path;
     while at.len() > job_end {
