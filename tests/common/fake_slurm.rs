@@ -99,8 +99,10 @@ exec "$@"
 "#;
 
 const SRUN: &str = r#"#!/bin/bash
-# Stand-in srun: its options noted and dropped, the command run here.
+# Stand-in srun: its options noted and dropped, the command run here. It
+# reads its stdin, as srun does to pass it on.
 echo "$*" >> "$FAKE_SLURM/srun.log"
+cat > /dev/null
 while [ $# -gt 0 ]; do case $1 in --*=*) shift ;; *) break ;; esac; done
 exec "$@"
 "#;

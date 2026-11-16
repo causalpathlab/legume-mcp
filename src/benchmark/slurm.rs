@@ -347,7 +347,9 @@ fn task_files(out: &str, tasks: &[Task]) -> HashMap<usize, TaskFiles> {
 }
 
 /// `srun` of `command` on a compute node, as the run's job `run`, with
-/// one core and `mem_gb` of memory for at most `minutes`.
+/// one core and `mem_gb` of memory for at most `minutes`. Its stdin is
+/// none: srun passes its own on to the command, and a script fed to bash
+/// on stdin would lose its lines after it.
 pub fn srun(
     run: &str,
     partition: Option<&str>,
@@ -356,7 +358,8 @@ pub fn srun(
     command: &str,
 ) -> String {
     format!(
-        "srun --job-name={} --cpus-per-task=1 --mem={mem_gb}G --time={minutes}{} {command}",
+        "srun --job-name={} --cpus-per-task=1 --mem={mem_gb}G --time={minutes}{} {command} \
+         < /dev/null",
         quote(run),
         place_flags(partition, account)
     )
