@@ -75,7 +75,8 @@ pub fn here() -> Machine {
     }
 }
 
-/// This machine's host name.
+/// This machine's host name, as the wrapper says where a task ran.
+#[cfg(target_os = "linux")]
 pub(crate) fn host() -> Option<String> {
     uname().0
 }
