@@ -542,8 +542,8 @@ fn the_command_line_exits_by_what_went_wrong() {
             "one SPEC, not also S2.json",
         ),
         (
-            &["run", "S1.json"],
-            "unknown command run: benchmark has plan and task",
+            &["nope", "S1.json"],
+            "unknown command nope: benchmark has plan, run and task",
         ),
     ] {
         let o = p.legume(args);

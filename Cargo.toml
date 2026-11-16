@@ -1,6 +1,6 @@
 [package]
 name = "legume-mcp"
-version = "0.5.11"
+version = "0.5.12"
 edition = "2021"
 rust-version = "1.91"
 license = "MIT"
@@ -111,4 +111,8 @@ required-features = ["benchmark"]
 
 [[test]]
 name = "benchmark_slurm"
+required-features = ["benchmark"]
+
+[[test]]
+name = "benchmark_run"
 required-features = ["benchmark"]

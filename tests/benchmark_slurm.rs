@@ -11,79 +11,12 @@ use legume_mcp::benchmark::remote::Shell;
 use legume_mcp::benchmark::slurm::{Site, Slurm};
 #[path = "common/bench.rs"]
 mod bench;
+#[path = "common/fake_slurm.rs"]
+mod fake_slurm;
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-const SBATCH: &str = r#"#!/bin/bash
-# Stand-in sbatch: each array task runs at once, in the background. Each
-# queued array task is a folder q/<jid>_<i> holding its name, state and pid.
-S=$FAKE_SLURM
-echo "$*" >> "$S/sbatch.log"
-n=$(( $(cat "$S/submits" 2>/dev/null || echo 0) + 1 )); echo $n > "$S/submits"
-if [ -n "$FAKE_SLURM_FAIL_AT" ] && [ "$n" -ge "$FAKE_SLURM_FAIL_AT" ]; then
-  echo "sbatch: error: Batch job submission failed" >&2; exit 1
-fi
-for a in "$@"; do
-  case $a in
-    --job-name=*) name=${a#*=} ;;
-    --array=0-*) last=${a#--array=0-} ;;
-    --output=*) out=${a#*=} ;;
-    --wrap=*) wrap=${a#*=} ;;
-  esac
-done
-jid=$(( 100 + n ))
-for i in $(seq 0 "$last"); do
-  q="$S/q/${jid}_$i"
-  mkdir -p "$q"; echo "$name" > "$q/name"
-  if [ -n "$FAKE_SLURM_HOLD" ]; then echo PD > "$q/state"; continue; fi
-  echo R > "$q/state"
-  (
-    SLURM_ARRAY_TASK_ID=$i bash -c "$wrap" > "${out//%a/$i}" 2>&1 &
-    p=$!; echo $p > "$q/pid"; wait $p; rm -rf "$q"
-  ) > /dev/null 2>&1 &
-done
-echo "$jid"
-"#;
-
-const SQUEUE: &str = r#"#!/bin/bash
-# Stand-in squeue -h --name=NAME -o '%i %t'.
-S=$FAKE_SLURM
-echo "$*" >> "$S/squeue.log"
-for a in "$@"; do case $a in --name=*) name=${a#*=} ;; esac; done
-for q in "$S"/q/*; do
-  [ "$(cat "$q/name" 2>/dev/null)" = "$name" ] && echo "${q##*/} $(cat "$q/state")"
-done
-exit 0
-"#;
-
-const SCANCEL: &str = r#"#!/bin/bash
-# An array job's id cancels each of its tasks.
-S=$FAKE_SLURM
-echo "$*" >> "$S/scancel.log"
-for j in "$@"; do
-  case $j in *_*) pat=$j ;; *) pat="${j}_*" ;; esac
-  for q in "$S"/q/$pat; do
-    [ -d "$q" ] || continue
-    if [ -f "$q/pid" ]; then kill -TERM "$(cat "$q/pid")"; else rm -rf "$q"; fi
-  done
-done
-"#;
-
-const SSH: &str = r#"#!/bin/bash
-# Stand-in ssh: options and the target are noted and dropped, and the
-# command runs here.
-echo "$*" >> "$FAKE_SLURM/ssh.log"
-while [ $# -gt 0 ]; do
-  case $1 in
-    -o|-O) shift 2 ;;
-    --) shift; shift; break ;;
-    *) shift; break ;;
-  esac
-done
-exec "$@"
-"#;
 
 /// A benchmark's folder, its plan of stand-in tasks, and the stand-in
 /// Slurm commands.
@@ -95,17 +28,7 @@ struct Cluster {
 impl Cluster {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::create_dir_all(dir.path().join("state/q")).unwrap();
-        for (name, body) in [
-            ("sbatch", SBATCH),
-            ("squeue", SQUEUE),
-            ("scancel", SCANCEL),
-            ("ssh", SSH),
-        ] {
-            bench::write_exe(&bin.join(name), body);
-        }
+        fake_slurm::install(&dir.path().join("bin"), &dir.path().join("state"));
         Self {
             dir,
             plan: Vec::new(),
@@ -205,7 +128,8 @@ fn ends(s: &mut Slurm, n: usize) -> Vec<(usize, Outcome)> {
     let start = Instant::now();
     while all.len() < n {
         assert!(start.elapsed() < Duration::from_secs(20), "ended: {all:?}");
-        all.extend(s.poll(Duration::from_millis(100)).unwrap());
+        let ended = s.poll(Duration::from_millis(100)).unwrap();
+        all.extend(ended.into_iter().map(|e| (e.task, e.outcome)));
     }
     all.sort_by_key(|e| e.0);
     all
@@ -356,7 +280,7 @@ fn an_adopted_task_ends_by_its_exit_json() {
     std::fs::create_dir_all(&dir).unwrap();
     let exit = json!({
         "task": "T1", "key": "key-T1", "attempt": 1, "outcome": "done", "exit": 0,
-        "signal": null, "timed_out": false, "stopped": false, "oom": false, "secs": 1.0,
+        "signal": null, "timed_out": false, "stopped": false, "oom": false, "started": 1.0, "secs": 1.0,
         "cpu_secs": 0.5, "max_rss_mb": 3.0, "node": "NODE1",
     });
     std::fs::write(dir.join("exit.json"), exit.to_string()).unwrap();
@@ -392,4 +316,33 @@ fn the_ssh_shell_shares_one_connection() {
     assert!(calls[0].contains("ControlMaster=auto") && calls[0].contains("ControlPersist=10m"));
     assert!(calls[0].ends_with("-- HOST1 bash -s"), "{}", calls[0]);
     assert!(calls[1].contains("-O exit -- HOST1"), "{}", calls[1]);
+}
+
+#[test]
+fn resume_finds_done_tasks_by_key_and_adopts_queued_ones() {
+    let mut c = Cluster::new();
+    let ids: Vec<usize> = (1..=4)
+        .map(|n| c.task(&format!("T{n}"), "true", 1, 1.0, 30))
+        .collect();
+    let dir = |n: usize| c.root().join(format!("tasks/T{n}"));
+    for n in 1..=4 {
+        std::fs::create_dir_all(dir(n)).unwrap();
+    }
+    // T1 done with its key, T2 done with another; T3 queued; T4 placed
+    // but ended, so not adopted.
+    std::fs::write(dir(1).join("done.json"), r#"{"key": "key-T1"}"#).unwrap();
+    std::fs::write(dir(2).join("done.json"), r#"{"key": "old"}"#).unwrap();
+    for n in [3, 4] {
+        let placed = format!("{{\n  \"array_job_id\": \"77\", \"index\": {n}\n}}\n");
+        std::fs::write(dir(n).join("slurm.json"), placed).unwrap();
+        c.queue(&format!("77_{n}"), "PD");
+    }
+    std::fs::write(dir(4).join("exit.json"), "{}").unwrap();
+    let mut s = c.slurm(100);
+    let r = s.resume().unwrap();
+    assert_eq!(r.done, vec![ids[0]]);
+    assert_eq!(r.adopted, vec![ids[2]]);
+    // The adopted task is watched: cancelling it cancels its array task.
+    s.cancel(&[ids[2]]).unwrap();
+    assert_eq!(c.log("scancel.log").trim(), "77_3");
 }

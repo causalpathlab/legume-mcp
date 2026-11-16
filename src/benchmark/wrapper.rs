@@ -24,7 +24,6 @@ use serde_json::json;
 use std::io::Write;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 /// `legume benchmark task`'s usage.
 pub const USAGE: &str = "\
@@ -120,28 +119,6 @@ fn listed(list: &Path, index: Option<String>) -> Result<String> {
     }
 }
 
-/// The signal that stopped the wrapper, 0 until one does.
-static STOP: AtomicI32 = AtomicI32::new(0);
-
-extern "C" fn on_stop(signal: libc::c_int) {
-    STOP.store(signal, Ordering::SeqCst);
-}
-
-/// TERM, INT and HUP to the wrapper are noted in [`STOP`], for the wrapper
-/// to pass on to the tool; the tool's own handlers are reset by its exec.
-fn catch_stops() {
-    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-        // SAFETY: a handler that only stores to an atomic, installed with
-        // an empty mask.
-        unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = on_stop as extern "C" fn(libc::c_int) as usize;
-            libc::sigemptyset(&mut action.sa_mask);
-            libc::sigaction(signal, &action, std::ptr::null_mut());
-        }
-    }
-}
-
 /// How the tool ended.
 #[derive(Clone, Copy)]
 enum Status {
@@ -194,9 +171,10 @@ fn run(t: &Task, grace: Duration) -> Result<Option<(i32, String)>> {
         .with_context(|| format!("making {}", log_path.display()))?;
     // SAFETY: prctl with an integer argument, on this process only.
     unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
-    catch_stops();
+    super::stop::catch();
 
     let start = Instant::now();
+    let started = super::executor::unix_secs();
     let mut cmd = std::process::Command::new(first);
     cmd.args(rest)
         .envs(&t.env)
@@ -271,6 +249,7 @@ fn run(t: &Task, grace: Duration) -> Result<Option<(i32, String)>> {
         timed_out: end.timed_out,
         stopped: end.stopped,
         oom,
+        started,
         secs,
         cpu_secs,
         max_rss_mb,
@@ -347,7 +326,7 @@ fn watch(group: &mut Group, timeout: Duration, grace: Duration) -> Result<(bool,
     while !group.exited()? {
         reap_adopted(group.id());
         let now = Instant::now();
-        let term_by = if !stopped && STOP.load(Ordering::SeqCst) != 0 {
+        let term_by = if !stopped && super::stop::asked() {
             stopped = true;
             Some(now + grace.min(STOP_GRACE))
         } else if !timed_out && !stopped && now - start >= timeout {
