@@ -9,10 +9,13 @@
 //! What it leaves in the task's folder, each file written whole:
 //! `done.json` when the tool exited 0, before its timeout or a stop, and
 //! made every `makes` file, then
-//! `exit.json` always, so a reader that sees `exit.json` sees the end. A
+//! `exit.json` always ([`TaskExit`], its `outcome` the end the pool
+//! counts), so a reader that sees `exit.json` sees the end. A
 //! rerun clears both first and keeps the last log as `log.<attempt>`.
 
+use super::executor::TaskExit;
 use super::plan::Task;
+use super::pool::Outcome;
 use crate::command::{canonical_flags, failed, flag_pairs, required, usage, Flag};
 use crate::procgroup::Group;
 use anyhow::{Context, Result};
@@ -245,20 +248,34 @@ fn run(t: &Task, grace: Duration) -> Result<Option<(i32, String)>> {
         Status::Exit(c) => (Some(c), None),
         Status::Signal(s) => (None, Some(s)),
     };
-    let exit = json!({
-        "task": t.id,
-        "key": t.key,
-        "attempt": attempt,
-        "exit": exit,
-        "signal": signal,
-        "timed_out": end.timed_out,
-        "stopped": end.stopped,
-        "oom": oom_said(&log_path),
-        "secs": secs,
-        "cpu_secs": cpu_secs,
-        "max_rss_mb": max_rss_mb,
-        "node": super::machine::host().unwrap_or_default(),
-    });
+    let oom = oom_said(&log_path);
+    // Stopped, then timed out, then done, then out of memory, then failed.
+    let outcome = if end.stopped {
+        Outcome::Stopped
+    } else if end.timed_out {
+        Outcome::Timeout
+    } else if not_done.is_none() {
+        Outcome::Done
+    } else if oom {
+        Outcome::Oom
+    } else {
+        Outcome::Failed
+    };
+    let exit = TaskExit {
+        task: t.id.clone(),
+        key: t.key.clone(),
+        attempt,
+        outcome,
+        exit,
+        signal,
+        timed_out: end.timed_out,
+        stopped: end.stopped,
+        oom,
+        secs,
+        cpu_secs,
+        max_rss_mb,
+        node: super::machine::host().unwrap_or_default(),
+    };
     crate::job::replace(dir, "exit.json", crate::pretty(&exit)?.as_bytes())?;
     // A tool that exits 0 and is not done (its timeout, a stop, a makes
     // file not made) ends the wrapper with 1.

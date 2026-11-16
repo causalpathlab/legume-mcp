@@ -35,6 +35,7 @@
 
 use super::plan::Task;
 use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 /// Free memory kept beyond what running tasks may still grow by, in GB.
@@ -132,7 +133,8 @@ pub struct Launch {
 }
 
 /// How a task ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Outcome {
     Done,
     Failed,
