@@ -77,11 +77,11 @@ pub(crate) fn tools() -> Vec<ToolSpec> {
         .idempotent(),
         ToolSpec::new(
             "benchmark_start",
-            "Start a benchmark on a cluster: `legume benchmark run SPEC --on REMOTE --detach`, in the background, returning at once. The run goes on after this server ends. It plans on a compute node, then runs each task as a Slurm array task; tasks done in an earlier run are reused, so starting again resumes. Follow it with benchmark_status, stop it with benchmark_stop. A start while its runner is alive is refused. A remote not in remotes.toml is refused with how to add it: ask the person.",
+            "Start a benchmark, in the background, returning at once: with `on`, on that cluster (`legume benchmark run SPEC --on REMOTE --detach`: it plans on a compute node, then runs each task as a Slurm array task); without `on`, on this machine (planned here, its tasks within the cores and memory the spec books; Linux only). The run goes on after this server ends. Tasks done in an earlier run are reused, so starting again resumes. Follow it with benchmark_status, stop it with benchmark_stop. A start while its runner is alive is refused. A remote not in remotes.toml is refused with how to add it: ask the person.",
             json!({
                 "type": "object",
                 "properties": { "spec": spec, "on": on },
-                "required": ["spec", "on"],
+                "required": ["spec"],
             }),
         )
         .writes()
@@ -97,7 +97,7 @@ pub(crate) fn tools() -> Vec<ToolSpec> {
         .read_only(),
         ToolSpec::new(
             "benchmark_stop",
-            "Stop a benchmark's runner: it is sent TERM, so it cancels its Slurm array tasks, waits for them to stop and ends. Refused when no runner is alive. Ask the person first; benchmark_start again resumes it.",
+            "Stop a benchmark's runner: it is sent TERM, so it stops its tasks (its Slurm array tasks, on a cluster), waits for them to stop and ends. Refused when no runner is alive. Ask the person first; benchmark_start again resumes it.",
             json!({
                 "type": "object",
                 "properties": { "name": name },
@@ -133,10 +133,7 @@ pub(crate) fn call(name: &str, args: &Value, cx: &Call) -> Result<String> {
 /// for a live runner and the remote), the spec kept only once it goes
 /// ahead, and the run recorded.
 fn start(root: &Path, args: &Value, cx: &Call) -> Result<String> {
-    let on = args["on"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .context("`on` is required: the remote to run on, as remotes.toml names it")?;
+    let on = args["on"].as_str().filter(|s| !s.is_empty());
     let given = given_spec(root, &args["spec"])?;
     reported(&given)?;
     let d = runner::Detach {
@@ -159,12 +156,18 @@ fn start(root: &Path, args: &Value, cx: &Call) -> Result<String> {
         let line = p.guarded(&bare, &[summary]);
         p.script_step(&format!("{line}\n"), Some(&bare));
     }
+    let how = match on {
+        Some(_) => {
+            "It first plans on a compute node there (that waits in Slurm's queue), then runs \
+             each task as a Slurm array task"
+        }
+        None => "It plans here, then runs each task on this machine within what the spec books",
+    };
     Ok(format!(
-        "{}It first plans on a compute node there (that waits in Slurm's queue), then \
-         runs each task as a Slurm array task; tasks done before are reused. It goes on \
-         after this server ends. Follow it with benchmark_status {{\"name\": \"{}\"}}: \
-         events.tsv gets a row as each task starts and ends, and summary.tsv comes once it \
-         ends. benchmark_stop stops it; benchmark_start again resumes it.\n",
+        "{}{how}; tasks done before are reused. It goes on after this server ends. Follow it \
+         with benchmark_status {{\"name\": \"{}\"}}: events.tsv gets a row as each task starts \
+         and ends, and summary.tsv comes once it ends. benchmark_stop stops it; \
+         benchmark_start again resumes it.\n",
         started.said(),
         started.name
     ))
@@ -177,7 +180,9 @@ fn reworded(e: anyhow::Error) -> anyhow::Error {
         Some(runner::Refused::Running { name, runner: r }) => refuse(format!(
             "benchmark {name} is running already, as pid {} (since {}, on {}): follow it \
              with benchmark_status, or stop it with benchmark_stop",
-            r.pid, r.started, r.remote
+            r.pid,
+            r.started,
+            runner::place(r.remote.as_deref())
         )),
         Some(runner::Refused::UnknownRemote { on, file, known }) => {
             let known = if known.is_empty() {
@@ -334,7 +339,8 @@ fn planned_here(root: &Path, given: &Given) -> Result<String> {
             hinted(
                 e,
                 "A spec for a cluster names its tools and inputs there: call benchmark_plan \
-                 with `on`, the remote, to check it here; it is planned there when it starts.",
+                 with `on`, the remote, to check it here; it is planned there when it starts. \
+                 To run it on this machine instead, install its tools here first.",
             )
         } else {
             fix_hint(e)
@@ -564,7 +570,9 @@ fn status_text(rel: &Path, dir: &Path) -> String {
             let _ = writeln!(
                 out,
                 "runner: pid {}, on {}, started {}: {state}",
-                r.pid, r.remote, r.started
+                r.pid,
+                runner::place(r.remote.as_deref()),
+                r.started
             );
         }
         None => out.push_str("runner: none started with --detach (no runner.json)\n"),

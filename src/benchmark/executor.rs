@@ -30,8 +30,24 @@ pub struct TaskExit {
     pub node: String,
 }
 
+/// What an executor found of an earlier run, as [`Executor::resume`]
+/// says it.
+#[derive(Debug, Default, PartialEq)]
+pub struct Resumed {
+    /// Tasks done in an earlier run, with their key.
+    pub done: Vec<usize>,
+    /// Tasks of an earlier run still queued or running, now watched.
+    pub adopted: Vec<usize>,
+}
+
 /// Runs a plan's tasks, by their index in the plan.
 pub trait Executor {
+    /// What an earlier run of the plan left: the tasks done, reused, and
+    /// those still running, adopted. Nothing, for an executor that keeps
+    /// nothing between runs.
+    fn resume(&mut self) -> Result<Resumed> {
+        Ok(Resumed::default())
+    }
     /// The machine now. An executor whose scheduler places memory itself
     /// leaves `mem_available_gb` empty.
     fn live(&mut self) -> Result<Live>;

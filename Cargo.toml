@@ -118,6 +118,10 @@ name = "benchmark_run"
 required-features = ["benchmark"]
 
 [[test]]
+name = "benchmark_local"
+required-features = ["benchmark"]
+
+[[test]]
 name = "benchmark_mcp"
 required-features = ["benchmark"]
 

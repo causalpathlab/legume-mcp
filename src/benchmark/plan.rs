@@ -78,6 +78,18 @@ pub struct PlanDoc {
     #[serde(default)]
     pub dir: Option<PathBuf>,
     pub grace_secs: u64,
+    /// The cores it books (none before legume 0.5.17 noted them here).
+    #[serde(default)]
+    pub cores: u32,
+    /// The memory it books, GB.
+    #[serde(default)]
+    pub mem_gb: f64,
+    /// The GPU devices it books.
+    #[serde(default)]
+    pub gpus: Vec<u32>,
+    /// Tasks a GPU device holds at once.
+    #[serde(default)]
+    pub gpu_slots: u32,
     pub tasks: Vec<Task>,
 }
 
@@ -125,6 +137,21 @@ pub fn done_key(done_json: &[u8]) -> Option<String> {
 }
 
 impl PlanDoc {
+    /// The cores, memory and GPUs it books, as the pool takes them;
+    /// refused for a plan that books no cores (one made before legume
+    /// 0.5.17 noted them here).
+    pub fn budget(&self) -> anyhow::Result<super::pool::Budget> {
+        if self.cores == 0 {
+            anyhow::bail!("its plan.json books no cores: plan it again");
+        }
+        Ok(super::pool::Budget {
+            cores: self.cores,
+            mem_gb: self.mem_gb,
+            gpus: self.gpus.clone(),
+            gpu_slots: self.gpu_slots,
+        })
+    }
+
     /// Where task `t`'s files are under `base`: its folder in the plan,
     /// moved from where the plan was made (a cluster's folder) to `base`;
     /// none when the plan does not have it in its own.
