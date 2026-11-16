@@ -796,6 +796,7 @@ The result of exploring is **hypotheses**, not findings. Say so.
 | Key numbers (`facts`, flagged ones in `status`) and `inputs` for every step, in `INDEX.tsv` | New in legume-mcp 0.5.0; each tool adds its own numbers |
 | The day's slides: `report.pdf` (typeset by legume when built with `--features pdf`, nothing else to install) and `report.md`, figures in place, with the trail graph | New in legume-mcp 0.5.0 |
 | Recipes as MCP prompts on the `legume` server: `explore`, `triangulate` | New in legume-mcp 0.5.0 |
+| Benchmarks on a cluster from the `legume` server: `benchmark_plan`, `benchmark_start`, `benchmark_status`, `benchmark_stop`, the prompt `benchmark` and section `benchmark` | New in legume-mcp 0.5.16, with `--features benchmark` |
 | `next` hints in results ("Next, if the person agrees"); tool annotations (read-only, writes, destructive) | New in legume-mcp 0.5.0; the job tools give them, each tool adds its own |
 | Testing on outside data (section 9): `plan` and data-beans `import` | Available with 0.5.0 |
 | lupin `decided_by` on labelling decisions | Available |
@@ -909,6 +910,111 @@ notebook is the person's.
   alone. The aim of the work (section 1).
 - **Summary** (notebook kind): the person's account of the day: what changed,
   what argues against it, what is next.
+
+## Benchmark specs
+
+A benchmark runs every method on a grid of settings, several times each,
+and scores each run against a truth. The person says what to compare; the
+agent writes the spec, the JSON below, checks it with `benchmark_plan`,
+shows the person the plan, starts it with `benchmark_start` and follows it
+with `benchmark_status`, and stops it with `benchmark_stop` when the person
+asks. These tools are on the `legume` server when legume is built with
+`--features benchmark`. The same spec runs from a terminal: `legume
+benchmark plan SPEC`, `legume benchmark run SPEC --on REMOTE [--detach]`,
+`legume benchmark stop NAME`.
+
+**Words.** A *task* is one run: a grid point, a replicate, a stage and one
+of its methods. A *method* is one way to do a stage; a stage without
+methods is one method named after the stage. A *remote* is a cluster in the
+person's `remotes.toml`; it is theirs, so an agent never makes one up: when
+`benchmark_start` refuses a remote, tell the person what it says.
+
+**Fields** (a refusal names the field, as `stages[1].methods.M1.threads`):
+
+- `name` (required): the benchmark's folder, `results/benchmarks/<name>/`;
+  1 to 40 of `A-Z a-z 0-9 . _ -`.
+- `seeds` (required): `{"n": 3, "base": 1}` for replicates 1 to 3, their
+  seeds derived from `base`; or `{"list": [11, 12]}`, one replicate a seed.
+- `axes`: the grid, each axis a list of strings (`"0.1"`, not `0.1`). A
+  *tuple axis* lists objects, each a `label` and the names it binds:
+  `{"label": "high", "sd": "1"}` sets `{sd}` and names the point `high`.
+  The grid is every combination of the axes' values.
+- `exclude`: points to drop, each a partial point,
+  `{"n_cells": "500", "noise": "high"}` (a tuple axis by its label).
+- `inputs`: the files whose content enters each task's key, by name:
+  `{"ref": {"path": "data/ref.tsv"}}`, or `"dir": true` for a folder.
+  Paths are from the project (on a cluster, from its folder there).
+- `stages` (required, in order): each has a `name` and either `run` and
+  `makes`, or `methods`, an object of method name to its own `run` and
+  `makes`.
+  - `run`: the command as a list of words; the first is a tool on PATH, or
+    `{legume}`. Placeholders: an axis or binding (`{n_cells}`, `{sd}`),
+    `{rep}`, `{rep_seed}` (the replicate's seed, the same for every stage),
+    `{seed}` (the task's own), `{threads}`, `{method}`, `{out}` (the task's
+    folder), `{inputs.NAME}`, an earlier stage's folder (`{sim}`) and
+    `{glob:STAGE/PATTERN}`. A method reads only the same method of an
+    earlier stage that has methods.
+  - `makes`: the files the task writes in `{out}`; it is done when they are
+    there. The last stage of each method makes exactly one `*.score.tsv`
+    (columns `score`, `metric`, `value`, `part`), as `{legume} score` does.
+  - What a task books, on a stage or on one method (a method's own wins):
+    `threads` (1), `mem_gb` (0), `gpus` (0), `timeout` (`"30m"`, `"1h30m"`;
+    4h when not given), `max_running` (at most this many at once), `tool`
+    (the binary to find when `run[0]` is not it) and `snapshot` (true: the
+    tool is copied by its content into the benchmark's folder).
+- `compare`: pairs `["M1/estimate", "M2/estimate"]` (method/score) that
+  gather compares replicate by replicate, into `paired.tsv`.
+- `plot`: `{"x": AXIS, "facet": AXIS, "metrics": ["auprc"]}` for
+  `summary.svg`.
+- For a run here only: `cores`, `mem_gb`, `gpus` (ids), `gpu_slots`,
+  `grace_secs`, `max_hours`, `disk` (`{"min_free_gb": 10}`).
+
+**A small example**: 3 points (one excluded) x 3 replicates x 3 stage
+methods, 27 tasks.
+
+```json
+{
+  "name": "demo-1",
+  "axes": {
+    "n_cells": ["500", "2000"],
+    "noise": [{"label": "low", "sd": "0.1"}, {"label": "high", "sd": "1"}]
+  },
+  "exclude": [{"n_cells": "500", "noise": "high"}],
+  "seeds": {"n": 3, "base": 1},
+  "inputs": {"ref": {"path": "data/ref.tsv"}},
+  "stages": [
+    {"name": "sim", "threads": 2, "mem_gb": 4, "timeout": "30m",
+     "run": ["TOOL1", "simulate", "--cells", "{n_cells}", "--sd", "{sd}",
+             "--ref", "{inputs.ref}", "--seed", "{rep_seed}", "-o", "{out}/sim"],
+     "makes": ["sim.tsv"]},
+    {"name": "fit", "timeout": "1h",
+     "methods": {
+       "M1": {"threads": 4, "mem_gb": 8,
+              "run": ["TOOL2", "{sim}/sim.tsv", "-t", "{threads}", "--seed", "{seed}",
+                      "-o", "{out}/m.score.tsv"],
+              "makes": ["m.score.tsv"]},
+       "M2": {"max_running": 20,
+              "run": ["TOOL3", "{sim}/sim.tsv", "-o", "{out}/m.score.tsv"],
+              "makes": ["m.score.tsv"]}}}
+  ],
+  "compare": [["M1/estimate", "M2/estimate"]],
+  "plot": {"x": "n_cells", "facet": "noise", "metrics": ["auprc"]}
+}
+```
+
+**The flow.** `benchmark_plan {"spec": {...}, "on": "REMOTE1"}` keeps the
+spec in `specs-in/<name>.json`, checks it and says the tasks and what each
+books; without `on` it plans here, finding the tools on PATH. Show the
+person the counts and what each task books, and ask before starting.
+`benchmark_start {"spec": "specs-in/<name>.json", "on": "REMOTE1"}` returns
+at once; the run goes on in the background, after the server ends too
+(`runner.json` and `run.log` in the benchmark's folder): it plans on a
+compute node, then runs the tasks as Slurm array tasks. `benchmark_status
+{"name": "<name>"}` says whether the runner is alive, the tasks by state, the
+latest failures, the end of `run.log` and, once the run has gathered, the
+head of `summary.tsv`; poll it now and then, not in a tight loop.
+`benchmark_stop {"name": "<name>"}` cancels its tasks and ends it. Starting
+again resumes: done tasks are reused.
 
 ## References
 
