@@ -401,6 +401,42 @@ fn rusts_out_of_memory_message_is_evidence() {
     assert_eq!(read(&d2.join("exit.json"))["oom"], false);
 }
 
+/// Task `id` of `plan` run with its stdout appended to `out`, as Slurm
+/// gives a job's output.
+fn task_into(plan: &Path, id: &str, out: &Path) {
+    let file = std::fs::OpenOptions::new().append(true).open(out).unwrap();
+    wrapper(plan)
+        .args(["--task", id])
+        .env("JOB_OUT", out)
+        .stdout(file)
+        .status()
+        .unwrap();
+}
+
+#[test]
+fn slurms_memory_kill_is_out_of_memory_not_stopped() {
+    let mut b = Bench::new();
+    // As slurmstepd does: its word in the job's output, then TERM to the
+    // job (the wrapper, the tool's parent).
+    let d1 = b.task(
+        "C1",
+        "echo 'slurmstepd: error: Job 1 exceeded memory limit (2340 > 1024), being killed' >> \"$JOB_OUT\"; kill -TERM $PPID; sleep 5",
+        &[],
+        30,
+    );
+    let d2 = b.task("C2", "exit 1", &[], 30);
+    let plan = b.plan(5);
+    let out = b.root().join("job.log");
+    std::fs::write(&out, "").unwrap();
+    task_into(&plan, "C1", &out);
+    let exit = read(&d1.join("exit.json"));
+    assert_eq!(exit["outcome"], "oom", "{exit}");
+    assert_eq!(exit["oom"], true);
+    // The word an earlier attempt left in the output is not this one's.
+    task_into(&plan, "C2", &out);
+    assert_eq!(read(&d2.join("exit.json"))["outcome"], "failed");
+}
+
 #[test]
 fn a_stopped_task_gets_at_most_twenty_seconds_of_grace() {
     // The plan's grace is longer than Slurm's KillWait leaves: the tool,
