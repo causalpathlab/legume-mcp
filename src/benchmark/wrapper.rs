@@ -166,6 +166,7 @@ fn run(t: &Task, grace: Duration) -> Result<Option<(i32, String)>> {
     // Where this attempt's part of the job's output starts: Slurm appends
     // every attempt's to one file.
     let output_from = job_output().map_or(0, |(_, len)| len);
+    let oom_kills_before = oom_kills();
     let start = Instant::now();
     let started = super::executor::unix_secs();
     let mut cmd = std::process::Command::new(first);
@@ -194,14 +195,19 @@ fn run(t: &Task, grace: Duration) -> Result<Option<(i32, String)>> {
         }
     };
     let (cpu_secs, max_rss_mb) = children_usage();
-    // The tool said so, or Slurm did, in the job's own output (this
-    // wrapper's stdout), before it ended the job.
-    let slurm_oom = slurm_said_oom(output_from);
-    let oom = slurm_oom || oom_said(&log_path);
-    // Out of memory by Slurm's say, then stopped, then timed out, then
-    // done, then out of memory, then failed.
-    let (outcome, not_done) = if slurm_oom {
-        let why = "Slurm ended it for exceeding its memory".to_string();
+    // Ended for its memory: the kernel killed something in the job's
+    // memory group meanwhile, or Slurm said so in the job's own output
+    // (this wrapper's stdout); a tool that still exited 0 was not.
+    let memory_killed = status.code() != Some(0)
+        && (oom_kills()
+            .zip(oom_kills_before)
+            .is_some_and(|(now, before)| now > before)
+            || slurm_said_oom(output_from));
+    let oom = memory_killed || oom_said(&log_path);
+    // Ended for its memory, then stopped, then timed out, then done, then
+    // out of memory by the tool's say, then failed.
+    let (outcome, not_done) = if memory_killed {
+        let why = "ended for exceeding its memory".to_string();
         (Outcome::Oom, Some(why))
     } else if stopped {
         (Outcome::Stopped, Some("stopped".to_string()))
@@ -419,6 +425,61 @@ fn oom_said(log: &Path) -> bool {
         .any(|l| l.contains("memory allocation of ") && l.ends_with(" bytes failed"))
 }
 
+/// How many times the kernel has killed a process for memory in this
+/// process's memory group and its parents up to its Slurm job's (or only
+/// its own, outside Slurm), from cgroup v2's `memory.events` or v1's
+/// `memory.oom_control`; none when neither can be read.
+fn oom_kills() -> Option<u64> {
+    let groups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let (root, path) = groups.lines().find_map(|l| {
+        let mut parts = l.splitn(3, ':');
+        let (_, controllers, path) = (parts.next()?, parts.next()?, parts.next()?);
+        match controllers {
+            "" => Some(("/sys/fs/cgroup".to_string(), path)),
+            c if c.split(',').any(|c| c == "memory") => {
+                Some(("/sys/fs/cgroup/memory".to_string(), path))
+            }
+            _ => None,
+        }
+    })?;
+    let mut total = None;
+    for dir in oom_groups(path) {
+        let dir = Path::new(&root).join(dir.trim_start_matches('/'));
+        let text = std::fs::read_to_string(dir.join("memory.events"))
+            .or_else(|_| std::fs::read_to_string(dir.join("memory.oom_control")));
+        if let Some(n) = text.ok().as_deref().and_then(oom_kill_count) {
+            total = Some(total.unwrap_or(0) + n);
+        }
+    }
+    total
+}
+
+/// The memory groups whose kills count for a process in group `path`:
+/// it and its parents up to the one named for its Slurm job (`job_N`),
+/// or only it when none is.
+fn oom_groups(path: &str) -> Vec<&str> {
+    let mut groups = vec![path];
+    let mut at = path;
+    while let Some((parent, name)) = at.rsplit_once('/') {
+        if name.starts_with("job_") || parent.is_empty() {
+            break;
+        }
+        groups.push(parent);
+        at = parent;
+    }
+    if at.rsplit('/').next().is_some_and(|n| n.starts_with("job_")) {
+        groups
+    } else {
+        vec![path]
+    }
+}
+
+/// The `oom_kill` count in a `memory.events` or `memory.oom_control`.
+fn oom_kill_count(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("oom_kill ")?.trim().parse().ok())
+}
+
 /// The job's output file (this wrapper's stdout, when it is a file) and
 /// its length now.
 fn job_output() -> Option<(std::path::PathBuf, u64)> {
@@ -486,6 +547,28 @@ mod tests {
         assert!(!slurm_oom_in(
             "slurmstepd: error: *** JOB 1 CANCELLED ***\n"
         ));
+    }
+
+    #[test]
+    fn the_kernels_kills_count_up_to_the_slurm_job() {
+        assert_eq!(
+            oom_groups("/slurm/uid_1/job_2/step_batch/task_0"),
+            [
+                "/slurm/uid_1/job_2/step_batch/task_0",
+                "/slurm/uid_1/job_2/step_batch",
+                "/slurm/uid_1/job_2"
+            ]
+        );
+        assert_eq!(oom_groups("/user.slice/a.scope"), ["/user.slice/a.scope"]);
+        assert_eq!(
+            oom_kill_count("low 0\nhigh 0\nmax 3\noom 1\noom_kill 2\n"),
+            Some(2)
+        );
+        assert_eq!(
+            oom_kill_count("oom_kill_disable 0\nunder_oom 0\noom_kill 5\n"),
+            Some(5)
+        );
+        assert_eq!(oom_kill_count("oom_kill_disable 0\n"), None);
     }
 
     #[test]
