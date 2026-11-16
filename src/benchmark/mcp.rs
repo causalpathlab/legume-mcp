@@ -43,6 +43,9 @@ const SUMMARY_LINES: usize = 10;
 /// Lines of `run.log` a status shows, the last.
 const LOG_LINES: usize = 8;
 
+/// The most of `run.log` a status reads, from its end, in bytes.
+const LOG_READ: u64 = 64 * 1024;
+
 /// The most a status shows of one line, in bytes.
 const LINE_MAX: usize = 160;
 
@@ -132,42 +135,75 @@ pub(crate) fn call(name: &str, args: &Value, cx: &Call) -> Result<String> {
     Ok(clip(&said, REPLY_MAX))
 }
 
-/// `benchmark_start`: the run detached, the spec and the run recorded.
+/// `benchmark_start`: the run detached ([`runner::detach`], which checks
+/// for a live runner and the remote), the spec kept only once it goes
+/// ahead, and the run recorded.
 fn start(root: &Path, args: &Value, cx: &Call) -> Result<String> {
     let on = args["on"]
         .as_str()
         .filter(|s| !s.is_empty())
         .context("`on` is required: the remote to run on, as remotes.toml names it")?;
-    let given = given_spec(root, &args["spec"], cx)?;
+    let given = given_spec(root, &args["spec"])?;
     plan::check(&given.spec).map_err(fix_hint)?;
-    known_remote(on)?;
-    let name = &given.spec.name;
-    let rel = bench_rel(name);
-    if let Some(r) = runner::live(&root.join(&rel)) {
-        return Err(refuse(format!(
-            "benchmark {name} is running already, as pid {} (since {}, on {}): follow it \
-             with benchmark_status, or stop it with benchmark_stop",
-            r.pid, r.started, r.remote
-        )));
-    }
-    let exe = crate::own_exe().context("finding this server's binary")?;
-    let mut detached = run_command(Command::new(&exe), root, &given.rel, on);
-    detached.arg("--detach");
-    let said = cx.run_reading(detached)?;
+    let d = runner::Detach {
+        root,
+        spec_file: &given.file,
+        text: &given.text,
+        on,
+    };
+    let started = runner::detach(&d, None, &mut || keep(&given, cx)).map_err(reworded)?;
     // The driver script repeats the run in the foreground, skipped once
     // it has gathered.
     if let Some(p) = &cx.records {
-        let bare = p.command(&run_command(Command::new(&exe), root, &given.rel, on));
-        let line = p.guarded(&bare, &[root.join(&rel).join("summary.tsv")]);
+        let exe = crate::own_exe().context("finding this server's binary")?;
+        let bare = p.command(&run_command(Command::new(exe), root, &given.rel, on));
+        let summary = root.join(bench_rel(&started.name)).join("summary.tsv");
+        let line = p.guarded(&bare, &[summary]);
         p.script_step(&format!("{line}\n"), Some(&bare));
     }
     Ok(format!(
-        "{said}It first plans on a compute node there (that waits in Slurm's queue), then \
+        "{}It first plans on a compute node there (that waits in Slurm's queue), then \
          runs each task as a Slurm array task; tasks done before are reused. It goes on \
-         after this server ends. Follow it with benchmark_status {{\"name\": \"{name}\"}}: \
+         after this server ends. Follow it with benchmark_status {{\"name\": \"{}\"}}: \
          events.tsv gets a row as each task starts and ends, and summary.tsv comes once it \
-         ends. benchmark_stop stops it; benchmark_start again resumes it.\n"
+         ends. benchmark_stop stops it; benchmark_start again resumes it.\n",
+        started.said(),
+        started.name
     ))
+}
+
+/// A refusal of [`runner::detach`], in an agent's words; any other error
+/// as it is.
+fn reworded(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast_ref::<runner::Refused>() {
+        Some(runner::Refused::Running { name, runner: r }) => refuse(format!(
+            "benchmark {name} is running already, as pid {} (since {}, on {}): follow it \
+             with benchmark_status, or stop it with benchmark_stop",
+            r.pid, r.started, r.remote
+        )),
+        Some(runner::Refused::UnknownRemote { on, file, known }) => {
+            let known = if known.is_empty() {
+                "it names none".to_string()
+            } else {
+                format!("it names {}", known.join(", "))
+            };
+            refuse(format!(
+                "no remote {on} in {} ({known}). A remote is the person's own, and is not \
+                 asked for over MCP. Ask them to run `legume benchmark run SPEC --on {on}` \
+                 once in a terminal, which asks for it and keeps it, or to add it to that \
+                 file:\n\n\
+                 [{on}]\n\
+                 ssh = \"HOST1\"           # a host or an alias from ~/.ssh/config\n\
+                 folder = \"/abs/folder\"  # on the cluster, for benchmarks\n\
+                 bin = \"/abs/prefix/bin\" # legume's tools there; leave out when on PATH\n\
+                 partition = \"PART1\"     # optional\n\
+                 account = \"ACCT1\"       # optional\n\n\
+                 then call again.",
+                file.display()
+            ))
+        }
+        None => e,
+    }
 }
 
 /// Benchmark `name`'s folder, from the project and under `root`; refused
@@ -195,39 +231,36 @@ fn project_root(cx: &Call) -> Result<PathBuf> {
     }
 }
 
-/// A spec a call gives: its file, from the project and absolute, the
-/// spec read, and its key.
+/// A spec a call gives: its file, from the project and absolute, its
+/// text, the spec read, its key, and whether it was given as JSON (and is
+/// to be kept in its file, [`keep`]).
 struct Given {
     rel: PathBuf,
     file: PathBuf,
+    text: String,
     spec: spec::Spec,
     key: String,
+    given_as_json: bool,
 }
 
-/// The spec `v` a call gives, in the project at `root`: a JSON object,
-/// kept in `specs-in/<name>.json` (and in the driver script), or the path
-/// of a spec file, from the project.
-fn given_spec(root: &Path, v: &Value, cx: &Call) -> Result<Given> {
-    let read = |text: &str| spec::parse(text).map_err(fix_hint);
-    let (rel, (spec, value)) = match v {
+/// The spec `v` a call gives, in the project at `root`: a JSON object, for
+/// `specs-in/<name>.json`, or the path of a spec file inside the project.
+fn given_spec(root: &Path, v: &Value) -> Result<Given> {
+    let (rel, text, given_as_json) = match v {
         Value::Object(_) => {
             let text = format!("{}\n", serde_json::to_string_pretty(v)?);
-            let parsed = read(&text)?;
-            let rel = Path::new(SPECS_IN).join(format!("{}.json", parsed.0.name));
-            let folder = root.join(SPECS_IN);
-            std::fs::create_dir_all(&folder)
-                .with_context(|| format!("making {}", folder.display()))?;
-            cx.write_file(&root.join(&rel), &text)?;
-            (rel, parsed)
+            let (s, _) = spec::parse(&text).map_err(fix_hint)?;
+            (
+                Path::new(SPECS_IN).join(format!("{}.json", s.name)),
+                text,
+                true,
+            )
         }
         Value::String(p) if !p.is_empty() => {
-            let file = root.join(p);
-            let text =
-                std::fs::read_to_string(&file).with_context(|| format!("reading the spec {p}"))?;
-            let rel = file
-                .strip_prefix(root)
-                .map_or(file.clone(), Path::to_path_buf);
-            (rel, read(&text)?)
+            let rel = inside(root, p)?;
+            let text = std::fs::read_to_string(root.join(&rel))
+                .with_context(|| format!("reading the spec {p}"))?;
+            (rel, text, false)
         }
         _ => {
             return Err(refuse(
@@ -235,12 +268,43 @@ fn given_spec(root: &Path, v: &Value, cx: &Call) -> Result<Given> {
             ))
         }
     };
+    let (spec, value) = spec::parse(&text).map_err(fix_hint)?;
     Ok(Given {
         file: root.join(&rel),
         rel,
+        text,
         spec,
         key: key::key(key::spec_file(&value).as_bytes()),
+        given_as_json,
     })
+}
+
+/// The spec file `p` from the project at `root`, resolved: refused when it
+/// is not there or not inside the project.
+fn inside(root: &Path, p: &str) -> Result<PathBuf> {
+    let real_root = root
+        .canonicalize()
+        .with_context(|| format!("resolving {}", root.display()))?;
+    let real = root
+        .join(p)
+        .canonicalize()
+        .map_err(|e| refuse(format!("spec: {p}: {e}")))?;
+    match real.strip_prefix(&real_root) {
+        Ok(rel) => Ok(rel.to_path_buf()),
+        Err(_) => Err(refuse(format!(
+            "spec: {p} is not inside the project; give a spec file in it, or the spec as JSON"
+        ))),
+    }
+}
+
+/// A spec given as JSON, kept in its file (and in the driver script).
+fn keep(given: &Given, cx: &Call) -> Result<()> {
+    if !given.given_as_json {
+        return Ok(());
+    }
+    let folder = given.file.parent().context("a spec file's folder")?;
+    std::fs::create_dir_all(folder).with_context(|| format!("making {}", folder.display()))?;
+    cx.write_file(&given.file, &given.text)
 }
 
 /// A refusal of the spec, with what to do: fix the field it names.
@@ -258,7 +322,8 @@ fn hinted(e: anyhow::Error, hint: &str) -> anyhow::Error {
 
 /// `benchmark_plan`.
 fn plan_tool(root: &Path, args: &Value, cx: &Call) -> Result<String> {
-    let given = given_spec(root, &args["spec"], cx)?;
+    let given = given_spec(root, &args["spec"])?;
+    keep(&given, cx)?;
     match args["on"].as_str().filter(|s| !s.is_empty()) {
         Some(on) => checked(&given, on),
         None => planned_here(root, &given),
@@ -397,31 +462,7 @@ fn duration(secs: u64) -> String {
 /// Remote `on`, as remotes.toml has it; else the refusal that says how a
 /// person adds it, which a call over MCP cannot ask them for.
 fn known_remote(on: &str) -> Result<remote::Remote> {
-    let file = remote::config_file()
-        .ok_or_else(|| refuse("no config folder for remotes.toml: set HOME, or LEGUME_REMOTES"))?;
-    let all = remote::read(&file)?;
-    if let Some(r) = all.iter().find(|r| r.name == on) {
-        return Ok(r.clone());
-    }
-    let names: Vec<&str> = all.iter().map(|r| r.name.as_str()).collect();
-    let known = if names.is_empty() {
-        "it names none".to_string()
-    } else {
-        format!("it names {}", names.join(", "))
-    };
-    Err(refuse(format!(
-        "no remote {on} in {} ({known}). A remote is the person's own, and is not asked \
-         for over MCP. Ask them to run `legume benchmark run SPEC --on {on}` once in a \
-         terminal, which asks for it and keeps it, or to add it to that file:\n\n\
-         [{on}]\n\
-         ssh = \"HOST1\"           # a host or an alias from ~/.ssh/config\n\
-         folder = \"/abs/folder\"  # on the cluster, for benchmarks\n\
-         bin = \"/abs/prefix/bin\" # legume's tools there; leave out when on PATH\n\
-         partition = \"PART1\"     # optional\n\
-         account = \"ACCT1\"       # optional\n\n\
-         then call again.",
-        file.display()
-    )))
+    runner::kept_remote(on, None).map_err(reworded)
 }
 
 /// The command `benchmark_start` runs: `legume`, as `exe` runs it, with
@@ -464,7 +505,7 @@ fn status_text(rel: &Path, dir: &Path) -> String {
                     "ended {}, exit {code}",
                     r.ended.as_deref().unwrap_or("at a time not noted")
                 ),
-                None if runner::alive(r.pid) => "alive".to_string(),
+                None if runner::alive(&r) => "alive".to_string(),
                 None => "gone, without noting how it ended (see run.log)".to_string(),
             };
             let _ = writeln!(
@@ -481,7 +522,8 @@ fn status_text(rel: &Path, dir: &Path) -> String {
         .map(|p| p.tasks.into_iter().map(|t| t.id).collect());
     let events = std::fs::read_to_string(dir.join("events.tsv")).unwrap_or_default();
     let mut latest: BTreeMap<String, &'static str> = BTreeMap::new();
-    // Each failure: its task and what to say of it.
+    // Each task's latest failure: the task and what to say of it, in the
+    // order they failed.
     let mut failures: Vec<(String, String)> = Vec::new();
     let mut lines = events.lines();
     let head: Vec<&str> = lines.next().unwrap_or_default().split('\t').collect();
@@ -510,6 +552,7 @@ fn status_text(rel: &Path, dir: &Path) -> String {
             if !get(node).is_empty() {
                 let _ = write!(f, ", on {}", get(node));
             }
+            failures.retain(|(t, _)| t != id);
             failures.push((id.to_string(), f));
         }
     }
@@ -545,7 +588,7 @@ fn status_text(rel: &Path, dir: &Path) -> String {
     } else {
         let _ = writeln!(out, "tasks {total}: {}", said.join(", "));
     }
-    // A failure is listed while its task's latest event is a failure.
+    // A task's failure is listed while its latest event is a failure.
     let still: Vec<&String> = failures
         .iter()
         .filter(|(id, _)| latest.get(id) == Some(&"failed"))
@@ -580,7 +623,8 @@ fn status_text(rel: &Path, dir: &Path) -> String {
         }
         Err(_) => out.push_str("summary.tsv: not yet (a run gathers it at its end)\n"),
     }
-    if let Ok(log) = std::fs::read_to_string(dir.join(runner::LOG_FILE)) {
+    let log = super::tail::tail(&dir.join(runner::LOG_FILE), LOG_READ);
+    if !log.is_empty() {
         let _ = writeln!(out, "{}, the last lines:", runner::LOG_FILE);
         for l in tail(&log, LOG_LINES) {
             let _ = writeln!(out, "  {}", clip(l, LINE_MAX));
@@ -677,6 +721,8 @@ mod tests {
             "T2\tA.r1.sim\t1\tdone\t1.0\t0.5\t0.1\tNODE1",
             "T3\tA.r1.score\t\tstart\t\t\t\t",
             "T4\tA.r1.score\t1\tfailed\t1.0\t0.5\t0.1\tNODE1",
+            "T4b\tA.r1.score\t\tstart\t\t\t\t",
+            "T4c\tA.r1.score\t2\tfailed\t1.0\t0.5\t0.1\tNODE1",
             "T5\tB.r1.sim\t\tstart\t\t\t\t",
             "T6\tB.r1.sim\t1\toom\t1.0\t0.5\t0.1\tNODE1",
             "T7\tB.r1.sim\t\tstart\t\t\t\t",
@@ -696,11 +742,14 @@ mod tests {
             ),
             "{said}"
         );
-        // B's out-of-memory attempt was retried, so only A's score failed.
+        // B's out-of-memory attempt was retried, so only A's score failed,
+        // listed once, by its latest failure.
+        assert!(said.contains("failed, latest 1 of 1:\n"), "{said}");
         assert!(
-            said.contains("T4 A.r1.score failed, attempt 1, on NODE1"),
+            said.contains("T4c A.r1.score failed, attempt 2, on NODE1"),
             "{said}"
         );
+        assert!(!said.contains("attempt 1"), "{said}");
         assert!(!said.contains("B.r1.sim oom"), "{said}");
         assert!(
             said.contains("runner: none started with --detach"),

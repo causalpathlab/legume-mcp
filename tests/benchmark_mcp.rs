@@ -194,6 +194,16 @@ fn a_refused_spec_names_the_field_to_fix() {
     // Not a spec at all.
     let (text, error) = s.call("benchmark_plan", json!({ "spec": 7 }));
     assert!(error && text.contains("`spec` is required"), "{text}");
+    // A spec file outside the project, by `..` or by an absolute path.
+    std::fs::write(w.root().join("outside.json"), SPEC).unwrap();
+    let outside = w.root().join("outside.json");
+    for p in ["../outside.json", outside.to_str().unwrap()] {
+        let (text, error) = s.call("benchmark_plan", json!({ "spec": p, "on": "REMOTE1" }));
+        assert!(
+            error && text.contains("is not inside the project"),
+            "{text}"
+        );
+    }
 }
 
 #[test]
@@ -321,8 +331,9 @@ fn a_start_refuses_a_remote_it_does_not_know_with_how_to_add_it() {
         text.contains("legume benchmark run SPEC --on REMOTE2"),
         "{text}"
     );
-    // Nothing went over ssh.
+    // Nothing went over ssh, and the spec was not kept.
     assert!(!w.root().join("state/ssh.log").exists());
+    assert!(!w.project().join("specs-in/N1.json").exists());
     let (text, error) = s.call("benchmark_start", json!({ "spec": spec() }));
     assert!(error && text.contains("`on` is required"), "{text}");
 }
@@ -411,10 +422,15 @@ fn a_stop_ends_a_live_run_and_its_tasks() {
         json!({ "spec": spec(), "on": "REMOTE1" }),
     );
     assert!(!error, "{text}");
-    // A second start while it is alive is refused.
-    let (text, error) = s.call(
-        "benchmark_start",
-        json!({ "spec": "specs-in/N1.json", "on": "REMOTE1" }),
+    // A second start while it is alive is refused, and leaves the spec
+    // the run came from as it is.
+    let kept = std::fs::read(w.project().join("specs-in/N1.json")).unwrap();
+    let mut other = spec();
+    other["seeds"]["n"] = json!(3);
+    let (text, error) = s.call("benchmark_start", json!({ "spec": other, "on": "REMOTE1" }));
+    assert_eq!(
+        std::fs::read(w.project().join("specs-in/N1.json")).unwrap(),
+        kept
     );
     assert!(
         error && text.contains("is running already, as pid"),

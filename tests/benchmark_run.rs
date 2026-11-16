@@ -1,5 +1,5 @@
 #![cfg(target_os = "linux")]
-//! `legume benchmark run SPEC --on R1`, end to end against stand-in ssh,
+//! `legume benchmark run SPEC --on REMOTE1`, end to end against stand-in ssh,
 //! srun, sbatch, squeue and scancel, with a "cluster" folder beside the
 //! project: the spec planned there, each task run by the real wrapper,
 //! the events kept here, and a run again resuming. Every task here lasts
@@ -76,11 +76,11 @@ printf 'score\tmetric\tvalue\tpart\nt\tauprc\t%s\tall\n' "$s" > "$o""#,
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// Remote R1 kept in remotes.toml.
+    /// Remote REMOTE1 kept in remotes.toml.
     fn with_remote(self) -> Self {
         std::fs::create_dir_all(self.remotes().parent().unwrap()).unwrap();
         let toml = format!(
-            "[R1]\nssh = \"HOST1\"\nfolder = \"{}\"\nbin = \"{}\"\npartition = \"PART1\"\n",
+            "[REMOTE1]\nssh = \"HOST1\"\nfolder = \"{}\"\nbin = \"{}\"\npartition = \"PART1\"\n",
             self.cluster().display(),
             self.tools().display()
         );
@@ -89,7 +89,7 @@ printf 'score\tmetric\tvalue\tpart\nt\tauprc\t%s\tall\n' "$s" > "$o""#,
     }
 
     fn command(&self) -> Command {
-        self.legume(&["benchmark", "run", "spec.json", "--on", "R1"])
+        self.legume(&["benchmark", "run", "spec.json", "--on", "REMOTE1"])
     }
 
     /// legume with `args`, in the project, against the stand-ins.
@@ -265,10 +265,10 @@ fn a_new_remote_is_asked_for_and_kept() {
     assert!(o.status.success(), "{}", said(&o));
     let kept = std::fs::read_to_string(w.remotes()).unwrap();
     assert!(
-        kept.starts_with("[R1]\nssh = \"HOST1\"\n") && !kept.contains("partition"),
+        kept.starts_with("[REMOTE1]\nssh = \"HOST1\"\n") && !kept.contains("partition"),
         "{kept}"
     );
-    assert!(said(&o).contains("kept remote R1"));
+    assert!(said(&o).contains("kept remote REMOTE1"));
 }
 
 #[test]
@@ -330,7 +330,7 @@ fn ctrl_c_cancels_the_runs_tasks() {
 fn install_submits_one_job_with_this_legume_and_not_while_one_is_queued() {
     let w = World::new(MAKES_SIM).with_remote();
     let install = || {
-        w.legume(&["benchmark", "install", "--on", "R1"])
+        w.legume(&["benchmark", "install", "--on", "REMOTE1"])
             .stdin(Stdio::null())
             .output()
             .unwrap()
@@ -404,11 +404,11 @@ fn install_wants_bin_to_be_an_install_prefixs() {
     std::fs::create_dir_all(w.remotes().parent().unwrap()).unwrap();
     std::fs::write(
         w.remotes(),
-        "[R1]\nssh = \"HOST1\"\nfolder = \"/x\"\nbin = \"/x/tools\"\n",
+        "[REMOTE1]\nssh = \"HOST1\"\nfolder = \"/x\"\nbin = \"/x/tools\"\n",
     )
     .unwrap();
     let o = w
-        .legume(&["benchmark", "install", "--on", "R1"])
+        .legume(&["benchmark", "install", "--on", "REMOTE1"])
         .stdin(Stdio::null())
         .output()
         .unwrap();
@@ -434,7 +434,7 @@ fn a_cluster_legume_of_another_version_is_refused() {
     assert_eq!(o.status.code(), Some(3), "{}", said(&o));
     let s = said(&o);
     assert!(s.contains("the cluster's legume is 0.0.1"), "{s}");
-    assert!(s.contains("legume benchmark install --on R1"), "{s}");
+    assert!(s.contains("legume benchmark install --on REMOTE1"), "{s}");
     assert_eq!(w.log("sbatch.log"), "");
 }
 
@@ -503,12 +503,12 @@ fn a_detached_run_returns_at_once_and_stop_cancels_its_tasks() {
     assert!(started.elapsed() < Duration::from_secs(10));
     let s = said(&o);
     assert!(
-        s.contains("started benchmark N1 on R1 in the background, as pid "),
+        s.contains("started benchmark N1 on REMOTE1 in the background, as pid "),
         "{s}"
     );
     assert!(s.contains("log: results/benchmarks/N1/run.log"), "{s}");
     let r = runner_json(&w).unwrap();
-    assert_eq!(r["remote"], "R1");
+    assert_eq!(r["remote"], "REMOTE1");
     assert_eq!(r["spec_key"].as_str().unwrap().len(), 32);
     assert!(r["exit"].is_null(), "{r}");
     // Another, while it is alive, is refused.
@@ -560,7 +560,7 @@ fn a_detached_run_returns_at_once_and_stop_cancels_its_tasks() {
     assert_eq!(cancelled.split_whitespace().count(), 2, "{cancelled}");
     assert_eq!(w.count("stopped"), 2);
     let log = std::fs::read_to_string(w.project().join("results/benchmarks/N1/run.log")).unwrap();
-    assert!(log.contains("planning N1 on R1"), "{log}");
+    assert!(log.contains("planning N1 on REMOTE1"), "{log}");
     assert!(log.contains("the run ended, exit 130"), "{log}");
     // Nothing is left to stop.
     let o = w.legume(&["benchmark", "stop", "N1"]).output().unwrap();
@@ -570,4 +570,36 @@ fn a_detached_run_returns_at_once_and_stop_cancels_its_tasks() {
         "{}",
         said(&o)
     );
+}
+
+#[test]
+fn a_detached_run_refused_at_once_still_notes_its_exit() {
+    let w = World::new(MAKES_SIM).with_remote();
+    let spec = SPEC.replace(
+        r#""makes": ["sim.tsv"]"#,
+        r#""makes": ["sim.tsv"], "gpus": 1"#,
+    );
+    std::fs::write(
+        w.project().join("spec.json"),
+        spec.replace(r#""seeds""#, r#""gpus": [0], "seeds""#),
+    )
+    .unwrap();
+    let o = w
+        .command()
+        .arg("--detach")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", said(&o));
+    let start = Instant::now();
+    let exit = loop {
+        if let Some(code) = runner_json(&w).and_then(|r| r["exit"].as_i64()) {
+            break code;
+        }
+        assert!(start.elapsed() < Duration::from_secs(30), "no exit noted");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(exit, 3);
+    let log = std::fs::read_to_string(w.project().join("results/benchmarks/N1/run.log")).unwrap();
+    assert!(log.contains("wants GPUs"), "{log}");
 }

@@ -27,6 +27,7 @@ pub mod slurm;
 pub mod spec;
 #[cfg(unix)]
 mod stop;
+pub(crate) mod tail;
 pub mod tools;
 #[cfg(target_os = "linux")]
 pub mod wrapper;
