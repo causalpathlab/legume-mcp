@@ -7,6 +7,8 @@
 //! the [`wrapper`], as a compute node runs it.
 
 pub mod executor;
+#[cfg(unix)]
+pub mod install;
 pub mod key;
 pub mod machine;
 pub mod plan;
@@ -44,7 +46,8 @@ benchmark's folder, from where it runs.
 It writes results/benchmarks/<name>/ in the project:
 
   specs/<key>.json   the spec as canonical JSON, named by its key
-  plan.json          every task: argv, env, threads, GPUs, timeout, seeds, key
+  plan.json          its legume's version, and every task: argv, env, threads,
+                     GPUs, timeout, seeds, key
   machine.json       the machine it was first planned on
   versions.tsv       each tool's source, content key, snapshot and --version
   tools/<key>/       the snapshots that run
@@ -57,6 +60,11 @@ legume benchmark run SPEC --on REMOTE
 
 Runs the benchmark on the cluster REMOTE, over SSH from here: planned on
 a compute node, its tasks Slurm array tasks (legume benchmark run --help).
+
+legume benchmark install --on REMOTE [CRATE ...]
+
+Installs legume's tools on the cluster REMOTE, with this legume's
+version, as one Slurm batch job (legume benchmark install --help).
 
 legume benchmark task --plan PLAN (--task ID | --list FILE [--index N])
 
@@ -85,13 +93,15 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
             plan_spec(&spec, retool, out, err)
         }
         #[cfg(unix)]
+        Some("install") => install::main(&args[1..], out, err),
+        #[cfg(unix)]
         Some("run") => run::main(&args[1..], out, err),
         #[cfg(target_os = "linux")]
         Some("task") => wrapper::main(&args[1..], out, err),
         #[cfg(not(target_os = "linux"))]
         Some("task") => Err(usage("benchmark task runs on Linux only")),
         Some(other) => Err(usage(format!(
-            "unknown command {other}: benchmark has plan, run and task"
+            "unknown command {other}: benchmark has plan, run, install and task"
         ))),
     }
 }
@@ -179,6 +189,7 @@ fn plan_spec(path: &Path, retool: bool, out: &mut dyn Write, err: &mut dyn Write
     )?;
     let plan_json = PlanFile {
         name: &spec.name,
+        legume: env!("CARGO_PKG_VERSION"),
         spec_key: &spec_key,
         dir: &dir,
         cores,
@@ -268,6 +279,8 @@ fn resolve_inputs(
 #[derive(Serialize)]
 struct PlanFile<'a> {
     name: &'a str,
+    /// The legume that planned it, which its tasks run under.
+    legume: &'a str,
     spec_key: &'a str,
     dir: &'a Path,
     cores: u32,

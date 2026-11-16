@@ -68,6 +68,9 @@ const POLL_ENV: &str = "LEGUME_BENCHMARK_POLL_MS";
 /// What the runner reads of `plan.json`.
 #[derive(Deserialize)]
 struct PlanDoc {
+    /// The legume that planned it; none before 0.5.13.
+    #[serde(default)]
+    legume: Option<String>,
     grace_secs: u64,
     tasks: Vec<Task>,
 }
@@ -96,19 +99,6 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
     }
 }
 
-/// Remote `name`, from `remotes.toml`, or asked for on stdin and kept.
-fn remote_named(name: &str, out: &mut dyn Write) -> Result<Remote> {
-    let file = remote::config_file()
-        .ok_or_else(|| refuse("no config folder: set HOME, or LEGUME_REMOTES"))?;
-    if let Some(r) = remote::read(&file)?.into_iter().find(|r| r.name == name) {
-        return Ok(r);
-    }
-    let r = remote::ask(name, &mut std::io::stdin().lock(), out)?;
-    remote::save(&file, &r)?;
-    writeln!(out, "kept remote {name} in {}", file.display())?;
-    Ok(r)
-}
-
 /// The run of spec `spec_file` on remote `on`: its exit code.
 fn run(spec_file: &Path, on: &str, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32> {
     let text = std::fs::read_to_string(spec_file)
@@ -124,7 +114,7 @@ fn run(spec_file: &Path, on: &str, out: &mut dyn Write, err: &mut dyn Write) -> 
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "project".into());
-    let remote = remote_named(on, out)?;
+    let remote = remote::named(on, out)?;
     let shell = Shell::ssh(&remote.ssh);
     let c = Cluster {
         dir: format!("{}/{project}", remote.folder.trim_end_matches('/')),
@@ -195,7 +185,16 @@ impl Cluster<'_> {
         let (said, plan) = said
             .split_once(&format!("{PLAN_MARK}\n"))
             .context("planning on the cluster: no plan.json")?;
-        let plan = serde_json::from_str(plan).context("reading plan.json")?;
+        let plan: PlanDoc = serde_json::from_str(plan).context("reading plan.json")?;
+        let here = env!("CARGO_PKG_VERSION");
+        if plan.legume.as_deref() != Some(here) {
+            return Err(refuse(format!(
+                "the cluster's legume is {}, and this one {here}: legume benchmark \
+                 install --on {} installs this one there",
+                plan.legume.as_deref().unwrap_or("older"),
+                self.remote.name
+            )));
+        }
         Ok((said.to_string(), plan))
     }
 

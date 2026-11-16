@@ -44,6 +44,11 @@ for a in "$@"; do
   esac
 done
 jid=$(( 100 + n ))
+# A batch job, not an array: kept in the queue, pending.
+if [ -z "$last" ]; then
+  mkdir -p "$S/q/$jid"; echo "$name" > "$S/q/$jid/name"; echo PD > "$S/q/$jid/state"
+  echo "$jid"; exit 0
+fi
 for i in $(seq 0 "$last"); do
   q="$S/q/${jid}_$i"
   mkdir -p "$q"; echo "$name" > "$q/name"
@@ -58,12 +63,17 @@ echo "$jid"
 "#;
 
 const SQUEUE: &str = r#"#!/bin/bash
-# Stand-in squeue -h --name=NAME -o '%i %t'.
+# Stand-in squeue -h --name=NAME -o '%i %t', or -h --jobs=JID -o %i.
 S=$FAKE_SLURM
 echo "$*" >> "$S/squeue.log"
-for a in "$@"; do case $a in --name=*) name=${a#*=} ;; esac; done
+for a in "$@"; do case $a in --name=*) name=${a#*=} ;; --jobs=*) jobs=${a#*=} ;; esac; done
 for q in "$S"/q/*; do
-  [ "$(cat "$q/name" 2>/dev/null)" = "$name" ] && echo "${q##*/} $(cat "$q/state")"
+  [ -d "$q" ] || continue
+  if [ -n "$jobs" ]; then
+    [ "${q##*/}" = "$jobs" ] && echo "$jobs"
+  elif [ "$(cat "$q/name" 2>/dev/null)" = "$name" ]; then
+    echo "${q##*/} $(cat "$q/state")"
+  fi
 done
 exit 0
 "#;

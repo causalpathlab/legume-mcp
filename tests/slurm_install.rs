@@ -117,6 +117,38 @@ fn dry_run_prints_the_job() {
 }
 
 #[test]
+fn legume_pins_legume_mcp_with_benchmark_unless_it_has_a_version() {
+    let bin = Bin::new();
+    let t = ok(&run(
+        &bin,
+        &["--dry-run", "--prefix", "/x", "--legume", "1.2.3"],
+    ));
+    assert!(
+        t.contains(r#"[0]="legume-mcp@1.2.3:benchmark" [1]="pinto-rs""#),
+        "{t}"
+    );
+    let t = ok(&run(
+        &bin,
+        &[
+            "--dry-run",
+            "--prefix",
+            "/x",
+            "--legume",
+            "1.2.3",
+            "legume-mcp",
+            "legume-mcp:pdf",
+            "legume-mcp@0.1",
+        ],
+    ));
+    assert!(
+        t.contains(r#"[0]="legume-mcp@1.2.3:benchmark" [1]="legume-mcp@1.2.3:pdf,benchmark" [2]="legume-mcp@0.1")"#),
+        "{t}"
+    );
+    let o = run(&bin, &["--dry-run", "--prefix", "/x", "--legume", "1 2"]);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+}
+
+#[test]
 fn without_a_partition_none_is_asked() {
     let bin = Bin::new();
     let prefix = tempfile::tempdir().unwrap();

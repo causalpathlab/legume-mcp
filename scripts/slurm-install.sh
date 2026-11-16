@@ -31,6 +31,8 @@
 #   --build-tmp DIR     node-local scratch for the build (default /tmp)
 #   --no-rust-update    use the Rust toolchain as it is
 #   --no-libclang       never fetch a libclang (see below)
+#   --legume VERSION    legume-mcp at VERSION, with benchmark, in the
+#                       defaults or when it is named without a version
 #   --dry-run           print the job script and do nothing
 #
 # Crates default to the legume tools: legume-mcp:benchmark (legume),
@@ -74,6 +76,7 @@ build_tmp="/tmp"
 rust_update=1
 libclang=1
 dry_run=0
+legume=""
 crates=()
 # The crates installed when none are named, and the names of those that
 # make C bindings with libclang at build time.
@@ -99,6 +102,7 @@ while [ $# -gt 0 ]; do
     --build-tmp) need "$@"; build_tmp="$2"; shift 2 ;;
     --no-rust-update) rust_update=0; shift ;;
     --no-libclang) libclang=0; shift ;;
+    --legume) need "$@"; legume="$2"; shift 2 ;;
     --dry-run) dry_run=1; shift ;;
     -h | --help) usage ;;
     -*) die "no option $1 (see --help)" ;;
@@ -113,7 +117,20 @@ case "$time_limit" in '' | *[!0-9:-]*) die "--time wants HH:MM:SS or D-HH:MM:SS,
 for v in "$partition" "$account"; do
     case "$v" in *[!A-Za-z0-9_.,-]*) die "'$v' is not a Slurm partition or account name" ;; esac
 done
+case "$legume" in *[!A-Za-z0-9.+-]*) die "'$legume' is not a version" ;; esac
 [ ${#crates[@]} -gt 0 ] || crates=("${default_crates[@]}")
+if [ -n "$legume" ]; then
+    for i in "${!crates[@]}"; do
+        case "${crates[$i]}" in
+        legume-mcp | legume-mcp:*)
+            f="${crates[$i]#legume-mcp}"
+            f="${f#:}"
+            case ",$f," in *,benchmark,*) ;; *) f="${f:+$f,}benchmark" ;; esac
+            crates[i]="legume-mcp@$legume:$f"
+            ;;
+        esac
+    done
+fi
 for c in "${crates[@]}"; do
     case "$c" in
     *[!A-Za-z0-9_.:@,+-]* | :* | @*) die "'$c' is not CRATE[@VERSION][:FEATURES]" ;;

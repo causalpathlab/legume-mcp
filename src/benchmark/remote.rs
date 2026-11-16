@@ -53,6 +53,35 @@ pub fn config_file() -> Option<PathBuf> {
     Some(config.join("legume").join("remotes.toml"))
 }
 
+/// What a question to [`ask`] wants.
+enum Answer {
+    Needed,
+    Optional,
+    NeededPath,
+    OptionalPath,
+}
+
+/// What a remote's folders must be.
+const NOT_ABSOLUTE: &str = "an absolute path, as the cluster has it (no ~)";
+
+/// Whether `p` is a path the cluster reads as it is.
+fn absolute(p: &str) -> bool {
+    p.starts_with('/')
+}
+
+/// Remote `name`, from `remotes.toml`, or asked for on stdin and kept.
+pub fn named(name: &str, out: &mut dyn Write) -> Result<Remote> {
+    let file =
+        config_file().ok_or_else(|| refuse("no config folder: set HOME, or LEGUME_REMOTES"))?;
+    if let Some(r) = read(&file)?.into_iter().find(|r| r.name == name) {
+        return Ok(r);
+    }
+    let r = ask(name, &mut std::io::stdin().lock(), out)?;
+    save(&file, &r)?;
+    writeln!(out, "kept remote {name} in {}", file.display())?;
+    Ok(r)
+}
+
 /// The remotes in `text`, a `remotes.toml`: sections of `key = "value"`
 /// lines, with `#` comments. An unknown key, or a section without `ssh`
 /// or `folder`, is refused.
@@ -92,6 +121,11 @@ pub fn parse(text: &str) -> Result<Vec<Remote>> {
     for r in &remotes {
         if r.ssh.is_empty() || r.folder.is_empty() {
             bail!("remotes.toml [{}]: needs ssh and folder", r.name);
+        }
+        for p in std::iter::once(&r.folder).chain(&r.bin) {
+            if !absolute(p) {
+                bail!("remotes.toml [{}]: {p} is not {NOT_ABSOLUTE}", r.name);
+            }
         }
     }
     Ok(remotes)
@@ -199,8 +233,11 @@ pub fn ask(name: &str, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<R
         "Remote {name} is new. legume reaches it with ssh, as you do, and keeps what you \
          say here in your own config, never in a project."
     )?;
-    // An answer, empty only when it is not `needed`.
-    let mut answer = |question: &str, needed: bool| -> Result<String> {
+    // An answer, empty only when it is not needed, and an absolute path
+    // when it is one.
+    let mut answer = |question: &str, kind: Answer| -> Result<String> {
+        let needed = matches!(kind, Answer::Needed | Answer::NeededPath);
+        let path = matches!(kind, Answer::NeededPath | Answer::OptionalPath);
         loop {
             write!(out, "{question}: ")?;
             out.flush()?;
@@ -209,20 +246,28 @@ pub fn ask(name: &str, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<R
                 return Err(refuse(format!("remote {name}: no answer to {question}")));
             }
             let line = line.trim();
-            if !line.is_empty() || !needed {
+            if path && !line.is_empty() && !absolute(line) {
+                writeln!(out, "Wanted: {NOT_ABSOLUTE}.")?;
+            } else if !line.is_empty() || !needed {
                 return Ok(line.to_string());
             }
         }
     };
-    let ssh = answer("SSH target (a host or an alias from ~/.ssh/config)", true)?;
-    let folder = answer("Folder on the cluster for benchmarks", true)?;
+    let ssh = answer(
+        "SSH target (a host or an alias from ~/.ssh/config)",
+        Answer::Needed,
+    )?;
+    let folder = answer("Folder on the cluster for benchmarks", Answer::NeededPath)?;
     let some = |s: String| Some(s).filter(|s| !s.is_empty());
     let bin = some(answer(
         "Folder of legume's tools on the cluster, an install's bin (empty if on PATH)",
-        false,
+        Answer::OptionalPath,
     )?);
-    let partition = some(answer("Slurm partition (empty for the default)", false)?);
-    let account = some(answer("Slurm account (empty for none)", false)?);
+    let partition = some(answer(
+        "Slurm partition (empty for the default)",
+        Answer::Optional,
+    )?);
+    let account = some(answer("Slurm account (empty for none)", Answer::Optional)?);
     Ok(Remote {
         name: name.to_string(),
         ssh,
@@ -436,6 +481,10 @@ mod tests {
         for (text, says) in [
             ("[R1]\nssh = \"h\"\n", "needs ssh and folder"),
             (
+                "[R1]\nssh = \"h\"\nfolder = \"~/x\"\n",
+                "is not an absolute path",
+            ),
+            (
                 "[R1]\nssh = \"h\"\nfolder = \"/x\"\nport = \"22\"\n",
                 "unknown key port",
             ),
@@ -451,7 +500,7 @@ mod tests {
 
     #[test]
     fn asking_repeats_until_a_needed_answer_and_leaves_optional_ones_empty() {
-        let mut input: &[u8] = b"\nHOST1\n/x\n\n\nACCT1\n";
+        let mut input: &[u8] = b"\nHOST1\n~/x\n/x\n\n\nACCT1\n";
         let mut said = Vec::new();
         let r = ask("R1", &mut input, &mut said).unwrap();
         assert_eq!(
@@ -467,6 +516,7 @@ mod tests {
         );
         let said = String::from_utf8(said).unwrap();
         assert_eq!(said.matches("SSH target").count(), 2, "{said}");
+        assert_eq!(said.matches("Folder on the cluster").count(), 2, "{said}");
     }
 
     #[test]
