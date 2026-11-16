@@ -3,6 +3,9 @@
 //! on a compute node, with stand-in tools (shell scripts this test writes).
 //! Every task here lasts a second or two at most.
 
+#[path = "common/bench.rs"]
+mod bench;
+
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -28,29 +31,12 @@ impl Bench {
 
     /// Task `id` running `body` in sh, making `makes`, `timeout` seconds.
     fn task(&mut self, id: &str, body: &str, makes: &[&str], timeout: u64) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let tool = self.root().join(format!("{id}.sh"));
-        std::fs::write(&tool, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bench::write_tool(&tool, body);
         let dir = self.root().join("tasks").join(id);
-        self.tasks.push(json!({
-            "id": id,
-            "argv": [tool, "ARG1"],
-            "env": {"RAYON_NUM_THREADS": "2"},
-            "dir": dir,
-            "timeout_secs": timeout,
-            "makes": makes,
-            "key": format!("key-{id}"),
-            "mem_gb": 1.0,
-            "threads": 2,
-            "gpus": 0,
-            "point": {},
-            "rep": 0,
-            "rep_seed": 1,
-            "seed": 1,
-            "stage": "s",
-            "upstream": [],
-        }));
+        let argv = json!([tool, "ARG1"]);
+        self.tasks
+            .push(bench::plan_task(id, argv, &dir, (2, 1.0, timeout), makes));
         dir
     }
 
@@ -157,6 +143,7 @@ fn a_task_that_makes_its_files_is_done() {
     assert!(o.status.success(), "{}", said(&o));
     let exit = read(&dir.join("exit.json"));
     assert_eq!(exit["exit"], 0);
+    assert_eq!(exit["outcome"], "done");
     assert_eq!(exit["signal"], Value::Null);
     assert_eq!(exit["timed_out"], false);
     assert_eq!(exit["key"], "key-C1");
@@ -192,7 +179,11 @@ fn a_failing_tool_gives_its_exit() {
     let dir = b.task("C1", "echo bad >&2; exit 7", &[], 30);
     let o = task(&b.plan(5), "C1");
     assert_eq!(o.status.code(), Some(7));
-    assert_eq!(read(&dir.join("exit.json"))["exit"], 7);
+    let exit = read(&dir.join("exit.json"));
+    assert_eq!(
+        (exit["exit"].as_i64(), exit["outcome"].as_str()),
+        (Some(7), Some("failed"))
+    );
     assert!(!dir.join("done.json").exists());
     assert!(log(&dir).contains("bad"));
 }
@@ -208,6 +199,7 @@ fn timeout_term_then_kill() {
     assert!(!o.status.success());
     let exit = read(&dir.join("exit.json"));
     assert_eq!(exit["timed_out"], true);
+    assert_eq!(exit["outcome"], "timeout");
     assert_eq!(exit["signal"], 9, "{exit}");
     assert!(took < Duration::from_secs(8), "{took:?}");
     assert!(took >= Duration::from_secs(2), "{took:?}");
@@ -266,6 +258,7 @@ fn term_to_the_wrapper_stops_the_tool() {
     );
     let exit = read(&dir.join("exit.json"));
     assert_eq!(exit["stopped"], true, "{exit}");
+    assert_eq!(exit["outcome"], "stopped");
     assert_eq!(exit["timed_out"], false);
 }
 
@@ -404,6 +397,7 @@ fn rusts_out_of_memory_message_is_evidence() {
     let exit = read(&d1.join("exit.json"));
     assert_eq!(exit["oom"], true, "{exit}");
     assert_eq!(exit["signal"], 6, "{exit}");
+    assert_eq!(exit["outcome"], "oom");
     assert_eq!(read(&d2.join("exit.json"))["oom"], false);
 }
 

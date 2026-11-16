@@ -11,6 +11,10 @@ pub mod key;
 pub mod machine;
 pub mod plan;
 pub mod pool;
+#[cfg(unix)]
+pub mod remote;
+#[cfg(unix)]
+pub mod slurm;
 pub mod spec;
 pub mod tools;
 #[cfg(target_os = "linux")]

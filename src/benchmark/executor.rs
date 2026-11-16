@@ -4,7 +4,30 @@
 
 use super::pool::{Budget, Launch, Live, Outcome, Pool};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
+
+/// A task's `exit.json`: how its attempt ended, as the wrapper writes it
+/// and every executor reads it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskExit {
+    pub task: String,
+    pub key: String,
+    /// From 1.
+    pub attempt: u32,
+    /// The end the pool counts, decided by the wrapper alone.
+    pub outcome: Outcome,
+    pub exit: Option<i32>,
+    pub signal: Option<i32>,
+    pub timed_out: bool,
+    pub stopped: bool,
+    /// The tool's log says memory ran out (evidence only).
+    pub oom: bool,
+    pub secs: f64,
+    pub cpu_secs: f64,
+    pub max_rss_mb: f64,
+    pub node: String,
+}
 
 /// Runs a plan's tasks, by their index in the plan.
 pub trait Executor {
