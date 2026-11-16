@@ -108,12 +108,12 @@ fn main() -> anyhow::Result<()> {
     };
     if let Err(e) = run(&args[1..], &mut std::io::stdout(), &mut std::io::stderr()) {
         // A refusal's own exit code: 2 for a command line, said with the
-        // command's usage, 3 for what a command refuses to do with what
+        // command's usage (a benchmark task passes on its tool's own), 3 for what a command refuses to do with what
         // it was given (a truth outside the universe, a spec that cannot
         // plan); 1 for anything else.
         let code = command::code(&e);
         eprintln!("legume {name}: {e:#}");
-        if code == 2 {
+        if e.downcast_ref::<command::Exit>().is_some_and(|x| x.usage) {
             eprintln!("\n{usage}");
         }
         std::process::exit(code);

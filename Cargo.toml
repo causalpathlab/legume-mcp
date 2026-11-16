@@ -104,3 +104,7 @@ required-features = ["benchmark"]
 [[test]]
 name = "benchmark_pool"
 required-features = ["benchmark"]
+
+[[test]]
+name = "benchmark_task"
+required-features = ["benchmark"]
