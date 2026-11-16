@@ -45,7 +45,8 @@
 # installs a toolchain into PREFIX/rust.
 #
 # libclang: faba's BAM reader (htslib) makes its C bindings with libclang
-# at build time. When faba is to be installed and the node has none (no
+# at build time (needs_libclang_crates below names the crates that do).
+# When one of them is to be installed and the node has none (no
 # LIBCLANG_PATH, LD_LIBRARY_PATH, llvm-config or ldconfig), the job fetches PyPI's libclang
 # wheel into PREFIX/libclang once, with python3's standard library, and
 # gives bindgen gcc's built-in headers, which the wheel lacks. Nothing
@@ -74,6 +75,12 @@ rust_update=1
 libclang=1
 dry_run=0
 crates=()
+# The crates installed when none are named, and the names of those that
+# make C bindings with libclang at build time.
+default_crates=(
+    "legume-mcp:benchmark" "pinto-rs" "lupin-rs" "senna-rs" "chickpea-rs" "faba" "data-beans"
+)
+needs_libclang_crates=(faba)
 
 # The value of option $1, which must be given: $2, not empty and not the
 # next option.
@@ -106,9 +113,7 @@ case "$time_limit" in '' | *[!0-9:-]*) die "--time wants HH:MM:SS or D-HH:MM:SS,
 for v in "$partition" "$account"; do
     case "$v" in *[!A-Za-z0-9_.,-]*) die "'$v' is not a Slurm partition or account name" ;; esac
 done
-[ ${#crates[@]} -gt 0 ] || crates=(
-    "legume-mcp:benchmark" "pinto-rs" "lupin-rs" "senna-rs" "chickpea-rs" "faba" "data-beans"
-)
+[ ${#crates[@]} -gt 0 ] || crates=("${default_crates[@]}")
 for c in "${crates[@]}"; do
     case "$c" in
     *[!A-Za-z0-9_.:@,+-]* | :* | @*) die "'$c' is not CRATE[@VERSION][:FEATURES]" ;;
@@ -122,8 +127,6 @@ case "$prefix" in
 *) prefix="$(pwd -P)/$prefix" ;;
 esac
 
-q() { printf '%q' "$1"; }
-
 # This install's own folder: its job script, log, status and versions.
 run="$prefix/install/$(date +%Y%m%d-%H%M%S)"
 
@@ -136,15 +139,8 @@ job() {
     echo "#SBATCH --mem=${mem}G"
     echo "#SBATCH --time=$time_limit"
     echo "set -uo pipefail"
-    echo "prefix=$(q "$prefix")"
-    echo "build_tmp=$(q "$build_tmp")"
-    echo "rust_update=$rust_update"
-    echo "libclang=$libclang"
-    # LEGUME_INSTALL_RUN lets the tests run the job in a folder of theirs.
-    echo "run=\"\${LEGUME_INSTALL_RUN:-$(q "$run")}\""
-    printf 'crates=('
-    for c in "${crates[@]}"; do printf ' %s' "$(q "$c")"; done
-    echo ' )'
+    # Each value quoted so the job reads it back as it is here.
+    declare -p prefix build_tmp rust_update libclang run crates needs_libclang_crates
     cat <<'EOF'
 say() { echo "[$(date '+%F %T')] $*"; }
 status() { echo "$*" > "$run/status.part" && mv "$run/status.part" "$run/status"; }
@@ -165,22 +161,25 @@ node=$(hostname -s)
 glibc=$(ldd --version 2>&1 | head -1)
 say "node $node, $glibc"
 
+# The Rust toolchain rustup keeps in the prefix. Its proxies find it only
+# through RUSTUP_HOME and CARGO_HOME.
+use_prefix_rust() {
+    export RUSTUP_HOME="$prefix/rust/rustup" CARGO_HOME="$prefix/rust/cargo"
+    PATH="$CARGO_HOME/bin:$PATH"
+}
+
 # Rust: the cargo on PATH, else ~/.cargo's or the prefix's, else rustup
 # into the prefix.
 for d in "${CARGO_HOME:-$HOME/.cargo}/bin" "$prefix/rust/cargo/bin"; do
     cargo --version > /dev/null 2>&1 && break
     [ -x "$d/cargo" ] || continue
-    PATH="$d:$PATH"
-    # rustup's proxies find the prefix's toolchain only through these.
-    [ "$d" = "$prefix/rust/cargo/bin" ] \
-        && export RUSTUP_HOME="$prefix/rust/rustup" CARGO_HOME="$prefix/rust/cargo"
+    if [ "$d" = "$prefix/rust/cargo/bin" ]; then use_prefix_rust; else PATH="$d:$PATH"; fi
 done
 if ! cargo --version > /dev/null 2>&1; then
     say "no working cargo here: installing rustup into $prefix/rust"
-    export RUSTUP_HOME="$prefix/rust/rustup" CARGO_HOME="$prefix/rust/cargo"
+    use_prefix_rust
     curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal \
         || { status "failed rustup"; exit 1; }
-    PATH="$CARGO_HOME/bin:$PATH"
 elif [ "$rust_update" = 1 ] && command -v rustup > /dev/null 2>&1; then
     say "updating the Rust toolchain"
     rustup update stable || say "rustup update failed; going on with $(rustc --version)"
@@ -190,10 +189,12 @@ say "$(cargo --version), $(rustc --version)"
 export CARGO_TARGET_DIR="$build_tmp/legume-install.${SLURM_JOB_ID:-$$}"
 mkdir -p "$CARGO_TARGET_DIR" "$prefix/bin"
 
-# libclang for crates whose C bindings are made at build time (faba).
+# libclang for crates whose C bindings are made at build time.
 needs_libclang=0
 for spec in "${crates[@]}"; do
-    case "${spec%%[@:]*}" in faba) needs_libclang=1 ;; esac
+    for c in "${needs_libclang_crates[@]}"; do
+        [ "${spec%%[@:]*}" = "$c" ] && needs_libclang=1
+    done
 done
 # A libclang the build would find: LIBCLANG_PATH, a folder in
 # LD_LIBRARY_PATH or llvm-config's, or the linker's cache (grep reads all
@@ -207,12 +208,14 @@ has_libclang() {
     PATH="$PATH:/sbin:/usr/sbin" ldconfig -p 2> /dev/null \
         | grep 'libclang[-.0-9]*\.so' > /dev/null
 }
-if [ "$needs_libclang" = 1 ] && [ "$libclang" = 1 ] && ! has_libclang; then
-    lc="$prefix/libclang"
-    so=$(find "$lc" -name libclang.so 2> /dev/null | head -1)
-    if [ -z "$so" ]; then
-        say "no libclang here, which faba's htslib bindings need: fetching PyPI's libclang wheel into $lc"
-        python3 - "$lc" << 'PY' || say "fetching libclang failed; faba will not build"
+# The libclang.so fetched into the prefix on this run or an earlier one,
+# or nothing.
+fetched_libclang() { find "$prefix/libclang" -name libclang.so 2> /dev/null | head -1; }
+# PyPI's libclang wheel, unpacked into the prefix with python3's standard
+# library.
+fetch_libclang() {
+    say "no libclang here, which faba's htslib bindings need: fetching PyPI's libclang wheel into $prefix/libclang"
+    python3 - "$prefix/libclang" << 'PY' || say "fetching libclang failed; faba will not build"
 import io, json, platform, sys, urllib.request, zipfile
 arch = platform.machine()
 meta = json.load(urllib.request.urlopen("https://pypi.org/pypi/libclang/json"))
@@ -223,24 +226,21 @@ if not urls:
 url = urls[0]
 zipfile.ZipFile(io.BytesIO(urllib.request.urlopen(url).read())).extractall(sys.argv[1])
 PY
-        so=$(find "$lc" -name libclang.so 2> /dev/null | head -1)
-    fi
-    if [ -n "$so" ]; then
-        export LIBCLANG_PATH="${so%/*}"
-        # The wheel has no clang built-in headers (stddef.h); gcc's serve.
-        command -v gcc > /dev/null \
-            && export BINDGEN_EXTRA_CLANG_ARGS="-I$(gcc -print-file-name=include)"
-        say "libclang: $LIBCLANG_PATH"
-    fi
+}
+so=""
+if [ "$needs_libclang" = 1 ] && [ "$libclang" = 1 ] && ! has_libclang; then
+    [ -n "$(fetched_libclang)" ] || fetch_libclang
+    so=$(fetched_libclang)
+fi
+if [ -n "$so" ]; then
+    export LIBCLANG_PATH="${so%/*}"
+    # The wheel has no clang built-in headers (stddef.h); gcc's serve.
+    command -v gcc > /dev/null \
+        && export BINDGEN_EXTRA_CLANG_ARGS="-I$(gcc -print-file-name=include)"
+    say "libclang: $LIBCLANG_PATH"
 fi
 
-# Each binary's checksum, to tell what this job installed.
-sums() {
-    local b
-    for b in "$prefix"/bin/*; do [ -f "$b" ] && cksum "$b"; done
-}
-before=$(sums)
-
+installed=""
 failed=""
 for spec in "${crates[@]}"; do
     name="${spec%%:*}"
@@ -254,20 +254,24 @@ for spec in "${crates[@]}"; do
     say "cargo ${args[*]} $name"
     cargo "${args[@]}" "$name" &
     build=$!
-    wait "$build" || { failed="$failed $name"; say "failed: $name"; }
+    if wait "$build"; then
+        installed="$installed $name"
+    else
+        failed="$failed $name"
+        say "failed: $name"
+    fi
     build=""
 done
 
 {
     echo "node: $node"
     echo "glibc: $glibc"
-    # Only what this job installed or replaced, each given 10 s to answer.
-    limit=""
-    command -v timeout > /dev/null && limit="timeout 10"
-    sums | while read -r sum size b; do
-        printf '%s\n' "$before" | grep -xF "$sum $size $b" > /dev/null && continue
-        [ -x "$b" ] && echo "$(basename "$b"): $($limit "$b" --version 2>&1 | head -1)"
-    done
+    # The crates this job installed, each with its version and binaries,
+    # from cargo's own record of the prefix.
+    cargo install --list --root "$prefix" 2> /dev/null | awk -v names="$installed" '
+        BEGIN { n = split(names, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+        /^[^ ]/ { keep = ($1 in want) }
+        keep'
 } > "$run/versions.txt"
 cat "$run/versions.txt"
 say "Add to PATH: export PATH=\"$prefix/bin:\$PATH\""
