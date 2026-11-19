@@ -77,10 +77,17 @@ pub(crate) fn tools() -> Vec<ToolSpec> {
         .idempotent(),
         ToolSpec::new(
             "benchmark_start",
-            "Start a benchmark, in the background, returning at once: with `on`, on that cluster (`legume benchmark run SPEC --on REMOTE --detach`: it plans on a compute node, then runs each task as a Slurm array task); without `on`, on this machine (planned here, its tasks within the cores and memory the spec books; Linux only). The run goes on after this server ends. Tasks done in an earlier run are reused, so starting again resumes. Follow it with benchmark_status, stop it with benchmark_stop. A start while its runner is alive is refused. A remote not in remotes.toml is refused with how to add it: ask the person.",
+            "Start a benchmark, in the background, returning at once: with `on`, on that cluster (`legume benchmark run SPEC --on REMOTE --detach`: it plans on a compute node, then runs each task as a Slurm array task); without `on`, on this machine (planned here, its tasks within the cores and memory the spec books; Linux only). The run goes on after this server ends. Tasks done in an earlier run are reused, so starting again resumes. A start that would rerun tasks an earlier run finished under another key (the spec changed their argv, inputs, tool or upstream) is refused in run.log before anything starts or is cancelled; benchmark_status shows it. Ask the person before passing `rerun_changed`, which runs them anew (earlier attempts are kept under tasks/.attempts). Follow it with benchmark_status, stop it with benchmark_stop. A start while its runner is alive is refused. A remote not in remotes.toml is refused with how to add it: ask the person.",
             json!({
                 "type": "object",
-                "properties": { "spec": spec, "on": on },
+                "properties": {
+                    "spec": spec,
+                    "on": on,
+                    "rerun_changed": {
+                        "type": "boolean",
+                        "description": "Run again the tasks an earlier run finished, or left queued, under another key; without it such a start is refused. Ask the person first.",
+                    },
+                },
                 "required": ["spec"],
             }),
         )
@@ -134,6 +141,7 @@ pub(crate) fn call(name: &str, args: &Value, cx: &Call) -> Result<String> {
 /// ahead, and the run recorded.
 fn start(root: &Path, args: &Value, cx: &Call) -> Result<String> {
     let on = args["on"].as_str().filter(|s| !s.is_empty());
+    let rerun_changed = args["rerun_changed"].as_bool().unwrap_or(false);
     let given = given_spec(root, &args["spec"])?;
     reported(&given)?;
     let d = runner::Detach {
@@ -142,12 +150,14 @@ fn start(root: &Path, args: &Value, cx: &Call) -> Result<String> {
         spec: &given.spec,
         spec_key: &given.key,
         on,
+        rerun_changed,
     };
     let started = runner::detach(&d, None, &mut || keep(&given, cx)).map_err(reworded)?;
     // The driver script repeats the run in the foreground, from the
-    // project, skipped once it has gathered.
+    // project, skipped once it has gathered; a rerun of what changed was
+    // asked for this start only, so it is not repeated.
     if let Some(p) = &cx.records {
-        let mut cmd = runner::run_command(&given.rel, on)?;
+        let mut cmd = runner::run_command(&given.rel, on, false)?;
         if std::env::current_dir().ok().as_deref() != Some(root) {
             cmd.current_dir(root);
         }

@@ -38,15 +38,24 @@ pub struct Resumed {
     pub done: Vec<usize>,
     /// Tasks of an earlier run still queued or running, now watched.
     pub adopted: Vec<usize>,
+    /// Tasks an earlier run finished, or left queued, under another key:
+    /// ones the spec changed since, which would run again.
+    pub rekeyed: Vec<usize>,
 }
 
 /// Runs a plan's tasks, by their index in the plan.
 pub trait Executor {
-    /// What an earlier run of the plan left: the tasks done, reused, and
-    /// those still running, adopted. Nothing, for an executor that keeps
-    /// nothing between runs.
+    /// What an earlier run of the plan left, changing nothing: the tasks
+    /// done, reused, those still running, adopted, and those it left under
+    /// another key. Nothing, for an executor that keeps nothing between
+    /// runs.
     fn resume(&mut self) -> Result<Resumed> {
         Ok(Resumed::default())
+    }
+    /// The attempts still queued of the tasks [`Executor::resume`] found
+    /// rekeyed, cancelled, once the run goes ahead with them.
+    fn cancel_rekeyed(&mut self) -> Result<()> {
+        Ok(())
     }
     /// The machine now. An executor whose scheduler places memory itself
     /// leaves `mem_available_gb` empty.

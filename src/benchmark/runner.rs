@@ -185,13 +185,20 @@ pub(crate) fn kept_remote(on: &str, ask: Option<&mut dyn Write>) -> Result<Remot
     }
 }
 
-/// `legume benchmark run SPEC [--on ON]`, run by this legume's own
-/// binary: on remote `on`, or on this machine.
-pub(crate) fn run_command(spec_file: &Path, on: Option<&str>) -> Result<Command> {
+/// `legume benchmark run SPEC [--on ON] [--rerun-changed]`, run by this
+/// legume's own binary: on remote `on`, or on this machine.
+pub(crate) fn run_command(
+    spec_file: &Path,
+    on: Option<&str>,
+    rerun_changed: bool,
+) -> Result<Command> {
     let mut cmd = crate::own_command(["benchmark", "run"])?;
     cmd.arg(spec_file);
     if let Some(on) = on {
         cmd.arg("--on").arg(on);
+    }
+    if rerun_changed {
+        cmd.arg("--rerun-changed");
     }
     Ok(cmd)
 }
@@ -212,6 +219,8 @@ pub(crate) struct Detach<'a> {
     pub(crate) spec: &'a Spec,
     pub(crate) spec_key: &'a str,
     pub(crate) on: Option<&'a str>,
+    /// Tasks the spec changed since an earlier run are run again.
+    pub(crate) rerun_changed: bool,
 }
 
 /// A runner started.
@@ -277,13 +286,13 @@ pub(crate) fn detach(
         .open(&log_path)
         .with_context(|| format!("opening {}", log_path.display()))?;
     let started = crate::project::rfc3339();
-    writeln!(
-        log,
-        "== {started}: legume benchmark run {}{}",
-        d.spec_file.display(),
-        d.on.map_or(String::new(), |on| format!(" --on {on}"))
-    )?;
-    let mut cmd = run_command(d.spec_file, d.on)?;
+    let mut cmd = run_command(d.spec_file, d.on, d.rerun_changed)?;
+    // The command as run, but for this legume's own path.
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    writeln!(log, "== {started}: legume {}", args.join(" "))?;
     cmd.current_dir(d.root)
         .env(crate::project::ROOT_ENV, d.root)
         .env(RUNNER_ENV, dir.join(RUNNER_FILE))
@@ -316,7 +325,12 @@ pub(crate) fn detach(
 
 /// `legume benchmark run SPEC --on ON --detach`, said on `out`: a refusal
 /// is the command's (exit 3).
-pub(super) fn detach_main(spec_file: &Path, on: Option<&str>, out: &mut dyn Write) -> Result<()> {
+pub(super) fn detach_main(
+    spec_file: &Path,
+    on: Option<&str>,
+    rerun_changed: bool,
+    out: &mut dyn Write,
+) -> Result<()> {
     let text = std::fs::read_to_string(spec_file)
         .with_context(|| format!("reading {}", spec_file.display()))?;
     let (spec, value) = super::spec::parse(&text)?;
@@ -328,6 +342,7 @@ pub(super) fn detach_main(spec_file: &Path, on: Option<&str>, out: &mut dyn Writ
         spec: &spec,
         spec_key: &super::key::spec_key(&value),
         on,
+        rerun_changed,
     };
     let started = detach(&d, Some(&mut *out), &mut || Ok(())).map_err(|e| {
         match e.downcast_ref::<Refused>() {
@@ -441,13 +456,13 @@ mod tests {
 
     #[test]
     fn a_run_is_legume_benchmark_run_spec_on_remote() {
-        let cmd = run_command(Path::new("specs-in/N1.json"), Some("REMOTE1")).unwrap();
+        let cmd = run_command(Path::new("specs-in/N1.json"), Some("REMOTE1"), false).unwrap();
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         assert_eq!(
             args,
             ["benchmark", "run", "specs-in/N1.json", "--on", "REMOTE1"]
         );
-        let here = run_command(Path::new("specs-in/N1.json"), None).unwrap();
+        let here = run_command(Path::new("specs-in/N1.json"), None, false).unwrap();
         let args: Vec<&std::ffi::OsStr> = here.get_args().collect();
         assert_eq!(args, ["benchmark", "run", "specs-in/N1.json"]);
     }

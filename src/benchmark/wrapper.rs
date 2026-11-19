@@ -10,11 +10,13 @@
 //! `done.json` when the tool exited 0, before its timeout or a stop, and
 //! made every `makes` file, then
 //! `exit.json` always ([`TaskExit`], its `outcome` the end the pool
-//! counts), so a reader that sees `exit.json` sees the end. A
-//! rerun clears both first and keeps the last log as `log.<attempt>`.
+//! counts), so a reader that sees `exit.json` sees the end. A rerun
+//! never writes over an earlier attempt: a folder that holds one is
+//! moved aside whole first, to `.attempts/<id>.<n>` beside it
+//! ([`set_aside`]).
 
 use super::executor::TaskExit;
-use super::plan::Task;
+use super::plan::{Task, ATTEMPTS, PLACED};
 use super::pool::Outcome;
 use crate::command::{canonical_flags, failed, flag_pairs, required, usage, Flag};
 use crate::procgroup::Group;
@@ -82,7 +84,11 @@ pub fn main(args: &[String], out: &mut dyn Write, _err: &mut dyn Write) -> Resul
     let Some(task) = plan.tasks.iter().find(|t| t.id == id) else {
         return Err(usage(format!("{}: no task {id}", plan_file.display())));
     };
-    let ran = run(task, Duration::from_secs(plan.grace_secs));
+    placed_for(task)?;
+    // A folder whose earlier attempt cannot be set aside is not written
+    // to at all: the runner counts the task lost.
+    let attempt = set_aside(&task.dir)?;
+    let ran = run(task, attempt, Duration::from_secs(plan.grace_secs));
     if ran.is_err() {
         failed_itself(task);
     }
@@ -118,6 +124,27 @@ fn failed_itself(t: &Task) {
     }
 }
 
+/// Refused, before anything is written, when this array job was placed
+/// for task `t` under another key (its `slurm.json` names this job and
+/// another key): the plan was made anew since, and this job runs only
+/// what it was placed for. A refused run leaves such jobs queued.
+fn placed_for(t: &Task) -> Result<()> {
+    let Ok(job) = std::env::var("SLURM_ARRAY_JOB_ID") else {
+        return Ok(());
+    };
+    let placed = std::fs::read(t.dir.join(PLACED))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<super::plan::Placed>(&b).ok());
+    match placed {
+        Some(p) if p.array_job_id == job && p.key != t.key => Err(usage(format!(
+            "task {}: array job {job} was placed for key {}, and the plan now has {}; \
+             not run",
+            t.id, p.key, t.key
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// The task id on line `index` of `list`, `index` being
 /// `$SLURM_ARRAY_TASK_ID` when not given.
 fn listed(list: &Path, index: Option<String>) -> Result<String> {
@@ -140,22 +167,11 @@ fn listed(list: &Path, index: Option<String>) -> Result<String> {
     }
 }
 
-/// Task `t` run once under the wrapper, with `grace` between TERM and
-/// KILL: `None` when it is done, or the wrapper's exit code and why not.
-fn run(t: &Task, grace: Duration) -> Result<Option<(i32, String)>> {
+/// Task `t` run once under the wrapper, as attempt `attempt`, with
+/// `grace` between TERM and KILL: `None` when it is done, or the wrapper's exit code and why not.
+fn run(t: &Task, attempt: u32, grace: Duration) -> Result<Option<(i32, String)>> {
     let dir = &t.dir;
     let (first, rest) = t.argv.split_first().context("a task's argv is empty")?;
-    std::fs::create_dir_all(dir).with_context(|| format!("making {}", dir.display()))?;
-    for stale in ["done.json", "exit.json"] {
-        let stale = dir.join(stale);
-        match std::fs::remove_file(&stale) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                return Err(e).with_context(|| format!("clearing {}", stale.display()));
-            }
-            _ => {}
-        }
-    }
-    let attempt = keep_last_log(dir)?;
     let log_path = dir.join("log");
     let log = std::fs::File::create(&log_path)
         .with_context(|| format!("making {}", log_path.display()))?;
@@ -290,20 +306,52 @@ fn write_done(t: &Task, secs: f64, cpu_secs: f64) -> std::result::Result<(), Str
         .map_err(|e| format!("exit 0, but writing done.json: {e}"))
 }
 
-/// The last log in `dir`, if any, kept as `log.<n>`, the first `n` free;
-/// the attempt the next log is, from 1.
-fn keep_last_log(dir: &Path) -> Result<u32> {
-    let log = dir.join("log");
-    if !log.exists() {
-        return Ok(1);
-    }
+/// Task folder `dir` made ready for a new attempt: an earlier attempt in
+/// it (anything there but its [`PLACED`]) moved aside whole, to
+/// `<ATTEMPTS>/<name>.<n>` beside it, `n` the first free from 1, its
+/// placement copied back. The attempt the new one is, from 1.
+fn set_aside(dir: &Path) -> Result<u32> {
+    let (parent, name) = match (dir.parent(), dir.file_name()) {
+        (Some(p), Some(n)) => (p, n.to_string_lossy()),
+        _ => anyhow::bail!("{} is not a task folder", dir.display()),
+    };
+    let attempts = parent.join(ATTEMPTS);
     let mut n = 1;
-    while dir.join(format!("log.{n}")).exists() {
+    while attempts.join(format!("{name}.{n}")).exists() {
         n += 1;
     }
-    let kept = dir.join(format!("log.{n}"));
-    std::fs::rename(&log, &kept).with_context(|| format!("keeping {}", kept.display()))?;
-    Ok(n + 1)
+    let reading = |e| anyhow::Error::new(e).context(format!("reading {}", dir.display()));
+    let earlier = match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            let mut earlier = false;
+            for e in entries {
+                if e.map_err(reading)?.file_name() != PLACED {
+                    earlier = true;
+                    break;
+                }
+            }
+            earlier
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(reading(e)),
+    };
+    let aside = attempts.join(format!("{name}.{n}"));
+    if earlier {
+        std::fs::create_dir_all(&attempts)
+            .with_context(|| format!("making {}", attempts.display()))?;
+        std::fs::rename(dir, &aside).with_context(|| format!("moving {} aside", dir.display()))?;
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("making {}", dir.display()))?;
+    if !earlier {
+        return Ok(n);
+    }
+    let placed = aside.join(PLACED);
+    match std::fs::copy(&placed, dir.join(PLACED)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("copying {}", placed.display()))
+        }
+        _ => Ok(n + 1),
+    }
 }
 
 /// The tool's `group` watched until its leader exits, left unreaped for

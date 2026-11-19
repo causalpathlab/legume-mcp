@@ -55,7 +55,8 @@ for i in $(seq 0 "$last"); do
   if [ -n "$FAKE_SLURM_HOLD" ]; then echo PD > "$q/state"; continue; fi
   echo R > "$q/state"
   (
-    SLURM_ARRAY_TASK_ID=$i bash -c "$wrap" > "${out//%a/$i}" 2>&1 &
+    o=${out//%A/$jid}; o=${o//%a/$i}
+    SLURM_ARRAY_TASK_ID=$i bash -c "$wrap" > "$o" 2>&1 &
     p=$!; echo $p > "$q/pid"; wait $p; rm -rf "$q"
   ) > /dev/null 2>&1 &
 done
