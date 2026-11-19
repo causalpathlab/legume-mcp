@@ -407,19 +407,12 @@ impl Pool {
     }
 
     /// The tasks to launch at `now`, with the machine as `live` says;
-    /// ahead, every task whose upstream is done or launched, at any depth.
+    /// ahead, every task whose upstream is done or launched, at any depth
+    /// (one pass in plan order, where a task is after those it reads).
     pub fn next(&mut self, now: u64, live: &Live) -> Vec<Launch> {
         self.advance(now);
         self.live = live.clone();
-        let mut out = self.pass(now, true);
-        while self.ahead {
-            let more = self.pass(now, true);
-            if more.is_empty() {
-                break;
-            }
-            out.extend(more);
-        }
-        out
+        self.pass(now, true)
     }
 
     /// `launched`, from [`Pool::next`] at `now`, did not start after all
@@ -444,25 +437,16 @@ impl Pool {
         }
         self.event(now, |p| {
             p.rss.remove(&i);
-            // Launched ahead and stopped (cancelled, or refused by a
-            // wrapper) behind an upstream task that ended and is not done:
-            // skipped. One a person stopped, whose upstream still runs, is
-            // stopped.
-            let cause = p.doomed.remove(&i);
-            if outcome == Outcome::Stopped && p.ahead {
-                let not_done = p.wants[i].upstream.iter().copied().find(|&j| {
-                    matches!(
-                        p.state[j],
-                        State::Ended(o) if o != Outcome::Done
-                    ) || matches!(p.state[j], State::Skipped { .. })
-                });
-                if let Some(upstream) = cause.or(not_done.map(Some)) {
+            // Launched ahead, cancelled behind an upstream task that did not
+            // end done or for its method's halt, and stopped: skipped. One a
+            // person stopped is stopped.
+            match p.doomed.remove(&i) {
+                Some(upstream) if outcome == Outcome::Stopped => {
                     p.state[i] = State::Skipped { upstream };
                     p.skip_downstream(i);
-                    return;
                 }
+                _ => p.end(i, outcome),
             }
-            p.end(i, outcome);
         });
         Ok(())
     }
@@ -574,7 +558,8 @@ impl Pool {
         let mut best = Hold::Nothing;
         let mut reserving = false;
         for k in 0..self.order.len() {
-            let i = self.order[k];
+            // Ahead, in plan order: a task's upstream is launched first.
+            let i = if self.ahead { k } else { self.order[k] };
             if !self.is_ready(i) {
                 continue;
             }

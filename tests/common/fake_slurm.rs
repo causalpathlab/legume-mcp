@@ -109,13 +109,25 @@ const SCANCEL: &str = r#"#!/bin/bash
 S=$FAKE_SLURM
 echo "$*" >> "$S/scancel.log"
 code=0
+# <jid>_[1-3,5] names those tasks of the array job.
 for j in "$@"; do
-  case $j in *_*) pat=$j ;; *) pat="${j}_*" ;; esac
+  case $j in
+    *_\[*\])
+      a=${j%%_*}; list=${j#*_[}; list=${list%]}; pats=()
+      for r in ${list//,/ }; do
+        case $r in *-*) for i in $(seq "${r%-*}" "${r#*-}"); do pats+=("${a}_$i"); done ;;
+          *) pats+=("${a}_$r") ;; esac
+      done ;;
+    *_*) pats=("$j") ;;
+    *) pats=("${j}_*") ;;
+  esac
   found=0
-  for q in "$S"/q/$pat; do
-    [ -d "$q" ] || continue
-    found=1
-    if [ -f "$q/pid" ]; then kill -TERM "$(cat "$q/pid")"; else rm -rf "$q"; fi
+  for pat in "${pats[@]}"; do
+    for q in "$S"/q/$pat; do
+      [ -d "$q" ] || continue
+      found=1
+      if [ -f "$q/pid" ]; then kill -TERM "$(cat "$q/pid")"; else rm -rf "$q"; fi
+    done
   done
   [ $found = 1 ] || { echo "scancel: error: Invalid job id $j" >&2; code=1; }
 done

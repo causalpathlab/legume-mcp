@@ -56,12 +56,13 @@ const LINGER: Duration = Duration::from_secs(1);
 
 /// How long a task waits for its upstream's done.json to show on this
 /// node before it is refused: as long as the runner waits for a lagging
-/// exit.json; `$LEGUME_BENCHMARK_UPSTREAM_WAIT_MS` when set (for tests).
+/// exit.json ([`super::slurm::LOST_AFTER`]);
+/// `$LEGUME_BENCHMARK_UPSTREAM_WAIT_MS` when set (for tests).
 fn upstream_wait() -> Duration {
     std::env::var("LEGUME_BENCHMARK_UPSTREAM_WAIT_MS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .map_or(Duration::from_secs(60), Duration::from_millis)
+        .map_or(super::slurm::LOST_AFTER, Duration::from_millis)
 }
 
 /// How often the wrapper looks at the tool, its clock and its own stop.
@@ -98,27 +99,36 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
     // A folder whose earlier attempt cannot be set aside is not written
     // to at all: the runner counts the task lost.
     let attempt = set_aside(&task.dir)?;
-    let upstream: Vec<&Task> = task
-        .upstream
+    // Its upstream tasks, by one pass over the plan.
+    let wanted: std::collections::HashSet<&str> =
+        task.upstream.iter().map(String::as_str).collect();
+    let upstream: Vec<&Task> = plan
+        .tasks
         .iter()
-        .filter_map(|id| plan.tasks.iter().find(|u| &u.id == id))
+        .filter(|u| wanted.contains(u.id.as_str()))
         .collect();
     // A task queued ahead whose upstream did not end done is not run: it
     // ends stopped, and the runner counts it skipped. A done.json written
-    // on another node may show here late, so it is waited for a while.
-    let not_done = || {
-        upstream
-            .iter()
-            .find(|u| !u.done_in(&u.dir))
-            .map(|u| u.id.clone())
-            .or_else(|| (upstream.len() < task.upstream.len()).then(|| "(not in the plan)".into()))
-    };
-    let (waited, wait) = (Instant::now(), upstream_wait());
-    let mut missing = not_done();
-    while missing.is_some() && waited.elapsed() < wait {
-        std::thread::sleep(Duration::from_secs(2).min(wait));
-        missing = not_done();
+    // on another node may show here late, so it is waited for a while
+    // (only those not seen yet are looked at again); a stop ends the wait.
+    let mut missing: Vec<&Task> = upstream
+        .iter()
+        .copied()
+        .filter(|u| !u.done_in(&u.dir))
+        .collect();
+    if !missing.is_empty() {
+        super::stop::catch();
+        let (waited, wait) = (Instant::now(), upstream_wait());
+        while !missing.is_empty() && waited.elapsed() < wait && !super::stop::asked() {
+            std::thread::sleep(Duration::from_millis(500).min(wait));
+            missing.retain(|u| !u.done_in(&u.dir));
+        }
     }
+    let missing = match missing.first() {
+        Some(u) => Some(u.id.clone()),
+        None if upstream.len() < wanted.len() => Some("(not in the plan)".to_string()),
+        None => None,
+    };
     if let Some(up) = missing {
         let mut exit = ended_unrun(task, Outcome::Stopped);
         exit.attempt = attempt;

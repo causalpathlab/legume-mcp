@@ -326,7 +326,8 @@ fn ctrl_c_cancels_the_runs_tasks() {
     assert_eq!(status.code(), Some(130));
     let cancelled = w.log("scancel.log");
     // The sims and the scores queued behind them, all stopped.
-    assert_eq!(cancelled.split_whitespace().count(), 4, "{cancelled}");
+    // Each array job's two tasks, as one range.
+    assert_eq!(cancelled.trim(), "101_[0-1] 102_[0-1]", "{cancelled}");
     assert_eq!(
         (
             w.count("stop-requested"),
@@ -568,7 +569,8 @@ fn a_detached_run_returns_at_once_and_stop_cancels_its_tasks() {
     };
     assert_eq!(exit, 130);
     let cancelled = w.log("scancel.log");
-    assert_eq!(cancelled.split_whitespace().count(), 4, "{cancelled}");
+    // Each array job's two tasks, as one range.
+    assert_eq!(cancelled.trim(), "101_[0-1] 102_[0-1]", "{cancelled}");
     assert_eq!((w.count("stopped"), w.count("skipped")), (4, 0));
     let log = std::fs::read_to_string(w.project().join("results/benchmarks/N1/run.log")).unwrap();
     assert!(log.contains("planning N1 on REMOTE1"), "{log}");

@@ -96,6 +96,9 @@ pub struct Slurm {
     /// The array jobs the last poll that read the queue saw in it, once
     /// one has.
     queued_arrays: Option<HashSet<String>>,
+    /// The array tasks launched since the last poll that read the queue:
+    /// pending, as far as anyone knows, so their files are not looked at.
+    fresh: HashSet<Job>,
     /// The last array job of each capped method (stage, method): the next
     /// one waits for it, so the method's tasks never run more than its
     /// `max_running` at once.
@@ -110,7 +113,7 @@ pub struct Slurm {
     /// Of `stopping`, those cancelled before the last poll saw them start,
     /// or that cannot run: one gone from the queue ends at once, its
     /// `exit.json` (if any) not waited for.
-    unstarted: HashSet<usize>,
+    ends_when_gone: HashSet<usize>,
     /// Array tasks resume found queued for a task under another key.
     stale: Vec<Job>,
     /// How long a task gone from the queue without an `exit.json` is
@@ -135,12 +138,13 @@ impl Slurm {
             running: BTreeMap::new(),
             pending: HashSet::new(),
             queued_arrays: None,
+            fresh: HashSet::new(),
             capped_last: HashMap::new(),
             max_array: None,
             stopping: HashSet::new(),
-            unstarted: HashSet::new(),
+            ends_when_gone: HashSet::new(),
             stale: Vec::new(),
-            lost_after: Duration::from_secs(60),
+            lost_after: LOST_AFTER,
         }
     }
 
@@ -452,6 +456,10 @@ fn squeue_line(run: &str) -> String {
     )
 }
 
+/// How long a task gone from the queue without an `exit.json` is waited
+/// for, by default; the wrapper waits as long for an upstream's done.json.
+pub const LOST_AFTER: Duration = Duration::from_secs(60);
+
 /// Slurm's own default MaxArraySize, less one: the most tasks an array job
 /// takes when the cluster does not say.
 const DEFAULT_MAX_ARRAY: usize = 1000;
@@ -520,7 +528,7 @@ impl Executor for Slurm {
     fn cancel_unrunnable(&mut self, tasks: &[usize]) -> Result<()> {
         self.cancel(tasks)?;
         let watched = tasks.iter().filter(|i| self.running.contains_key(i));
-        self.unstarted.extend(watched);
+        self.ends_when_gone.extend(watched);
         Ok(())
     }
 
@@ -595,10 +603,12 @@ impl Executor for Slurm {
         // Each group after those it waits for: upstream tasks are before
         // their downstream in the plan, so this ends.
         let mut order: Vec<usize> = Vec::with_capacity(groups.len());
+        let mut placed = vec![false; groups.len()];
         while order.len() < groups.len() {
             let before = order.len();
             for (g, after) in groups_after.iter().enumerate() {
-                if !order.contains(&g) && after.iter().all(|h| order.contains(h)) {
+                if !placed[g] && after.iter().all(|&h| placed[h]) {
+                    placed[g] = true;
                     order.push(g);
                 }
             }
@@ -686,6 +696,7 @@ impl Executor for Slurm {
                     array_job: array_job.clone(),
                     index,
                 };
+                self.fresh.insert(job.clone());
                 self.watch(i, job);
             }
         }
@@ -700,7 +711,7 @@ impl Executor for Slurm {
         // one: every line one record.
         let mut script = squeue_line(&self.site.run);
         for (i, r) in &self.running {
-            if self.pending.contains(&r.job) {
+            if self.pending.contains(&r.job) || self.fresh.contains(&r.job) {
                 continue;
             }
             let _ = writeln!(
@@ -716,9 +727,9 @@ impl Executor for Slurm {
         }
         let poll = parse_poll(&ran.stdout);
         if poll.queue_ok {
-            let arrays = poll.queued.iter().chain(&poll.pending);
-            self.queued_arrays = Some(arrays.map(|j| j.array_job.clone()).collect());
+            self.queued_arrays = Some(poll.arrays);
             self.pending = poll.pending;
+            self.fresh.clear();
         }
         let now = Instant::now();
         let mut ended = Vec::new();
@@ -742,12 +753,16 @@ impl Executor for Slurm {
                 });
                 continue;
             }
-            if !poll.queue_ok || poll.queued.contains(&r.job) || self.pending.contains(&r.job) {
+            if !poll.queue_ok
+                || poll.queued.contains(&r.job)
+                || self.pending.contains(&r.job)
+                || self.fresh.contains(&r.job)
+            {
                 r.gone_since = None;
                 continue;
             }
             let since = *r.gone_since.get_or_insert(now);
-            if self.unstarted.contains(&i) || now.duration_since(since) >= self.lost_after {
+            if self.ends_when_gone.contains(&i) || now.duration_since(since) >= self.lost_after {
                 let outcome = if self.stopping.contains(&i) {
                     Outcome::Stopped
                 } else {
@@ -759,7 +774,7 @@ impl Executor for Slurm {
         for e in &ended {
             self.running.remove(&e.task);
             self.stopping.remove(&e.task);
-            self.unstarted.remove(&e.task);
+            self.ends_when_gone.remove(&e.task);
         }
         Ok(ended)
     }
@@ -767,21 +782,55 @@ impl Executor for Slurm {
     fn cancel(&mut self, tasks: &[usize]) -> Result<()> {
         // Only tasks running here are stopping: one marked otherwise would
         // end as stopped, not lost, on a later launch.
-        let (ids, jobs): (Vec<usize>, Vec<String>) = tasks
+        let (ids, jobs): (Vec<usize>, Vec<&Job>) = tasks
             .iter()
-            .filter_map(|&i| self.running.get(&i).map(|r| (i, quote(&r.job.id()))))
+            .filter_map(|&i| self.running.get(&i).map(|r| (i, &r.job)))
             .unzip();
         if jobs.is_empty() {
             return Ok(());
         }
         // A job already gone from the queue is no error: it ends by its
         // exit.json.
+        let words = ranges(&jobs);
         self.shell
-            .check(&format!("scancel {} || true", jobs.join(" ")), "scancel")?;
-        self.unstarted.extend(self.unstarted_of(&ids));
+            .check(&format!("scancel {} || true", words.join(" ")), "scancel")?;
+        self.ends_when_gone.extend(self.unstarted_of(&ids));
         self.stopping.extend(ids);
         Ok(())
     }
+}
+
+/// `jobs` as scancel's words: an array job's tasks as `<id>_[1-3,5]`,
+/// one alone as `<id>_<index>`, so a whole plan's tasks take a few words.
+fn ranges(jobs: &[&Job]) -> Vec<String> {
+    let mut by: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for j in jobs {
+        by.entry(&j.array_job).or_default().push(j.index);
+    }
+    by.into_iter()
+        .map(|(array, mut idx)| {
+            idx.sort_unstable();
+            idx.dedup();
+            if let [one] = idx[..] {
+                return format!("{array}_{one}");
+            }
+            let mut runs: Vec<String> = Vec::new();
+            let mut k = 0;
+            while k < idx.len() {
+                let start = idx[k];
+                while k + 1 < idx.len() && idx[k + 1] == idx[k] + 1 {
+                    k += 1;
+                }
+                runs.push(if idx[k] == start {
+                    start.to_string()
+                } else {
+                    format!("{start}-{}", idx[k])
+                });
+                k += 1;
+            }
+            format!("{array}_[{}]", runs.join(","))
+        })
+        .collect()
 }
 
 /// A poll's output.
@@ -791,6 +840,8 @@ struct Poll {
     queued: HashSet<Job>,
     /// The pending ones.
     pending: HashSet<Job>,
+    /// The array jobs of either.
+    arrays: HashSet<String>,
     /// Each task's `exit.json` text, by task index.
     exits: HashMap<usize, String>,
     /// `squeue` answered.
@@ -812,6 +863,11 @@ fn parse_poll(out: &str) -> Poll {
             let Some(job) = words.next() else {
                 continue;
             };
+            if let Some((array, _)) = job.split_once('_') {
+                if !p.arrays.contains(array) {
+                    p.arrays.insert(array.to_string());
+                }
+            }
             if let Some(range) = parse_range(job) {
                 p.pending.extend(range);
             } else if let Ok(job) = parse_job(job) {
@@ -862,6 +918,19 @@ mod tests {
         assert_eq!(p.exits[&3], "{\"exit\": 0}");
         assert!(!p.exits.contains_key(&4));
         assert!(!parse_poll("qfail\n").queue_ok);
+    }
+
+    #[test]
+    fn scancel_takes_each_array_jobs_tasks_as_ranges() {
+        let jobs = [
+            job("10", 3),
+            job("10", 0),
+            job("10", 1),
+            job("10", 5),
+            job("11", 2),
+        ];
+        let refs: Vec<&Job> = jobs.iter().collect();
+        assert_eq!(ranges(&refs), ["10_[0-1,3,5]", "11_2"]);
     }
 
     #[test]

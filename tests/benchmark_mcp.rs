@@ -484,7 +484,8 @@ fn a_stop_ends_a_live_run_and_its_tasks() {
     );
     assert_eq!(ended(&w, Duration::from_secs(30)), 130);
     let cancelled = std::fs::read_to_string(w.root().join("state/scancel.log")).unwrap();
-    assert_eq!(cancelled.split_whitespace().count(), 4, "{cancelled}");
+    // Each array job's two tasks, as one range.
+    assert_eq!(cancelled.trim(), "101_[0-1] 102_[0-1]", "{cancelled}");
     let (text, _) = s.call("benchmark_status", json!({ "name": "N1" }));
     assert!(text.contains(", exit 130\n"), "{text}");
     // The scores queued behind the sims are stopped with them.

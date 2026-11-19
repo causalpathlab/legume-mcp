@@ -378,15 +378,6 @@ pub fn check(spec: &Spec) -> Result<()> {
                         format!("{{{name}}} is for a stage with shards, and this one has none"),
                     ))
                 }
-                Ph::Stage(t) | Ph::Glob(t, _) => {
-                    if let Some(up) = spec.stages.iter().find(|s| s.name == t) {
-                        reads_sharded |= up.shards > 1;
-                        sharding(stage, up, at, name, matches!(ph, Ph::Glob(..)))?;
-                    }
-                }
-                _ => {}
-            }
-            match ph {
                 Ph::Method if method.name.is_none() => {
                     return Err(bad(at, "{method} is for a stage with methods"))
                 }
@@ -396,7 +387,10 @@ pub fn check(spec: &Spec) -> Result<()> {
                 Ph::Input(n) if !spec.inputs.iter().any(|i| i.name == n) => {
                     return Err(bad(at, format!("{{{name}}}: {n:?} is no declared input")))
                 }
-                Ph::Stage(t) => upstream(spec, si, method, t, at, name)?,
+                Ph::Stage(t) => {
+                    let up = upstream(spec, si, method, t, at, name)?;
+                    reads_sharded |= sharding(stage, up, at, name, false)?;
+                }
                 Ph::Glob(t, pattern) => {
                     if !is_plain_relative(pattern) {
                         return Err(bad(
@@ -404,7 +398,8 @@ pub fn check(spec: &Spec) -> Result<()> {
                             format!("{{{name}}}: a glob is {{glob:STAGE/PATTERN}}, the pattern inside the stage's folder"),
                         ));
                     }
-                    upstream(spec, si, method, t, at, name)?;
+                    let up = upstream(spec, si, method, t, at, name)?;
+                    reads_sharded |= sharding(stage, up, at, name, true)?;
                 }
                 _ => {}
             }
@@ -458,7 +453,14 @@ fn grid(spec: &Spec) -> Result<()> {
 
 /// `{<t>}` (or a glob in `t`) used at `at`, by `method` of stage `si`: `t` is
 /// an earlier stage, and a method of it this method may read.
-fn upstream(spec: &Spec, si: usize, method: &Method, t: &str, at: &str, name: &str) -> Result<()> {
+fn upstream<'a>(
+    spec: &'a Spec,
+    si: usize,
+    method: &Method,
+    t: &str,
+    at: &str,
+    name: &str,
+) -> Result<&'a Stage> {
     let Some(ti) = spec.stages.iter().position(|s| s.name == t) else {
         return Err(bad(at, format!("{{{name}}}: {t:?} is no stage")));
     };
@@ -476,7 +478,7 @@ fn upstream(spec: &Spec, si: usize, method: &Method, t: &str, at: &str, name: &s
     }
     let up = &spec.stages[ti];
     if !up.has_methods() {
-        return Ok(());
+        return Ok(up);
     }
     let names = || method_names(up).join(", ");
     match &method.name {
@@ -496,7 +498,7 @@ fn upstream(spec: &Spec, si: usize, method: &Method, t: &str, at: &str, name: &s
                 names()
             ),
         )),
-        Some(_) => Ok(()),
+        Some(_) => Ok(up),
     }
 }
 
@@ -504,13 +506,14 @@ fn upstream(spec: &Spec, si: usize, method: &Method, t: &str, at: &str, name: &s
 /// `glob`): a sharded stage's tasks pair with those of a stage of as many
 /// shards, shard by shard, and a combine stage reads all of them, by a
 /// glob, which spans their folders; any stage may read an unsharded one.
-fn sharding(stage: &Stage, up: &Stage, at: &str, name: &str, glob: bool) -> Result<()> {
+/// Whether `up` is sharded.
+fn sharding(stage: &Stage, up: &Stage, at: &str, name: &str, glob: bool) -> Result<bool> {
     if up.shards == 1 {
-        return Ok(());
+        return Ok(false);
     }
     if stage.combine {
         return if glob {
-            Ok(())
+            Ok(true)
         } else {
             Err(bad(
                 at,
@@ -533,7 +536,7 @@ fn sharding(stage: &Stage, up: &Stage, at: &str, name: &str, glob: bool) -> Resu
             ),
         ));
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The names of `stage`'s methods.
@@ -1118,76 +1121,82 @@ fn named_path(token: &str) -> &Path {
 /// Listed seeds nearer than this overlap in data-beans' streams.
 const CLOSE_SEEDS: u64 = 1 << 20;
 
-/// What `{glob:<folder>/<pattern>}` gives when a task starts: every path
-/// under `folder` that `pattern` matches (`*` and `?` within a part of
-/// the path, a hidden name only by a part that starts with `.`, as in a
-/// shell), natural-sorted, joined by commas; refused when none does.
-pub fn glob(folder: &Path, pattern: &str) -> Result<String> {
-    Ok(glob_paths(folder, pattern)?.join(","))
-}
-
 /// `argv` of a task reading the task folders `upstream`, with each
 /// `{glob:<path pattern>}` its plan holds expanded, as the task starts: a
 /// word that is a glob alone becomes a word per path it matches,
-/// natural-sorted; one inside a word, the paths joined by commas. Only a
-/// pattern in the folder of the tasks it reads is a glob (other text of
-/// that shape is left as it is), and only paths in those tasks' own
-/// folders count (not those of a shard the plan no longer has). Refused
+/// natural-sorted; one inside a word, the paths joined by commas. A glob
+/// names a task folder (in a combine stage, a pattern matching each
+/// shard's) and a pattern inside it; it is matched in the folders of the
+/// tasks it reads alone, so a shard an earlier plan had is never read, and
+/// text of that shape naming no such folder is left as it is. Refused
 /// when a glob matches nothing.
 pub fn expand_globs(argv: &[String], upstream: &[&Path]) -> Result<Vec<String>> {
-    let Some(tasks) = upstream.first().and_then(|d| d.parent()) else {
-        return Ok(argv.to_vec());
-    };
     let paths = |pattern: &str| -> Result<Option<Vec<String>>> {
-        if !Path::new(pattern).starts_with(tasks) {
+        let mut named = false;
+        let mut found = Vec::new();
+        for d in upstream {
+            let (Some(tasks), Some(name)) = (d.parent(), d.file_name()) else {
+                continue;
+            };
+            let Ok(rest) = Path::new(pattern).strip_prefix(tasks) else {
+                continue;
+            };
+            let mut parts = rest.iter();
+            let Some(first) = parts.next() else {
+                continue;
+            };
+            if !wild(first.as_encoded_bytes(), name.as_encoded_bytes()) {
+                continue;
+            }
+            named = true;
+            let inside = parts.as_path().to_string_lossy();
+            found.extend(glob_paths(d, &inside).unwrap_or_default());
+        }
+        if !named {
             return Ok(None);
         }
-        let found: Vec<String> = glob_paths(Path::new("/"), pattern)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|p| upstream.iter().any(|d| Path::new(p).starts_with(d)))
-            .collect();
         if found.is_empty() {
             return Err(refuse(format!(
                 "{{glob:{pattern}}} matches nothing in the folders of the tasks it reads"
             )));
         }
+        found.sort_by(|a, b| natural(a, b));
         Ok(Some(found))
     };
     let mut out = Vec::with_capacity(argv.len());
     for word in argv {
-        if let Some(pattern) = word
-            .strip_prefix("{glob:")
-            .and_then(|r| r.strip_suffix('}'))
-            .filter(|p| !p.contains('}'))
-        {
-            match paths(pattern)? {
-                Some(found) => out.extend(found),
-                None => out.push(word.clone()),
-            }
-            continue;
-        }
+        // Each glob in the word: alone, a word per path; else a list.
         let mut w = String::new();
         let mut rest = word.as_str();
+        let mut alone = None;
         while let Some(at) = rest.find("{glob:") {
             let Some(close) = rest[at..].find('}') else {
                 break;
             };
-            w.push_str(&rest[..at]);
-            match paths(&rest[at + "{glob:".len()..at + close])? {
-                Some(found) => w.push_str(&found.join(",")),
-                None => w.push_str(&rest[at..=at + close]),
+            let found = paths(&rest[at + "{glob:".len()..at + close])?;
+            let whole = at == 0 && close + 1 == rest.len() && w.is_empty();
+            match found {
+                Some(found) if whole => alone = Some(found),
+                Some(found) => w.push_str(&format!("{}{}", &rest[..at], found.join(","))),
+                None => w.push_str(&rest[..=at + close]),
             }
             rest = &rest[at + close + 1..];
         }
-        w.push_str(rest);
-        out.push(w);
+        match alone {
+            Some(found) => out.extend(found),
+            None => {
+                w.push_str(rest);
+                out.push(w);
+            }
+        }
     }
     Ok(out)
 }
 
-/// The paths of [`glob`], natural-sorted.
-fn glob_paths(folder: &Path, pattern: &str) -> Result<Vec<String>> {
+/// Every path under `folder` that `pattern` matches (`*` and `?` within a
+/// part of the path, a hidden name only by a part that starts with `.`,
+/// as in a shell), natural-sorted; refused when none does.
+pub fn glob_paths(folder: &Path, pattern: &str) -> Result<Vec<String>> {
     let mut found = vec![folder.to_path_buf()];
     for part in pattern.split('/').filter(|p| !p.is_empty()) {
         let mut next = Vec::new();
@@ -1502,7 +1511,7 @@ mod tests {
         // Not in the tasks' folder: text, as written.
         want.push("{glob:/elsewhere/*}".to_string());
         assert_eq!(expand_globs(&argv, &upstream).unwrap(), want);
-        let none = vec![format!("{{glob:{}/u*/x}}", d.path().display())];
+        let none = vec![format!("{{glob:{}/t.shard*/nope}}", d.path().display())];
         let e = expand_globs(&none, &upstream).unwrap_err();
         assert!(e.to_string().contains("matches nothing"), "{e}");
     }
@@ -1990,14 +1999,18 @@ mod tests {
         }
         let at = |n: &str| sec.join(n).display().to_string();
         assert_eq!(
-            glob(d.path(), "sim/sections/S*.zarr").unwrap(),
+            glob_paths(d.path(), "sim/sections/S*.zarr")
+                .unwrap()
+                .join(","),
             [at("S1.zarr"), at("S2.zarr"), at("S10.zarr")].join(",")
         );
         assert_eq!(
-            glob(d.path(), "sim/sections/S?.coords.*").unwrap(),
+            glob_paths(d.path(), "sim/sections/S?.coords.*")
+                .unwrap()
+                .join(","),
             at("S2.coords.parquet")
         );
-        let e = glob(d.path(), "sim/sections/T*.zarr").unwrap_err();
+        let e = glob_paths(d.path(), "sim/sections/T*.zarr").unwrap_err();
         assert_eq!(code(&e), 3);
         assert!(e
             .to_string()
@@ -2010,12 +2023,9 @@ mod tests {
         // A wildcard part, as in a shell, leaves out a hidden file (an
         // atomic write's temporary) unless it starts with a dot itself.
         std::fs::write(sec.join(".S3.zarr.123"), b"").unwrap();
+        assert_eq!(glob_paths(d.path(), "sim/sections/*").unwrap().len(), 4);
         assert_eq!(
-            glob(d.path(), "sim/sections/*").unwrap().split(',').count(),
-            4
-        );
-        assert_eq!(
-            glob(d.path(), "sim/sections/.S*").unwrap(),
+            glob_paths(d.path(), "sim/sections/.S*").unwrap().join(","),
             at(".S3.zarr.123")
         );
     }

@@ -478,10 +478,10 @@ fn a_queued_task_is_cancelled_and_one_running_is_left() {
 #[test]
 fn an_array_job_holds_at_most_the_clusters_max_array_size() {
     let mut c = Cluster::new();
-    let scontrol = c.root().join("bin/scontrol");
-    std::fs::write(&scontrol, "#!/bin/sh\necho 'MaxArraySize            = 2'\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&scontrol, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bench::write_tool(
+        &c.root().join("bin/scontrol"),
+        "echo 'MaxArraySize            = 2'",
+    );
     let ids: Vec<usize> = (1..=3)
         .map(|n| c.task(&format!("T{n}"), "true", 1, 1.0, 30))
         .collect();
