@@ -57,6 +57,16 @@ pub trait Executor {
     fn cancel_rekeyed(&mut self) -> Result<()> {
         Ok(())
     }
+    /// Its scheduler holds a task until its upstream tasks end, so the
+    /// pool launches tasks ahead of them ([`Pool::queue_ahead`]).
+    fn queues_ahead(&self) -> bool {
+        false
+    }
+    /// Cancels those of `tasks` that have not started; one that has ends as
+    /// it does. For an executor that [`Executor::queues_ahead`].
+    fn cancel_queued(&mut self, _tasks: &[usize]) -> Result<()> {
+        Ok(())
+    }
     /// The machine now. An executor whose scheduler places memory itself
     /// leaves `mem_available_gb` empty.
     fn live(&mut self) -> Result<Live>;
@@ -128,6 +138,15 @@ pub fn round(pool: &mut Pool, ex: &mut dyn Executor, clock: &mut dyn FnMut() -> 
     }
     if r.error.is_some() {
         return r;
+    }
+    // Kept until cancelled, so a round that fails here tries again.
+    if !pool.cancels().is_empty() {
+        let doomed = pool.cancels().to_vec();
+        if let Err(e) = ex.cancel_queued(&doomed) {
+            r.error = Some(e);
+            return r;
+        }
+        pool.cancelled();
     }
     let launch = match ex.live() {
         Ok(live) => pool.next(now, &live),

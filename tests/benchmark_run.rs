@@ -227,7 +227,9 @@ fn a_failed_sim_fails_the_run_and_its_score_is_skipped() {
     assert!(s.contains("2 failed") && s.contains("2 skipped"), "{s}");
     assert_eq!((w.count("failed"), w.count("skipped")), (2, 2));
     assert!(s.contains("gathered 0 of 2 scored tasks"), "{s}");
-    assert_eq!(w.log("sbatch.log").lines().count(), 1);
+    // The scores went in with the sims, behind them, and were cancelled.
+    assert_eq!(w.log("sbatch.log").lines().count(), 2);
+    assert!(w.log("sbatch.log").contains("--dependency=afterany:101"));
 }
 
 #[test]
@@ -322,8 +324,17 @@ fn ctrl_c_cancels_the_runs_tasks() {
     let status = wait(&mut child, Duration::from_secs(20)).expect("still running");
     assert_eq!(status.code(), Some(130));
     let cancelled = w.log("scancel.log");
-    assert_eq!(cancelled.split_whitespace().count(), 2, "{cancelled}");
-    assert_eq!((w.count("stop-requested"), w.count("stopped")), (2, 2));
+    // The sims and the scores queued behind them; the scores, which never
+    // ran, are skipped.
+    assert_eq!(cancelled.split_whitespace().count(), 4, "{cancelled}");
+    assert_eq!(
+        (
+            w.count("stop-requested"),
+            w.count("stopped"),
+            w.count("skipped")
+        ),
+        (4, 2, 2)
+    );
 }
 
 #[test]
@@ -557,8 +568,8 @@ fn a_detached_run_returns_at_once_and_stop_cancels_its_tasks() {
     };
     assert_eq!(exit, 130);
     let cancelled = w.log("scancel.log");
-    assert_eq!(cancelled.split_whitespace().count(), 2, "{cancelled}");
-    assert_eq!(w.count("stopped"), 2);
+    assert_eq!(cancelled.split_whitespace().count(), 4, "{cancelled}");
+    assert_eq!((w.count("stopped"), w.count("skipped")), (2, 2));
     let log = std::fs::read_to_string(w.project().join("results/benchmarks/N1/run.log")).unwrap();
     assert!(log.contains("planning N1 on REMOTE1"), "{log}");
     assert!(log.contains("the run ended, exit 130"), "{log}");

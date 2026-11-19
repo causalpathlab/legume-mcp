@@ -58,7 +58,7 @@ const LINGER: Duration = Duration::from_secs(1);
 const TICK: Duration = Duration::from_millis(50);
 
 /// `legume benchmark task` with `args` (those after `task`).
-pub fn main(args: &[String], out: &mut dyn Write, _err: &mut dyn Write) -> Result<()> {
+pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result<()> {
     let Some(pairs) = flag_pairs(args)? else {
         return Ok(writeln!(out, "{USAGE}")?);
     };
@@ -88,6 +88,22 @@ pub fn main(args: &[String], out: &mut dyn Write, _err: &mut dyn Write) -> Resul
     // A folder whose earlier attempt cannot be set aside is not written
     // to at all: the runner counts the task lost.
     let attempt = set_aside(&task.dir)?;
+    // A task queued ahead whose upstream did not end done is not run: it
+    // ends stopped, and the runner counts it skipped.
+    if let Some(up) = task.upstream.iter().find(|id| {
+        !plan
+            .tasks
+            .iter()
+            .find(|u| &u.id == *id)
+            .is_some_and(|u| u.done_in(&u.dir))
+    }) {
+        let mut exit = ended_unrun(task, Outcome::Stopped);
+        exit.attempt = attempt;
+        exit.stopped = true;
+        crate::job::replace(&task.dir, "exit.json", crate::pretty(&exit)?.as_bytes())?;
+        writeln!(err, "task {}: upstream {up} is not done; not run", task.id)?;
+        return Ok(());
+    }
     let ran = run(task, attempt, Duration::from_secs(plan.grace_secs));
     if ran.is_err() {
         failed_itself(task);
@@ -103,11 +119,19 @@ pub fn main(args: &[String], out: &mut dyn Write, _err: &mut dyn Write) -> Resul
 /// the Slurm log), so the runner sees the end now and not only once the
 /// task is lost; nothing when even that cannot be written.
 fn failed_itself(t: &Task) {
-    let exit = TaskExit {
+    if let Ok(text) = crate::pretty(&ended_unrun(t, Outcome::Failed)) {
+        let _ = crate::job::replace(&t.dir, "exit.json", text.as_bytes());
+    }
+}
+
+/// The `exit.json` of task `t` that ended `outcome` with its tool never
+/// run.
+fn ended_unrun(t: &Task, outcome: Outcome) -> TaskExit {
+    TaskExit {
         task: t.id.clone(),
         key: t.key.clone(),
         attempt: 0,
-        outcome: Outcome::Failed,
+        outcome,
         exit: None,
         signal: None,
         timed_out: false,
@@ -118,9 +142,6 @@ fn failed_itself(t: &Task) {
         cpu_secs: 0.0,
         max_rss_mb: 0.0,
         node: super::machine::host().unwrap_or_default(),
-    };
-    if let Ok(text) = crate::pretty(&exit) {
-        let _ = crate::job::replace(&t.dir, "exit.json", text.as_bytes());
     }
 }
 

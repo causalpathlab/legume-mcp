@@ -497,7 +497,10 @@ impl<'a> Runner<'a> {
         dir: &Path,
     ) -> Result<Self> {
         let stages: Vec<&str> = spec.stages.iter().map(|s| s.name.as_str()).collect();
-        let pool = Pool::new(Want::of_plan(tasks, &stages)?, budget)?;
+        let mut pool = Pool::new(Want::of_plan(tasks, &stages)?, budget)?;
+        if ex.queues_ahead() {
+            pool.queue_ahead();
+        }
         Ok(Runner {
             skipped_said: vec![false; tasks.len()],
             tasks,
@@ -655,8 +658,16 @@ impl<'a> Runner<'a> {
         } in &round.ended
         {
             let at = self.submitted.get(task).copied();
+            // One launched ahead and cancelled behind an upstream that did
+            // not end done never ran: skipped, not stopped.
+            let word = if matches!(self.pool.state(*task), State::Skipped { .. }) {
+                self.skipped_said[*task] = true;
+                SKIPPED
+            } else {
+                outcome.word()
+            };
             self.events
-                .row(&self.tasks[*task], outcome.word(), exit.as_ref(), at)?;
+                .row(&self.tasks[*task], word, exit.as_ref(), at)?;
         }
         let at = unix_secs();
         for l in &round.launched {
