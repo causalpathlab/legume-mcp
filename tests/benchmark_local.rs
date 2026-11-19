@@ -147,6 +147,40 @@ fn a_spec_runs_here_is_gathered_and_a_run_again_reuses_it() {
 }
 
 #[test]
+fn a_run_that_would_rerun_finished_tasks_under_a_new_key_is_refused() {
+    let w = World::new("0");
+    assert!(w.run().status.success());
+    // M1's argv changed: its four tasks are keyed anew.
+    let spec = SPEC.replace("\"0.{A}\"", "\"0.{A}0\"");
+    std::fs::write(w.root().join("spec.json"), spec).unwrap();
+    let plan = std::fs::read(w.bench().join("plan.json")).unwrap();
+    let o = w.run();
+    let s = said(&o);
+    assert!(!o.status.success(), "{s}");
+    // The last plan, with its scores, is kept.
+    assert_eq!(std::fs::read(w.bench().join("plan.json")).unwrap(), plan);
+    assert!(s.contains("4 task(s) an earlier run finished"), "{s}");
+    assert!(s.contains("--rerun-changed"), "{s}");
+    // Nothing started, nothing moved.
+    assert_eq!(w.count("start"), 12, "{s}");
+    assert!(!w.bench().join("tasks/.attempts").exists());
+
+    let o = w
+        .legume(&["benchmark", "run", "spec.json", "--rerun-changed"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", said(&o));
+    assert!(said(&o).contains("8 done before"), "{}", said(&o));
+    assert_eq!(w.count("start"), 16);
+    // The four earlier results are kept whole.
+    let kept = std::fs::read_dir(w.bench().join("tasks/.attempts"))
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().path().join("done.json").exists())
+        .count();
+    assert_eq!(kept, 4);
+}
+
+#[test]
 fn ctrl_c_stops_the_tasks_here() {
     let w = World::new("30");
     let child = w

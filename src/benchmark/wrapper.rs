@@ -16,7 +16,7 @@
 //! ([`set_aside`]).
 
 use super::executor::TaskExit;
-use super::plan::Task;
+use super::plan::{Task, ATTEMPTS, PLACED};
 use super::pool::Outcome;
 use crate::command::{canonical_flags, failed, flag_pairs, required, usage, Flag};
 use crate::procgroup::Group;
@@ -57,13 +57,6 @@ const LINGER: Duration = Duration::from_secs(1);
 /// How often the wrapper looks at the tool, its clock and its own stop.
 const TICK: Duration = Duration::from_millis(50);
 
-/// The folder beside the task folders that earlier attempts are moved to.
-pub(crate) const ATTEMPTS: &str = ".attempts";
-
-/// What a folder of a new attempt may already hold: its placement, which
-/// a Slurm launch writes before the attempt starts.
-pub(crate) const PLACED: &str = "slurm.json";
-
 /// `legume benchmark task` with `args` (those after `task`).
 pub fn main(args: &[String], out: &mut dyn Write, _err: &mut dyn Write) -> Result<()> {
     let Some(pairs) = flag_pairs(args)? else {
@@ -91,6 +84,7 @@ pub fn main(args: &[String], out: &mut dyn Write, _err: &mut dyn Write) -> Resul
     let Some(task) = plan.tasks.iter().find(|t| t.id == id) else {
         return Err(usage(format!("{}: no task {id}", plan_file.display())));
     };
+    placed_for(task)?;
     // A folder whose earlier attempt cannot be set aside is not written
     // to at all: the runner counts the task lost.
     let attempt = set_aside(&task.dir)?;
@@ -127,6 +121,32 @@ fn failed_itself(t: &Task) {
     };
     if let Ok(text) = crate::pretty(&exit) {
         let _ = crate::job::replace(&t.dir, "exit.json", text.as_bytes());
+    }
+}
+
+/// Refused, before anything is written, when this array job was placed
+/// for task `t` under another key (its `slurm.json` names this job and
+/// another key): the plan was made anew since, and this job runs only
+/// what it was placed for. A refused run leaves such jobs queued.
+fn placed_for(t: &Task) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct Placed {
+        array_job_id: String,
+        key: String,
+    }
+    let Ok(job) = std::env::var("SLURM_ARRAY_JOB_ID") else {
+        return Ok(());
+    };
+    let placed = std::fs::read(t.dir.join(PLACED))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Placed>(&b).ok());
+    match placed {
+        Some(p) if p.array_job_id == job && p.key != t.key => Err(usage(format!(
+            "task {}: array job {job} was placed for key {}, and the plan now has {}; \
+             not run",
+            t.id, p.key, t.key
+        ))),
+        _ => Ok(()),
     }
 }
 

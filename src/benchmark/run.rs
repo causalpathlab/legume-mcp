@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 /// `legume benchmark run`'s usage.
 pub const USAGE: &str = "\
-legume benchmark run SPEC [--on REMOTE] [--detach]
+legume benchmark run SPEC [--on REMOTE] [--detach] [--rerun-changed]
 
 Without --on, runs the benchmark of the spec SPEC on this machine: the
 spec is planned here (as legume benchmark plan does), and each task
@@ -60,9 +60,20 @@ With --detach, the run starts in the background, in a session of its
 own, and this returns at once: its output goes to run.log in the
 benchmark's folder, and its pid to runner.json there. legume benchmark
 stop NAME stops it as Ctrl-C would. A remote not kept yet is asked for
-first.";
+first.
 
-const FLAGS: &[Flag] = &[Flag::once(&["--on"]), Flag::switch(&["--detach"])];
+A task the spec changed since an earlier run finished it (its argv,
+inputs, tool or upstream, so its key) would run again; a run that would
+do so is refused, before anything starts or is cancelled, naming them.
+With --rerun-changed, such tasks run again, and an attempt of one still
+queued is cancelled. An earlier attempt is never written over: it is
+kept whole under tasks/.attempts in the benchmark's folder.";
+
+const FLAGS: &[Flag] = &[
+    Flag::once(&["--on"]),
+    Flag::switch(&["--detach"]),
+    Flag::switch(&["--rerun-changed"]),
+];
 
 /// Cores the pool may book at once on a cluster: Slurm's scheduler and
 /// each method's max_running are the real limits.
@@ -114,21 +125,22 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
     let Some(given) = flags(FLAGS, rest)? else {
         return Ok(writeln!(out, "{USAGE}")?);
     };
-    let (mut on, mut detach) = (None, false);
+    let (mut on, mut detach, mut rerun_changed) = (None, false, false);
     for (flag, v) in given {
         match flag {
             "--detach" => detach = true,
+            "--rerun-changed" => rerun_changed = true,
             _ => on = Some(v.to_string()),
         }
     }
     let spec = spec.ok_or_else(|| usage("run needs SPEC, the spec's JSON file"))?;
     if detach {
-        return super::runner::detach_main(&spec, on.as_deref(), out);
+        return super::runner::detach_main(&spec, on.as_deref(), rerun_changed, out);
     }
     super::runner::keep_alive_lock();
     let ran = match &on {
-        Some(on) => run(&spec, on, out, err),
-        None => run_here(&spec, out, err),
+        Some(on) => run(&spec, on, rerun_changed, out, err),
+        None => run_here(&spec, rerun_changed, out, err),
     };
     let result = ran.and_then(|code| match code {
         0 => Ok(()),
@@ -142,8 +154,15 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
     result
 }
 
-/// The run of spec `spec_file` on remote `on`: its exit code.
-fn run(spec_file: &Path, on: &str, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32> {
+/// The run of spec `spec_file` on remote `on`, rerunning the tasks it
+/// changed when `rerun_changed`: its exit code.
+fn run(
+    spec_file: &Path,
+    on: &str,
+    rerun_changed: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<i32> {
     let text = std::fs::read_to_string(spec_file)
         .with_context(|| format!("reading {}", spec_file.display()))?;
     let (spec, value) = super::spec::parse(&text)?;
@@ -166,6 +185,7 @@ fn run(spec_file: &Path, on: &str, out: &mut dyn Write, err: &mut dyn Write) -> 
         }),
         remote: &remote,
         shell: &shell,
+        rerun_changed,
     };
     let local = root.join(super::bench_rel(&spec.name));
     let result = c.run(&spec, &spec_key, &text, &local, out, err);
@@ -175,17 +195,25 @@ fn run(spec_file: &Path, on: &str, out: &mut dyn Write, err: &mut dyn Write) -> 
 
 /// The run of spec `spec_file` on this machine: planned here, each task
 /// under the wrapper as a child of this process, the scores gathered
-/// here: its exit code.
+/// here, rerunning the tasks it changed when `rerun_changed`: its exit
+/// code.
 #[cfg(target_os = "linux")]
-fn run_here(spec_file: &Path, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32> {
+fn run_here(
+    spec_file: &Path,
+    rerun_changed: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<i32> {
     let text = std::fs::read_to_string(spec_file)
         .with_context(|| format!("reading {}", spec_file.display()))?;
     let (spec, value) = super::spec::parse(&text)?;
     let spec_key = super::key::spec_key(&value);
     let root = crate::project::root().context("finding the project's folder")?;
-    super::plan_spec(&root, spec_file, false, out, err)?;
     let dir = root.join(super::bench_rel(&spec.name));
     let plan_file = dir.join("plan.json");
+    // The last plan, with its scores, put back when the run is refused.
+    let last_plan = std::fs::read(&plan_file).ok();
+    super::plan_spec(&root, spec_file, false, out, err)?;
     let plan: PlanDoc = serde_json::from_slice(
         &std::fs::read(&plan_file).with_context(|| format!("reading {}", plan_file.display()))?,
     )
@@ -198,8 +226,13 @@ fn run_here(spec_file: &Path, out: &mut dyn Write, err: &mut dyn Write) -> Resul
         Box::new(ex),
         LOCAL_PACE,
         &dir,
-        out,
     )?;
+    if let Err(e) = r.resume(rerun_changed, out) {
+        if let Some(last) = last_plan {
+            crate::job::replace(&dir, "plan.json", &last)?;
+        }
+        return Err(e);
+    }
     let code = r.finish(&dir, out, err)?;
     // Its wrappers are gone before the scores are read.
     drop(r);
@@ -215,7 +248,7 @@ fn run_here(spec_file: &Path, out: &mut dyn Write, err: &mut dyn Write) -> Resul
 
 /// A run here needs the wrapper, which runs on Linux only.
 #[cfg(not(target_os = "linux"))]
-fn run_here(_: &Path, _: &mut dyn Write, _: &mut dyn Write) -> Result<i32> {
+fn run_here(_: &Path, _: bool, _: &mut dyn Write, _: &mut dyn Write) -> Result<i32> {
     Err(usage(
         "a run on this machine needs Linux (its wrapper does); use --on REMOTE",
     ))
@@ -235,6 +268,8 @@ struct Cluster<'a> {
     dir: String,
     /// `legume` there.
     legume: String,
+    /// Tasks the spec changed since an earlier run are run again.
+    rerun_changed: bool,
 }
 
 impl Cluster<'_> {
@@ -345,10 +380,6 @@ impl Cluster<'_> {
                 t.id
             )));
         }
-        // plan.json here from the start, so a status read while the run
-        // goes on knows every task; the end writes it again with the scores.
-        std::fs::create_dir_all(local).with_context(|| format!("making {}", local.display()))?;
-        super::gather::write(local, "plan.json", &plan_text)?;
         let bench = self.bench(&spec.name);
         let site = Site {
             legume: self.legume.clone(),
@@ -371,15 +402,13 @@ impl Cluster<'_> {
             plan.tasks.clone(),
             plan.grace_secs,
         );
-        let mut r = Runner::start(
-            &plan.tasks,
-            spec,
-            budget,
-            Box::new(ex),
-            CLUSTER_PACE,
-            local,
-            out,
-        )?;
+        std::fs::create_dir_all(local).with_context(|| format!("making {}", local.display()))?;
+        let mut r = Runner::start(&plan.tasks, spec, budget, Box::new(ex), CLUSTER_PACE, local)?;
+        r.resume(self.rerun_changed, out)?;
+        // plan.json here once the run goes ahead (a refused one leaves the
+        // last, with its scores), so a status read while the run goes on
+        // knows every task; the end writes it again with the scores.
+        super::gather::write(local, "plan.json", &plan_text)?;
         let code = r.finish(local, out, err)?;
         // A run stopped by hand ends now; the next run gathers.
         if super::stop::asked() {
@@ -458,8 +487,7 @@ struct Runner<'a> {
 
 impl<'a> Runner<'a> {
     /// The runner of `tasks`, the plan of `spec`, within `budget`, by
-    /// `ex` at `pace`, its events kept in `dir`; what an earlier run left
-    /// resumed, as said on `out`.
+    /// `ex` at `pace`, its events kept in `dir`; [`Self::resume`] next.
     fn start(
         tasks: &'a [Task],
         spec: &super::spec::Spec,
@@ -467,11 +495,10 @@ impl<'a> Runner<'a> {
         ex: Box<dyn Executor>,
         pace: Pace,
         dir: &Path,
-        out: &mut dyn Write,
     ) -> Result<Self> {
         let stages: Vec<&str> = spec.stages.iter().map(|s| s.name.as_str()).collect();
         let pool = Pool::new(Want::of_plan(tasks, &stages)?, budget)?;
-        let mut r = Runner {
+        let r = Runner {
             skipped_said: vec![false; tasks.len()],
             tasks,
             pool,
@@ -481,7 +508,6 @@ impl<'a> Runner<'a> {
             submitted: HashMap::new(),
             started: Instant::now(),
         };
-        r.resume(out)?;
         Ok(r)
     }
 
@@ -497,9 +523,35 @@ impl<'a> Runner<'a> {
     }
 
     /// What an earlier run left, as the executor finds it: tasks done
-    /// reused, tasks still queued adopted.
-    fn resume(&mut self, out: &mut dyn Write) -> Result<()> {
-        let resumed = self.ex.resume()?;
+    /// reused, tasks still queued adopted; refused, before anything
+    /// changes, when tasks finished or queued under another key would run
+    /// again, unless `rerun_changed`.
+    fn resume(&mut self, rerun_changed: bool, out: &mut dyn Write) -> Result<()> {
+        let resumed = self.ex.resume(rerun_changed)?;
+        if !resumed.rekeyed.is_empty() {
+            let n = resumed.rekeyed.len();
+            let some: Vec<&str> = resumed
+                .rekeyed
+                .iter()
+                .take(3)
+                .map(|&i| self.tasks[i].id.as_str())
+                .collect();
+            let more = if n > some.len() { ", ..." } else { "" };
+            let said = format!(
+                "{n} task(s) an earlier run finished or queued under another key would run \
+                 again ({}{more}): the spec changed what they run (an argv word, an input, \
+                 a tool or an upstream task)",
+                some.join(", ")
+            );
+            if !rerun_changed {
+                return Err(refuse(format!(
+                    "{said}. Nothing was started or cancelled. Put the spec back to reuse \
+                     them, or run with --rerun-changed (benchmark_start's rerun_changed) to \
+                     run them anew; their earlier attempts are kept under tasks/.attempts"
+                )));
+            }
+            writeln!(out, "{said}; running them anew (--rerun-changed)")?;
+        }
         self.pool.resume(0, &resumed.done, &resumed.adopted)?;
         for (list, event) in [(&resumed.done, REUSED), (&resumed.adopted, ADOPTED)] {
             for &i in list {

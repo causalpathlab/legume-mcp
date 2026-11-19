@@ -549,3 +549,30 @@ fn a_folder_whose_attempt_cannot_be_set_aside_is_not_written_to() {
     );
     assert!(!dir.join("exit.json").exists());
 }
+
+#[test]
+fn a_job_placed_for_another_key_does_not_run() {
+    let mut b = Bench::new();
+    let dir = b.task("T1", "printf ran > out", &["out"], 30);
+    let plan = b.plan(1);
+    std::fs::create_dir_all(&dir).unwrap();
+    let placed = r#"{"array_job_id": "77", "index": 0, "key": "old"}"#;
+    std::fs::write(dir.join("slurm.json"), placed).unwrap();
+    // Job 77 was placed for the old key: refused, nothing written.
+    let o = wrapper(&plan)
+        .args(["--task", "T1"])
+        .env("SLURM_ARRAY_JOB_ID", "77")
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    assert!(said(&o).contains("placed for key old"), "{}", said(&o));
+    assert!(!dir.join("out").exists() && !dir.join("exit.json").exists());
+    // Another job, placed since: it runs.
+    let o = wrapper(&plan)
+        .args(["--task", "T1"])
+        .env("SLURM_ARRAY_JOB_ID", "78")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", said(&o));
+    assert!(dir.join("out").exists());
+}

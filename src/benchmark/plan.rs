@@ -116,6 +116,13 @@ pub struct Task {
     pub key: String,
 }
 
+/// The folder beside the task folders that earlier attempts are moved to.
+pub(crate) const ATTEMPTS: &str = ".attempts";
+
+/// What a folder of a new attempt may already hold: its placement, which
+/// a Slurm launch writes before the attempt starts.
+pub(crate) const PLACED: &str = "slurm.json";
+
 impl Task {
     /// It is done in `dir`, where its files are: its `done.json` has its
     /// key.

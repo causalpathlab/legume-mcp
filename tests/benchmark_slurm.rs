@@ -366,7 +366,8 @@ fn resume_finds_done_tasks_by_key_and_adopts_queued_ones() {
         std::fs::create_dir_all(dir(n)).unwrap();
     }
     // T1 done with its key, T2 done with another; T3 queued; T4 placed
-    // but ended, so not adopted; T5 queued for another key, so cancelled.
+    // but ended, so not adopted; T5 queued for another key, so cancelled
+    // when asked to rerun what changed.
     std::fs::write(dir(1).join("done.json"), r#"{"key": "key-T1"}"#).unwrap();
     std::fs::write(dir(2).join("done.json"), r#"{"key": "old"}"#).unwrap();
     for (n, key) in [(3, "key-T3"), (4, "key-T4"), (5, "old")] {
@@ -376,10 +377,15 @@ fn resume_finds_done_tasks_by_key_and_adopts_queued_ones() {
         c.queue(&format!("77_{n}"), "R");
     }
     std::fs::write(dir(4).join("exit.json"), "{}").unwrap();
+    // Without rerun_changed, the queued attempt of another key is left.
+    let r = c.slurm(100).resume(false).unwrap();
+    assert_eq!(r.rekeyed, vec![ids[1], ids[4]]);
+    assert_eq!(c.log("scancel.log").trim(), "");
     let mut s = c.slurm(100);
-    let r = s.resume().unwrap();
+    let r = s.resume(true).unwrap();
     assert_eq!(r.done, vec![ids[0]]);
     assert_eq!(r.adopted, vec![ids[2]]);
+    assert_eq!(r.rekeyed, vec![ids[1], ids[4]]);
     assert_eq!(c.log("scancel.log").trim(), "77_5");
     // The adopted task is watched, and ends by its exit.json.
     assert!(s.poll().unwrap().is_empty());

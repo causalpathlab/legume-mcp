@@ -27,10 +27,9 @@
 //! but bash, coreutils and Slurm's own commands.
 
 use super::executor::{Ended, Executor, Resumed, TaskExit};
-use super::plan::Task;
+use super::plan::{Task, ATTEMPTS, PLACED};
 use super::pool::{Launch, Live, Outcome};
 use super::remote::Shell;
-use super::wrapper::{ATTEMPTS, PLACED};
 use crate::project::quote;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -113,12 +112,13 @@ impl Slurm {
     /// On resume, one shell call: the tasks done in an earlier run (their
     /// `done.json` has the task's key), and the tasks of an earlier run
     /// still in the queue (`slurm.json` names an array task the queue
-    /// has, and no `exit.json` says it ended), which are adopted. One
-    /// still queued for another key, an attempt of a task rekeyed since,
-    /// is cancelled. The script is the same size for any number of
-    /// tasks: one `find` at the tasks' depth under their common folder,
-    /// and one `awk` that prints each file found.
-    fn resumed(&mut self) -> Result<Resumed> {
+    /// has, and no `exit.json` says it ended), which are adopted. A task
+    /// done, or still queued, for another key is rekeyed; one still
+    /// queued is cancelled only when `rerun_changed`. The script is the
+    /// same size for any number of tasks: one `find` at the tasks' depth
+    /// under their common folder, and one `awk` that prints each file
+    /// found.
+    fn resumed(&mut self, rerun_changed: bool) -> Result<Resumed> {
         let root = common_folder(self.tasks.iter().map(|t| t.dir.as_path()))
             .context("a plan with no tasks")?;
         let depths = self.tasks.iter().map(|t| {
@@ -154,9 +154,13 @@ impl Slurm {
             let done = f
                 .and_then(|f| f.done.as_deref())
                 .and_then(|j| super::plan::done_key(j.as_bytes()));
-            if done.is_some_and(|k| k == t.key) {
-                resumed.done.push(i);
-                continue;
+            match done {
+                Some(k) if k == t.key => {
+                    resumed.done.push(i);
+                    continue;
+                }
+                Some(_) => resumed.rekeyed.push(i),
+                None => {}
             }
             let placed = f
                 .filter(|f| !f.exit)
@@ -172,7 +176,12 @@ impl Slurm {
                 .filter(|(j, _)| poll.queued.contains(j) || poll.pending.contains(j));
             match placed {
                 Some((job, true)) => watched.push((i, job)),
-                Some((job, false)) => stale.push(quote(&job.id())),
+                Some((job, false)) => {
+                    stale.push(quote(&job.id()));
+                    if resumed.rekeyed.last() != Some(&i) {
+                        resumed.rekeyed.push(i);
+                    }
+                }
                 None => {}
             }
         }
@@ -180,7 +189,7 @@ impl Slurm {
             self.watch(i, job);
             resumed.adopted.push(i);
         }
-        if !stale.is_empty() {
+        if rerun_changed && !stale.is_empty() {
             self.shell.check(
                 &format!("scancel {} || true", stale.join(" ")),
                 "cancelling attempts of tasks rekeyed since",
@@ -416,8 +425,8 @@ fn aside_fn() -> String {
 const GROUP: &str = "@@group ";
 
 impl Executor for Slurm {
-    fn resume(&mut self) -> Result<Resumed> {
-        self.resumed()
+    fn resume(&mut self, rerun_changed: bool) -> Result<Resumed> {
+        self.resumed(rerun_changed)
     }
 
     fn live(&mut self) -> Result<Live> {
