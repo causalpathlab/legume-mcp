@@ -1,6 +1,7 @@
 //! Stand-in Slurm and ssh commands for the executor and runner tests,
-//! keeping their queue in `$FAKE_SLURM`: `sbatch` runs each array task at
-//! once in the background (or holds it with `$FAKE_SLURM_HOLD`, or fails
+//! keeping their queue in `$FAKE_SLURM`: `sbatch` runs each array task in
+//! the background once the array jobs of its `--dependency=afterany:` have
+//! left the queue, at most its `%K` throttle at once (or holds it with `$FAKE_SLURM_HOLD`, or fails
 //! from submit `$FAKE_SLURM_FAIL_AT` on), `squeue` and `scancel` read and
 //! change the queue, `srun` and `ssh` run their command here (ssh drops
 //! call `$FAKE_SSH_FAIL_AT`).
@@ -35,14 +36,19 @@ n=$(( $(cat "$S/submits" 2>/dev/null || echo 0) + 1 )); echo $n > "$S/submits"
 if [ -n "$FAKE_SLURM_FAIL_AT" ] && [ "$n" -ge "$FAKE_SLURM_FAIL_AT" ]; then
   echo "sbatch: error: Batch job submission failed" >&2; exit 1
 fi
+deps=""
 for a in "$@"; do
   case $a in
     --job-name=*) name=${a#*=} ;;
     --array=0-*) last=${a#--array=0-} ;;
+    --dependency=afterany:*) deps=${a#--dependency=afterany:} ;;
     --output=*) out=${a#*=} ;;
     --wrap=*) wrap=${a#*=} ;;
   esac
 done
+# --array=0-N%K: at most K of the array's tasks run at once.
+throttle=""
+case $last in *%*) throttle=${last#*%}; last=${last%%%*} ;; esac
 jid=$(( 100 + n ))
 # A batch job, not an array: kept in the queue, pending.
 if [ -z "$last" ]; then
@@ -51,15 +57,33 @@ if [ -z "$last" ]; then
 fi
 for i in $(seq 0 "$last"); do
   q="$S/q/${jid}_$i"
-  mkdir -p "$q"; echo "$name" > "$q/name"
-  if [ -n "$FAKE_SLURM_HOLD" ]; then echo PD > "$q/state"; continue; fi
-  echo R > "$q/state"
-  (
-    o=${out//%A/$jid}; o=${o//%a/$i}
-    SLURM_ARRAY_TASK_ID=$i bash -c "$wrap" > "$o" 2>&1 &
-    p=$!; echo $p > "$q/pid"; wait $p; rm -rf "$q"
-  ) > /dev/null 2>&1 &
+  mkdir -p "$q"; echo "$name" > "$q/name"; echo PD > "$q/state"
 done
+[ -n "$FAKE_SLURM_HOLD" ] && { echo "$jid"; exit 0; }
+# Each task in turn: once every array job it is after has left the queue,
+# and fewer than the throttle of its own run. One cancelled while pending
+# is gone, and passed.
+(
+  for d in ${deps//:/ }; do
+    while compgen -G "$S/q/${d}_*" > /dev/null; do sleep 0.05; done
+  done
+  for i in $(seq 0 "$last"); do
+    q="$S/q/${jid}_$i"
+    if [ -n "$throttle" ]; then
+      while [ "$(grep -lx R "$S"/q/${jid}_*/state 2>/dev/null | wc -l)" -ge "$throttle" ]; do
+        sleep 0.05
+      done
+    fi
+    [ -d "$q" ] || continue
+    echo R > "$q/state"
+    (
+      o=${out//%A/$jid}; o=${o//%a/$i}
+      SLURM_ARRAY_TASK_ID=$i bash -c "$wrap" > "$o" 2>&1 &
+      p=$!; echo $p > "$q/pid"; wait $p; rm -rf "$q"
+    ) &
+  done
+  wait
+) > /dev/null 2>&1 &
 echo "$jid"
 "#;
 
@@ -85,13 +109,25 @@ const SCANCEL: &str = r#"#!/bin/bash
 S=$FAKE_SLURM
 echo "$*" >> "$S/scancel.log"
 code=0
+# <jid>_[1-3,5] names those tasks of the array job.
 for j in "$@"; do
-  case $j in *_*) pat=$j ;; *) pat="${j}_*" ;; esac
+  case $j in
+    *_\[*\])
+      a=${j%%_*}; list=${j#*_[}; list=${list%]}; pats=()
+      for r in ${list//,/ }; do
+        case $r in *-*) for i in $(seq "${r%-*}" "${r#*-}"); do pats+=("${a}_$i"); done ;;
+          *) pats+=("${a}_$r") ;; esac
+      done ;;
+    *_*) pats=("$j") ;;
+    *) pats=("${j}_*") ;;
+  esac
   found=0
-  for q in "$S"/q/$pat; do
-    [ -d "$q" ] || continue
-    found=1
-    if [ -f "$q/pid" ]; then kill -TERM "$(cat "$q/pid")"; else rm -rf "$q"; fi
+  for pat in "${pats[@]}"; do
+    for q in "$S"/q/$pat; do
+      [ -d "$q" ] || continue
+      found=1
+      if [ -f "$q/pid" ]; then kill -TERM "$(cat "$q/pid")"; else rm -rf "$q"; fi
+    done
   done
   [ $found = 1 ] || { echo "scancel: error: Invalid job id $j" >&2; code=1; }
 done

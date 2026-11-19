@@ -25,6 +25,13 @@
 //!   skipped. The benchmark halts when every method of a stage has
 //!   halted; then nothing starts.
 //! - **Downstream** of a task that did not end done is skipped.
+//! - **Ahead.** For an executor whose scheduler holds a task until its
+//!   upstream ends ([`Pool::queue_ahead`]), a task is ready once every
+//!   task upstream of it is done or launched, so a whole plan goes in at
+//!   once; a method's `max_running` is the scheduler's to keep. A task
+//!   launched behind one that then does not end done, or of a method that
+//!   halts, is to be cancelled ([`Pool::cancels`]); it ends skipped
+//!   when it ends stopped.
 //! - **Accounting**, in core-ms between events: `booked` (threads
 //!   running) and the free cores, as `slack` when a ready task fits but
 //!   waits for the next round, `no_fit` when a ready task lacks only
@@ -239,6 +246,13 @@ pub struct Pool {
     draining: bool,
     halted: Option<String>,
     live: Live,
+    /// Tasks are launched ahead of their upstream.
+    ahead: bool,
+    /// Launched tasks to cancel, with why: the upstream task that did not
+    /// end done, or `None` for their method's halt.
+    doomed: HashMap<usize, Option<usize>>,
+    /// Of `doomed`, those not yet [`Pool::cancelled`], with their cause.
+    cancels: Vec<(usize, Option<usize>)>,
     /// How long a task may be passed over; [`STARVE_MS`] by default.
     pub starve_ms: u64,
     acct: Acct,
@@ -324,6 +338,9 @@ impl Pool {
             draining: false,
             halted: None,
             live: Live::default(),
+            ahead: false,
+            doomed: HashMap::new(),
+            cancels: Vec::new(),
             starve_ms: STARVE_MS,
             acct: Acct::default(),
             at: 0,
@@ -369,7 +386,29 @@ impl Pool {
             .sum()
     }
 
-    /// The tasks to launch at `now`, with the machine as `live` says.
+    /// From now, tasks are launched ahead of their upstream: the executor's
+    /// scheduler holds each until its upstream ends, and keeps each
+    /// method's `max_running`.
+    pub fn queue_ahead(&mut self) {
+        self.ahead = true;
+    }
+
+    /// The launched tasks to cancel, until [`Pool::cancelled`]: each with
+    /// the upstream task that did not end done (it cannot run, started or
+    /// not), or `None` when its method halted (only one not started is
+    /// cancelled).
+    pub fn cancels(&self) -> &[(usize, Option<usize>)] {
+        &self.cancels
+    }
+
+    /// The tasks [`Pool::cancels`] gave are cancelled.
+    pub fn cancelled(&mut self) {
+        self.cancels.clear();
+    }
+
+    /// The tasks to launch at `now`, with the machine as `live` says;
+    /// ahead, every task whose upstream is done or launched, at any depth
+    /// (one pass in plan order, where a task is after those it reads).
     pub fn next(&mut self, now: u64, live: &Live) -> Vec<Launch> {
         self.advance(now);
         self.live = live.clone();
@@ -398,7 +437,16 @@ impl Pool {
         }
         self.event(now, |p| {
             p.rss.remove(&i);
-            p.end(i, outcome);
+            // Launched ahead, cancelled behind an upstream task that did not
+            // end done or for its method's halt, and stopped: skipped. One a
+            // person stopped is stopped.
+            match p.doomed.remove(&i) {
+                Some(upstream) if outcome == Outcome::Stopped => {
+                    p.state[i] = State::Skipped { upstream };
+                    p.skip_downstream(i);
+                }
+                _ => p.end(i, outcome),
+            }
         });
         Ok(())
     }
@@ -463,13 +511,13 @@ impl Pool {
         self.state[i].is_running()
     }
 
-    /// Task `i` is pending and every task upstream of it is done.
+    /// Task `i` is pending and every task upstream of it is done, or,
+    /// ahead, launched.
     fn is_ready(&self, i: usize) -> bool {
         self.state[i] == State::Pending
-            && self.wants[i]
-                .upstream
-                .iter()
-                .all(|&j| self.state[j] == State::Ended(Outcome::Done))
+            && self.wants[i].upstream.iter().all(|&j| {
+                self.state[j] == State::Ended(Outcome::Done) || (self.ahead && self.is_running(j))
+            })
     }
 
     fn pending(&self, i: usize) -> Result<()> {
@@ -510,7 +558,8 @@ impl Pool {
         let mut best = Hold::Nothing;
         let mut reserving = false;
         for k in 0..self.order.len() {
-            let i = self.order[k];
+            // Ahead, in plan order: a task's upstream is launched first.
+            let i = if self.ahead { k } else { self.order[k] };
             if !self.is_ready(i) {
                 continue;
             }
@@ -549,9 +598,10 @@ impl Pool {
             return Hold::Cores;
         }
         let k = self.method_of[i];
-        if self.methods[k]
-            .max_running
-            .is_some_and(|cap| u.methods[k] >= cap)
+        if !self.ahead
+            && self.methods[k]
+                .max_running
+                .is_some_and(|cap| u.methods[k] >= cap)
         {
             return Hold::Capped;
         }
@@ -591,9 +641,14 @@ impl Pool {
         }
         m.halted = true;
         for j in 0..self.wants.len() {
-            if self.method_of[j] == k && self.state[j] == State::Pending {
+            if self.method_of[j] != k {
+                continue;
+            }
+            if self.state[j] == State::Pending {
                 self.state[j] = State::Skipped { upstream: None };
                 self.skip_downstream(j);
+            } else if self.ahead && self.is_running(j) {
+                self.doom(j, None);
             }
         }
         let stage = &self.methods[k].stage;
@@ -603,14 +658,27 @@ impl Pool {
         }
     }
 
-    /// Pending tasks reading `i`, at any depth, skipped for it.
+    /// Pending tasks reading `i`, at any depth, skipped for it; ahead,
+    /// launched ones to be cancelled for it.
     fn skip_downstream(&mut self, i: usize) {
         let mut stack = self.downstream[i].clone();
         while let Some(j) = stack.pop() {
             if self.state[j] == State::Pending {
                 self.state[j] = State::Skipped { upstream: Some(i) };
-                stack.extend(self.downstream[j].iter().copied());
+            } else if self.ahead && self.is_running(j) {
+                self.doom(j, Some(i));
+            } else {
+                continue;
             }
+            stack.extend(self.downstream[j].iter().copied());
+        }
+    }
+
+    /// Launched task `i` is to be cancelled, for `cause`.
+    fn doom(&mut self, i: usize, cause: Option<usize>) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.doomed.entry(i) {
+            e.insert(cause);
+            self.cancels.push((i, cause));
         }
     }
 

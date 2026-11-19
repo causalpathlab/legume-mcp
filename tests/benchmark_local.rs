@@ -223,3 +223,65 @@ fn a_detached_run_here_goes_on_and_stop_cancels_it() {
     assert_eq!(runner()["exit"], 130);
     assert_eq!(w.count("stopped"), 2);
 }
+
+/// A task of three shards, each writing its number, and a combine stage
+/// that reads every shard's file, in shard order, by a glob.
+const SHARDED: &str = r#"{"name": "N1", "seeds": {"n": 1, "base": 1}, "cores": 2,
+  "stages": [
+    {"name": "part", "shards": 3,
+     "run": ["TOOL3", "{shard}", "{out}/x.shard-{shard}-of-{shards}.tsv"],
+     "makes": ["x.shard-{shard}-of-{shards}.tsv"]},
+    {"name": "score", "combine": "shards",
+     "run": ["TOOL4", "{out}/m.score.tsv", "{glob:part/x.shard-*.tsv}"],
+     "makes": ["m.score.tsv"]}]}"#;
+
+#[test]
+fn a_sharded_stage_runs_each_shard_and_a_combine_stage_reads_them_all() {
+    let w = World::new("0");
+    write_tool(&w.bin().join("TOOL3"), r#"printf %s "$1" > "$2""#);
+    write_tool(
+        &w.bin().join("TOOL4"),
+        r#"o=$1; shift; v=0.; for f; do v="$v$(cat "$f")"; done
+printf 'score\tmetric\tvalue\tpart\nt\tauprc\t%s\tall\n' "$v" > "$o""#,
+    );
+    std::fs::write(w.root().join("spec.json"), SHARDED).unwrap();
+    let o = w.run();
+    let s = said(&o);
+    assert!(o.status.success(), "{s}");
+    assert!(s.contains("4 tasks: 4 done"), "{s}");
+    let tasks: Vec<String> = std::fs::read_dir(w.bench().join("tasks"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    for k in 0..3 {
+        assert!(
+            tasks
+                .iter()
+                .any(|t| t.ends_with(&format!(".part.shard{k}"))),
+            "{tasks:?}"
+        );
+    }
+    // The combine read the three shards' files, as words, in shard order.
+    let summary = std::fs::read_to_string(w.bench().join("summary.tsv")).unwrap();
+    assert!(summary.contains("\t0.012\t"), "{summary}");
+}
+
+#[test]
+fn a_spec_with_no_score_runs_unscored() {
+    let w = World::new("0");
+    write_tool(&w.bin().join("TOOL3"), r#"printf %s "$1" > "$2""#);
+    write_tool(&w.bin().join("TOOL4"), r#"o=$1; shift; cat "$@" > "$o""#);
+    let spec = SHARDED.replace("m.score.tsv", "all.tsv");
+    std::fs::write(w.root().join("spec.json"), spec).unwrap();
+    let o = w.run();
+    let s = said(&o);
+    assert!(o.status.success(), "{s}");
+    assert!(s.contains("4 tasks: 4 done"), "{s}");
+    let combined: Vec<PathBuf> = std::fs::read_dir(w.bench().join("tasks"))
+        .unwrap()
+        .map(|e| e.unwrap().path().join("all.tsv"))
+        .filter(|p| p.exists())
+        .collect();
+    assert_eq!(combined.len(), 1);
+    assert_eq!(std::fs::read_to_string(&combined[0]).unwrap(), "012");
+}

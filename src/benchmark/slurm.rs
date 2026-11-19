@@ -2,8 +2,16 @@
 //! cluster, each under the wrapper (`legume benchmark task`), driven
 //! through a [`Shell`] from wherever the runner is.
 //!
-//! - **Launch.** Tasks of one shape (threads, memory, timeout) go in as
-//!   one array job, at most `max_array` tasks each. A list of their ids
+//! - **Ahead.** The pool launches a task once its upstream is launched
+//!   ([`Executor::queues_ahead`]), so a whole plan goes in at once. Tasks
+//!   of one stage, method and shape (threads, memory, timeout) go in as
+//!   one array job, of at most the cluster's MaxArraySize tasks (else
+//!   `max_array`), its method's `max_running` the array's `%K` throttle,
+//!   held by `--dependency=afterany` until the array jobs of the tasks it
+//!   reads have ended. A task queued behind one that did not end done is
+//!   cancelled while pending ([`Executor::cancel_queued`]) and ends at
+//!   once; the wrapper refuses one whose upstream is not done.
+//! - **Launch.** A list of their ids
 //!   is written beside the benchmark, named by the run and its content
 //!   (`slurm/<run>-<key>.tasks`, so a list an earlier array job still
 //!   reads is never rewritten with other lines), and array task `i` runs
@@ -32,7 +40,7 @@ use super::pool::{Launch, Live, Outcome};
 use super::remote::Shell;
 use crate::project::quote;
 use anyhow::{bail, Context, Result};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
@@ -49,7 +57,7 @@ pub struct Site {
     pub run: String,
     pub partition: Option<String>,
     pub account: Option<String>,
-    /// Tasks in one array job at most.
+    /// Tasks in one array job at most, besides the cluster's MaxArraySize.
     pub max_array: usize,
 }
 
@@ -85,8 +93,27 @@ pub struct Slurm {
     /// The array tasks the last poll saw pending, whose files are not
     /// looked at.
     pending: HashSet<Job>,
+    /// The array jobs the last poll that read the queue saw in it, once
+    /// one has.
+    queued_arrays: Option<HashSet<String>>,
+    /// The array tasks launched since the last poll that read the queue:
+    /// pending, as far as anyone knows, so their files are not looked at.
+    fresh: HashSet<Job>,
+    /// The last array job of each capped method (stage, method): the next
+    /// one waits for it, so the method's tasks never run more than its
+    /// `max_running` at once.
+    capped_last: HashMap<(String, Option<String>), String>,
+    /// Each task's index in the plan, by id.
+    index: HashMap<String, usize>,
+    /// The most tasks one array job takes: the cluster's MaxArraySize,
+    /// once read, else `site.max_array`.
+    max_array: Option<usize>,
     /// Tasks a person stopped: one lost is stopped, not lost.
     stopping: HashSet<usize>,
+    /// Of `stopping`, those cancelled before the last poll saw them start,
+    /// or that cannot run: one gone from the queue ends at once, its
+    /// `exit.json` (if any) not waited for.
+    ends_when_gone: HashSet<usize>,
     /// Array tasks resume found queued for a task under another key.
     stale: Vec<Job>,
     /// How long a task gone from the queue without an `exit.json` is
@@ -101,13 +128,23 @@ impl Slurm {
         Slurm {
             shell,
             site,
-            tasks,
             grace_secs,
+            index: tasks
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (t.id.clone(), i))
+                .collect(),
+            tasks,
             running: BTreeMap::new(),
             pending: HashSet::new(),
+            queued_arrays: None,
+            fresh: HashSet::new(),
+            capped_last: HashMap::new(),
+            max_array: None,
             stopping: HashSet::new(),
+            ends_when_gone: HashSet::new(),
             stale: Vec::new(),
-            lost_after: Duration::from_secs(60),
+            lost_after: LOST_AFTER,
         }
     }
 
@@ -188,6 +225,42 @@ impl Slurm {
         Ok(resumed)
     }
 
+    /// The most tasks one array job takes: the cluster's MaxArraySize, read
+    /// once ([`DEFAULT_MAX_ARRAY`] when the cluster does not say), and at
+    /// most `site.max_array`.
+    fn max_array(&mut self) -> Result<usize> {
+        if let Some(n) = self.max_array {
+            return Ok(n);
+        }
+        let ran = self
+            .shell
+            .run("scontrol show config 2> /dev/null | sed -n 's/^MaxArraySize *= *//p'")?;
+        let n = ran
+            .stdout
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|&n| ran.ok() && n > 0)
+            .unwrap_or(DEFAULT_MAX_ARRAY)
+            .min(self.site.max_array);
+        self.max_array = Some(n);
+        Ok(n)
+    }
+
+    /// Those of `tasks` watched here whose array task the last poll saw
+    /// pending.
+    fn unstarted_of(&self, tasks: &[usize]) -> Vec<usize> {
+        tasks
+            .iter()
+            .copied()
+            .filter(|i| {
+                self.running
+                    .get(i)
+                    .is_some_and(|r| self.pending.contains(&r.job))
+            })
+            .collect()
+    }
+
     /// Task `i` watched as array task `job`.
     fn watch(&mut self, i: usize, job: Job) {
         self.running.insert(
@@ -205,9 +278,10 @@ impl Slurm {
             .with_context(|| format!("no task {i} in the plan"))
     }
 
-    /// `sbatch` of an array job of `n` tasks of `t`'s shape whose list is
-    /// `list`, its logs `name`.
-    fn sbatch(&self, t: &Task, n: usize, list: &str, name: &str) -> String {
+    /// `sbatch` of an array job of `n` tasks of `t`'s shape and method
+    /// whose list is `list`, its logs `name`, held until the array jobs
+    /// `after` (ids, or the shell variables that hold them) end.
+    fn sbatch(&self, t: &Task, n: usize, list: &str, name: &str, after: &[String]) -> String {
         let s = &self.site;
         // The wrapper's timeout and grace go first; Slurm's --time is
         // only a backstop, a few minutes after.
@@ -218,8 +292,16 @@ impl Slurm {
             quote(&s.plan),
             quote(list)
         );
+        // At most max_running of the array at once, by Slurm's throttle;
+        // after its upstream arrays have ended, whatever their end.
+        let throttle = t.max_running.map(|k| format!("%{k}")).unwrap_or_default();
+        let after = if after.is_empty() {
+            String::new()
+        } else {
+            format!(" --dependency=afterany:{}", after.join(":"))
+        };
         let mut args = format!(
-            "sbatch --parsable --job-name={} --array=0-{} --cpus-per-task={}{} \
+            "sbatch --parsable --job-name={} --array=0-{}{throttle}{after} --cpus-per-task={}{} \
              --time={minutes} --open-mode=append --output={} --wrap={}",
             quote(&s.run),
             n - 1,
@@ -374,7 +456,20 @@ fn squeue_line(run: &str) -> String {
     )
 }
 
-/// Tasks of one shape go in as one array job.
+/// How long a task gone from the queue without an `exit.json` is waited
+/// for, by default; the wrapper waits as long for an upstream's done.json.
+pub const LOST_AFTER: Duration = Duration::from_secs(60);
+
+/// Slurm's own default MaxArraySize, less one: the most tasks an array job
+/// takes when the cluster does not say.
+const DEFAULT_MAX_ARRAY: usize = 1000;
+
+/// Tasks of one stage, method and shape go in as one array job: a
+/// method's tasks share its throttle, and a stage's wait for the same
+/// upstream.
+type GroupKey = (String, Option<String>, (u32, u64, u64));
+
+/// A task's shape: threads, memory and timeout.
 fn shape(t: &Task) -> (u32, u64, u64) {
     (t.threads, t.mem_gb.to_bits(), t.timeout_secs)
 }
@@ -426,25 +521,112 @@ impl Executor for Slurm {
         Ok(Live::default())
     }
 
+    fn queues_ahead(&self) -> bool {
+        true
+    }
+
+    fn cancel_unrunnable(&mut self, tasks: &[usize]) -> Result<()> {
+        self.cancel(tasks)?;
+        let watched = tasks.iter().filter(|i| self.running.contains_key(i));
+        self.ends_when_gone.extend(watched);
+        Ok(())
+    }
+
+    fn cancel_queued(&mut self, tasks: &[usize]) -> Result<()> {
+        let mut queued = self.unstarted_of(tasks);
+        queued.retain(|i| !self.stopping.contains(i));
+        self.cancel(&queued)
+    }
+
     fn launch(&mut self, tasks: &[Launch]) -> Result<()> {
-        // Groups of one shape, in launch order, each cut at max_array.
+        let max_array = self.max_array()?;
+        // Groups of one stage, method and shape, in plan order, each cut
+        // at max_array.
+        let mut sorted: Vec<usize> = tasks.iter().map(|l| l.task).collect();
+        sorted.sort_unstable();
         let mut groups: Vec<Vec<usize>> = Vec::new();
-        let mut open: HashMap<(u32, u64, u64), usize> = HashMap::new();
-        for l in tasks {
-            let key = shape(self.task(l.task)?);
-            match open.get(&key) {
-                Some(&g) if groups[g].len() < self.site.max_array => groups[g].push(l.task),
+        let mut open: HashMap<GroupKey, usize> = HashMap::new();
+        let mut group_of: HashMap<usize, usize> = HashMap::new();
+        for i in sorted {
+            let t = self.task(i)?;
+            let key = (t.stage.clone(), t.method.clone(), shape(t));
+            let g = match open.get(&key) {
+                Some(&g) if groups[g].len() < max_array => g,
                 _ => {
                     open.insert(key, groups.len());
-                    groups.push(vec![l.task]);
+                    groups.push(Vec::new());
+                    groups.len() - 1
                 }
+            };
+            groups[g].push(i);
+            group_of.insert(i, g);
+        }
+        // What each group waits for: the array jobs of upstream tasks
+        // already in, and the groups of those in this launch; for a capped
+        // method, its array job before. An array job the queue no longer
+        // has has ended, so is not waited for (Slurm may have forgotten
+        // it, and refuse the dependency).
+        let mut jobs_after: Vec<BTreeSet<String>> = vec![BTreeSet::new(); groups.len()];
+        let mut groups_after: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); groups.len()];
+        let mut capped: HashMap<(String, Option<String>), usize> = HashMap::new();
+        for (g, members) in groups.iter().enumerate() {
+            for &i in members {
+                for id in &self.tasks[i].upstream {
+                    let Some(&u) = self.index.get(id) else {
+                        continue;
+                    };
+                    if let Some(&h) = group_of.get(&u) {
+                        groups_after[g].insert(h);
+                    } else if let Some(r) = self.running.get(&u) {
+                        jobs_after[g].insert(r.job.array_job.clone());
+                    }
+                }
+            }
+            let t = &self.tasks[members[0]];
+            if t.max_running.is_some() {
+                let method = (t.stage.clone(), t.method.clone());
+                match capped.insert(method.clone(), g) {
+                    Some(h) => {
+                        groups_after[g].insert(h);
+                    }
+                    None => {
+                        if let Some(j) = self.capped_last.get(&method) {
+                            jobs_after[g].insert(j.clone());
+                        }
+                    }
+                }
+            }
+            if let Some(queued) = &self.queued_arrays {
+                jobs_after[g].retain(|j| queued.contains(j));
+            }
+        }
+        // Each group after those it waits for: upstream tasks are before
+        // their downstream in the plan, so this ends.
+        let mut order: Vec<usize> = Vec::with_capacity(groups.len());
+        let mut placed = vec![false; groups.len()];
+        while order.len() < groups.len() {
+            let before = order.len();
+            for (g, after) in groups_after.iter().enumerate() {
+                if !placed[g] && after.iter().all(|&h| placed[h]) {
+                    placed[g] = true;
+                    order.push(g);
+                }
+            }
+            if order.len() == before {
+                bail!("the launch's array jobs wait for each other");
             }
         }
         let s = &self.site;
         let mut script = format!("{}mkdir -p {}\n", aside_fn(), quote(&s.slurm_dir));
         let mut placed = String::new();
-        for (g, members) in groups.iter().enumerate() {
+        for &g in &order {
+            let members = &groups[g];
             let group: Vec<&Task> = members.iter().map(|&i| &self.tasks[i]).collect();
+            let after: Vec<String> = jobs_after[g]
+                .iter()
+                .cloned()
+                .chain(groups_after[g].iter().map(|h| format!("${{jid_{h}}}")))
+                .collect();
             let ids: String = group.iter().map(|t| format!("{}\n", t.id)).collect();
             // Each task's folder and key, a line each.
             let entries: Vec<String> = group
@@ -466,7 +648,7 @@ impl Executor for Slurm {
                 quote(&entries),
                 quote(&ids),
                 quote(&list),
-                self.sbatch(group[0], group.len(), &list, &name)
+                self.sbatch(group[0], group.len(), &list, &name, &after)
             );
             // Written once every array job is in, so a launch that fails
             // leaves none naming a job it cancels.
@@ -505,12 +687,16 @@ impl Executor for Slurm {
                 ran.stderr.trim()
             );
         };
+        for (method, g) in capped {
+            self.capped_last.insert(method, jids[g].clone());
+        }
         for (members, array_job) in groups.iter().zip(jids) {
             for (index, &i) in members.iter().enumerate() {
                 let job = Job {
                     array_job: array_job.clone(),
                     index,
                 };
+                self.fresh.insert(job.clone());
                 self.watch(i, job);
             }
         }
@@ -525,7 +711,7 @@ impl Executor for Slurm {
         // one: every line one record.
         let mut script = squeue_line(&self.site.run);
         for (i, r) in &self.running {
-            if self.pending.contains(&r.job) {
+            if self.pending.contains(&r.job) || self.fresh.contains(&r.job) {
                 continue;
             }
             let _ = writeln!(
@@ -541,7 +727,9 @@ impl Executor for Slurm {
         }
         let poll = parse_poll(&ran.stdout);
         if poll.queue_ok {
+            self.queued_arrays = Some(poll.arrays);
             self.pending = poll.pending;
+            self.fresh.clear();
         }
         let now = Instant::now();
         let mut ended = Vec::new();
@@ -565,12 +753,16 @@ impl Executor for Slurm {
                 });
                 continue;
             }
-            if !poll.queue_ok || poll.queued.contains(&r.job) || self.pending.contains(&r.job) {
+            if !poll.queue_ok
+                || poll.queued.contains(&r.job)
+                || self.pending.contains(&r.job)
+                || self.fresh.contains(&r.job)
+            {
                 r.gone_since = None;
                 continue;
             }
             let since = *r.gone_since.get_or_insert(now);
-            if now.duration_since(since) >= self.lost_after {
+            if self.ends_when_gone.contains(&i) || now.duration_since(since) >= self.lost_after {
                 let outcome = if self.stopping.contains(&i) {
                     Outcome::Stopped
                 } else {
@@ -582,6 +774,7 @@ impl Executor for Slurm {
         for e in &ended {
             self.running.remove(&e.task);
             self.stopping.remove(&e.task);
+            self.ends_when_gone.remove(&e.task);
         }
         Ok(ended)
     }
@@ -589,20 +782,55 @@ impl Executor for Slurm {
     fn cancel(&mut self, tasks: &[usize]) -> Result<()> {
         // Only tasks running here are stopping: one marked otherwise would
         // end as stopped, not lost, on a later launch.
-        let (ids, jobs): (Vec<usize>, Vec<String>) = tasks
+        let (ids, jobs): (Vec<usize>, Vec<&Job>) = tasks
             .iter()
-            .filter_map(|&i| self.running.get(&i).map(|r| (i, quote(&r.job.id()))))
+            .filter_map(|&i| self.running.get(&i).map(|r| (i, &r.job)))
             .unzip();
         if jobs.is_empty() {
             return Ok(());
         }
         // A job already gone from the queue is no error: it ends by its
         // exit.json.
+        let words = ranges(&jobs);
         self.shell
-            .check(&format!("scancel {} || true", jobs.join(" ")), "scancel")?;
+            .check(&format!("scancel {} || true", words.join(" ")), "scancel")?;
+        self.ends_when_gone.extend(self.unstarted_of(&ids));
         self.stopping.extend(ids);
         Ok(())
     }
+}
+
+/// `jobs` as scancel's words: an array job's tasks as `<id>_[1-3,5]`,
+/// one alone as `<id>_<index>`, so a whole plan's tasks take a few words.
+fn ranges(jobs: &[&Job]) -> Vec<String> {
+    let mut by: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for j in jobs {
+        by.entry(&j.array_job).or_default().push(j.index);
+    }
+    by.into_iter()
+        .map(|(array, mut idx)| {
+            idx.sort_unstable();
+            idx.dedup();
+            if let [one] = idx[..] {
+                return format!("{array}_{one}");
+            }
+            let mut runs: Vec<String> = Vec::new();
+            let mut k = 0;
+            while k < idx.len() {
+                let start = idx[k];
+                while k + 1 < idx.len() && idx[k + 1] == idx[k] + 1 {
+                    k += 1;
+                }
+                runs.push(if idx[k] == start {
+                    start.to_string()
+                } else {
+                    format!("{start}-{}", idx[k])
+                });
+                k += 1;
+            }
+            format!("{array}_[{}]", runs.join(","))
+        })
+        .collect()
 }
 
 /// A poll's output.
@@ -612,6 +840,8 @@ struct Poll {
     queued: HashSet<Job>,
     /// The pending ones.
     pending: HashSet<Job>,
+    /// The array jobs of either.
+    arrays: HashSet<String>,
     /// Each task's `exit.json` text, by task index.
     exits: HashMap<usize, String>,
     /// `squeue` answered.
@@ -633,6 +863,11 @@ fn parse_poll(out: &str) -> Poll {
             let Some(job) = words.next() else {
                 continue;
             };
+            if let Some((array, _)) = job.split_once('_') {
+                if !p.arrays.contains(array) {
+                    p.arrays.insert(array.to_string());
+                }
+            }
             if let Some(range) = parse_range(job) {
                 p.pending.extend(range);
             } else if let Ok(job) = parse_job(job) {
@@ -683,6 +918,19 @@ mod tests {
         assert_eq!(p.exits[&3], "{\"exit\": 0}");
         assert!(!p.exits.contains_key(&4));
         assert!(!parse_poll("qfail\n").queue_ok);
+    }
+
+    #[test]
+    fn scancel_takes_each_array_jobs_tasks_as_ranges() {
+        let jobs = [
+            job("10", 3),
+            job("10", 0),
+            job("10", 1),
+            job("10", 5),
+            job("11", 2),
+        ];
+        let refs: Vec<&Job> = jobs.iter().collect();
+        assert_eq!(ranges(&refs), ["10_[0-1,3,5]", "11_2"]);
     }
 
     #[test]

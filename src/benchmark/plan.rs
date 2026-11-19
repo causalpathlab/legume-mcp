@@ -27,13 +27,19 @@
 //!   value); the key's template keeps them doubled, apart from a
 //!   placeholder.
 //! - **Globs.** `{glob:<stage>/<pattern>}` names files in the upstream
-//!   task's folder; the plan's argv holds it with the folder made
-//!   absolute. [`glob`] is what expands it when the task starts, once
-//!   tasks run; nothing calls it yet.
+//!   task's folder (in a combine stage, every shard's folder); the plan's
+//!   argv holds it with the folder made absolute, and the wrapper expands
+//!   it when the task starts ([`expand_globs`]).
+//! - **Shards.** A stage of `shards` N has N tasks for each point,
+//!   replicate and method, `<id>.shard<k>`, each with `{shard}` k (from 0)
+//!   and `{shards}` N, and the seed of the task they make up. A stage of
+//!   as many shards reads it shard by shard; a combine stage, one task for
+//!   all N, reads every shard.
 
 use super::key;
 use super::spec::{
-    bad, is_plain_relative, AxisValue, Method, Seeds, Spec, Stage, RESERVED, THREAD_VARS,
+    bad, fill_shard, is_plain_relative, AxisValue, Method, Seeds, Spec, Stage, RESERVED,
+    THREAD_VARS,
 };
 use super::tools::Resolved;
 use crate::command::refuse;
@@ -258,7 +264,7 @@ fn classify<'a>(name: &'a str, spec: &Spec) -> Option<Ph<'a>> {
         return Some(Ph::Input(input));
     }
     match name {
-        "rep" | "rep_seed" | "seed" => return Some(Ph::Value(name)),
+        "rep" | "rep_seed" | "seed" | "shard" | "shards" => return Some(Ph::Value(name)),
         "method" => return Some(Ph::Method),
         "threads" => return Some(Ph::Threads),
         "gpu" => return Some(Ph::Gpu),
@@ -362,8 +368,16 @@ pub fn check(spec: &Spec) -> Result<()> {
                 Part::Text(_) => None,
             })
         });
+        let stage = &spec.stages[si];
+        let mut reads_sharded = false;
         for (at, name, ph) in placeholders {
             match ph {
+                Ph::Value("shard" | "shards") if stage.shards == 1 => {
+                    return Err(bad(
+                        at,
+                        format!("{{{name}}} is for a stage with shards, and this one has none"),
+                    ))
+                }
                 Ph::Method if method.name.is_none() => {
                     return Err(bad(at, "{method} is for a stage with methods"))
                 }
@@ -373,7 +387,10 @@ pub fn check(spec: &Spec) -> Result<()> {
                 Ph::Input(n) if !spec.inputs.iter().any(|i| i.name == n) => {
                     return Err(bad(at, format!("{{{name}}}: {n:?} is no declared input")))
                 }
-                Ph::Stage(t) => upstream(spec, si, method, t, at, name)?,
+                Ph::Stage(t) => {
+                    let up = upstream(spec, si, method, t, at, name)?;
+                    reads_sharded |= sharding(stage, up, at, name, false)?;
+                }
                 Ph::Glob(t, pattern) => {
                     if !is_plain_relative(pattern) {
                         return Err(bad(
@@ -381,10 +398,18 @@ pub fn check(spec: &Spec) -> Result<()> {
                             format!("{{{name}}}: a glob is {{glob:STAGE/PATTERN}}, the pattern inside the stage's folder"),
                         ));
                     }
-                    upstream(spec, si, method, t, at, name)?;
+                    let up = upstream(spec, si, method, t, at, name)?;
+                    reads_sharded |= sharding(stage, up, at, name, true)?;
                 }
                 _ => {}
             }
+        }
+        if stage.combine && !reads_sharded {
+            return Err(bad(
+                &format!("{}.run", method.at),
+                "a combine stage reads a sharded stage, with {glob:STAGE/PATTERN}; \
+                 this one reads none",
+            ));
         }
         if is_pinto_lra(method) && method.mem_gb <= 0.0 {
             return Err(bad(
@@ -428,7 +453,14 @@ fn grid(spec: &Spec) -> Result<()> {
 
 /// `{<t>}` (or a glob in `t`) used at `at`, by `method` of stage `si`: `t` is
 /// an earlier stage, and a method of it this method may read.
-fn upstream(spec: &Spec, si: usize, method: &Method, t: &str, at: &str, name: &str) -> Result<()> {
+fn upstream<'a>(
+    spec: &'a Spec,
+    si: usize,
+    method: &Method,
+    t: &str,
+    at: &str,
+    name: &str,
+) -> Result<&'a Stage> {
     let Some(ti) = spec.stages.iter().position(|s| s.name == t) else {
         return Err(bad(at, format!("{{{name}}}: {t:?} is no stage")));
     };
@@ -446,7 +478,7 @@ fn upstream(spec: &Spec, si: usize, method: &Method, t: &str, at: &str, name: &s
     }
     let up = &spec.stages[ti];
     if !up.has_methods() {
-        return Ok(());
+        return Ok(up);
     }
     let names = || method_names(up).join(", ");
     match &method.name {
@@ -466,8 +498,45 @@ fn upstream(spec: &Spec, si: usize, method: &Method, t: &str, at: &str, name: &s
                 names()
             ),
         )),
-        Some(_) => Ok(()),
+        Some(_) => Ok(up),
     }
+}
+
+/// How a task of `stage` may read `up`, at `at` (`{name}`, a glob when
+/// `glob`): a sharded stage's tasks pair with those of a stage of as many
+/// shards, shard by shard, and a combine stage reads all of them, by a
+/// glob, which spans their folders; any stage may read an unsharded one.
+/// Whether `up` is sharded.
+fn sharding(stage: &Stage, up: &Stage, at: &str, name: &str, glob: bool) -> Result<bool> {
+    if up.shards == 1 {
+        return Ok(false);
+    }
+    if stage.combine {
+        return if glob {
+            Ok(true)
+        } else {
+            Err(bad(
+                at,
+                format!(
+                    "{{{name}}}: stage {} has {} shards, each a folder of its own; a combine \
+                     stage reads them with {{glob:{}/PATTERN}}",
+                    up.name, up.shards, up.name
+                ),
+            ))
+        };
+    }
+    if stage.shards != up.shards {
+        return Err(bad(
+            at,
+            format!(
+                "{{{name}}}: stage {} has {} shards and this stage {}; a stage reads a sharded \
+                 one shard by shard, with as many shards, or combines them (\"combine\": \
+                 \"shards\")",
+                up.name, up.shards, stage.shards
+            ),
+        ));
+    }
+    Ok(true)
 }
 
 /// The names of `stage`'s methods.
@@ -480,34 +549,43 @@ fn method_names(stage: &Stage) -> Vec<&str> {
 }
 
 /// The last stage of each method (and the last stage) makes exactly one
-/// `*.score.tsv`.
+/// `*.score.tsv`; or none makes one, in a spec with no `compare` or
+/// `plot`: an unscored benchmark, such as one on real data with no truth
+/// to score against.
 fn scores_made(spec: &Spec) -> Result<()> {
     let last = spec.stages.len() - 1;
+    let mut ends = Vec::new();
     for (si, stage) in spec.stages.iter().enumerate() {
         for method in &stage.methods {
-            let ends = si == last
+            let end = si == last
                 || method.name.as_ref().is_some_and(|m| {
                     !spec.stages[si + 1..]
                         .iter()
                         .any(|s| s.methods.iter().any(|o| o.name.as_ref() == Some(m)))
                 });
-            if !ends {
-                continue;
+            if end {
+                ends.push((stage, method));
             }
-            let n = scores(method);
-            if n != 1 {
-                let what = method
-                    .name
-                    .as_ref()
-                    .map_or(format!("stage {}", stage.name), |m| format!("method {m}"));
-                return Err(bad(
-                    &format!("{}.makes", method.at),
-                    format!(
-                        "lists {n} *.score.tsv; {what} ends here, and the last stage of each \
-                         method makes exactly one"
-                    ),
-                ));
-            }
+        }
+    }
+    let unscored = ends.iter().all(|(_, m)| scores(m) == 0);
+    if unscored && spec.compare.is_empty() && spec.plot.is_none() {
+        return Ok(());
+    }
+    for (stage, method) in ends {
+        let n = scores(method);
+        if n != 1 {
+            let what = method
+                .name
+                .as_ref()
+                .map_or(format!("stage {}", stage.name), |m| format!("method {m}"));
+            return Err(bad(
+                &format!("{}.makes", method.at),
+                format!(
+                    "lists {n} *.score.tsv; {what} ends here, and the last stage of each \
+                     method makes exactly one (or, with no compare or plot, none does)"
+                ),
+            ));
         }
     }
     Ok(())
@@ -615,6 +693,11 @@ pub fn point_id(labels: &BTreeMap<String, String>) -> String {
     key::key_of(&v)[..8].to_string()
 }
 
+/// The id of shard `shard` of the task `id`.
+pub fn shard_id(id: &str, shard: u32) -> String {
+    format!("{id}.shard{shard}")
+}
+
 /// A task's id.
 pub fn task_id(point: &str, rep: u32, stage: &str, method: Option<&str>) -> String {
     match method {
@@ -669,8 +752,9 @@ struct Prepared<'a> {
     method: &'a Method,
     /// `run[1..]`, each word's parts.
     words: Vec<Vec<Part<'a>>>,
-    /// Each stage it reads, and whether that stage has methods.
-    upstream: Vec<(&'a str, bool)>,
+    /// Each stage it reads: whether that stage has methods, and its
+    /// shards.
+    upstream: Vec<(&'a str, bool, u32)>,
     inputs: Vec<&'a str>,
     /// legume's content key, when another tool's argv embeds `{legume}`.
     legume: Option<&'a str>,
@@ -698,10 +782,11 @@ impl<'a> Prepared<'a> {
         for part in words.iter().flatten() {
             match *part {
                 Part::Ph(_, Ph::Stage(t) | Ph::Glob(t, _))
-                    if !upstream.iter().any(|u: &(&str, bool)| u.0 == t) =>
+                    if !upstream.iter().any(|u: &(&str, bool, u32)| u.0 == t) =>
                 {
-                    let has_methods = spec.stages.iter().any(|s| s.name == t && s.has_methods());
-                    upstream.push((t, has_methods));
+                    let up = spec.stages.iter().find(|s| s.name == t);
+                    let has_methods = up.is_some_and(Stage::has_methods);
+                    upstream.push((t, has_methods, up.map_or(1, |s| s.shards)));
                 }
                 Part::Ph(_, Ph::Input(n)) if !inputs.contains(&n) => inputs.push(n),
                 Part::Ph(_, Ph::Legume) if word != LEGUME => embeds = true,
@@ -728,12 +813,14 @@ impl<'a> Prepared<'a> {
     }
 
     /// The task key of a task of this method that runs `argv`, from
-    /// `template`, and reads the tasks keyed `upstream_keys`.
+    /// `template`, and reads the tasks keyed `upstream_keys`; of a sharded
+    /// stage, shard `shard`.
     fn key(
         &self,
         template: &[String],
         argv: &[String],
         upstream_keys: &[&String],
+        shard: Option<u32>,
         ctx: &Context,
     ) -> String {
         // A declared input named by its path is read as well.
@@ -765,6 +852,9 @@ impl<'a> Prepared<'a> {
         });
         if let Some(k) = self.legume {
             keyed["legume"] = json!(k);
+        }
+        if let Some(k) = shard {
+            keyed["shard"] = json!([k, self.stage.shards]);
         }
         key::key_of(&keyed)
     }
@@ -873,56 +963,89 @@ pub fn tasks(spec: &Spec, ctx: &Context) -> Result<Vec<Task>> {
             for p in &prepared {
                 let (stage, method) = (p.stage, p.method);
                 let name = method.name.as_deref();
-                let id = task_id(&pid, rep, &stage.name, name);
+                let task = task_id(&pid, rep, &stage.name, name);
                 let seed = stage_seed(rep_seed, &stage.name, name.unwrap_or(""));
-                let mut values = shared.clone();
-                values.insert("seed", seed.to_string());
-                let mut upstream: Vec<String> = Vec::new();
-                let mut stages: HashMap<&str, PathBuf> = HashMap::new();
-                for &(t, has_methods) in &p.upstream {
-                    let uid = task_id(&pid, rep, t, name.filter(|_| has_methods));
-                    stages.insert(t, tasks_dir.join(&uid));
-                    upstream.push(uid);
+                let sharded = stage.shards > 1;
+                for shard in 0..stage.shards {
+                    let id = if sharded {
+                        shard_id(&task, shard)
+                    } else {
+                        task.clone()
+                    };
+                    let mut values = shared.clone();
+                    values.insert("seed", seed.to_string());
+                    if sharded {
+                        values.insert("shard", shard.to_string());
+                        values.insert("shards", stage.shards.to_string());
+                    }
+                    let mut upstream: Vec<String> = Vec::new();
+                    let mut stages: HashMap<&str, PathBuf> = HashMap::new();
+                    for &(t, has_methods, shards) in &p.upstream {
+                        let uid = task_id(&pid, rep, t, name.filter(|_| has_methods));
+                        if shards == 1 {
+                            stages.insert(t, tasks_dir.join(&uid));
+                            upstream.push(uid);
+                        } else if stage.combine {
+                            // Every shard; a glob spans their folders.
+                            stages.insert(t, tasks_dir.join(format!("{uid}.shard*")));
+                            upstream.extend((0..shards).map(|k| shard_id(&uid, k)));
+                        } else {
+                            let u = shard_id(&uid, shard);
+                            stages.insert(t, tasks_dir.join(&u));
+                            upstream.push(u);
+                        }
+                    }
+                    let dir = tasks_dir.join(&id);
+                    let fill = Fill {
+                        values: &values,
+                        method: name,
+                        threads: method.threads,
+                        out: &dir,
+                        stages: &stages,
+                        ctx,
+                    };
+                    let mut template = vec![method.run[0].clone()];
+                    let mut argv = vec![p.tool.exec.display().to_string()];
+                    for w in &p.words {
+                        template.push(fill.word(w, true));
+                        argv.push(fill.word(w, false));
+                    }
+                    let upstream_keys: Vec<&String> =
+                        upstream.iter().filter_map(|u| keys.get(u)).collect();
+                    let key = p.key(
+                        &template,
+                        &argv,
+                        &upstream_keys,
+                        sharded.then_some(shard),
+                        ctx,
+                    );
+                    keys.insert(id.clone(), key.clone());
+                    let makes = method
+                        .makes
+                        .iter()
+                        .map(|m| fill_shard(m, shard, stage.shards))
+                        .collect();
+                    tasks.push(Task {
+                        id,
+                        point: labels.clone(),
+                        rep,
+                        rep_seed,
+                        seed,
+                        stage: stage.name.clone(),
+                        method: name.map(str::to_string),
+                        argv,
+                        env: p.env.clone(),
+                        threads: method.threads,
+                        mem_gb: method.mem_gb,
+                        gpus: method.gpus,
+                        timeout_secs: method.timeout_secs,
+                        max_running: method.max_running,
+                        dir,
+                        makes,
+                        upstream,
+                        key,
+                    });
                 }
-                let dir = tasks_dir.join(&id);
-                let fill = Fill {
-                    values: &values,
-                    method: name,
-                    threads: method.threads,
-                    out: &dir,
-                    stages: &stages,
-                    ctx,
-                };
-                let mut template = vec![method.run[0].clone()];
-                let mut argv = vec![p.tool.exec.display().to_string()];
-                for w in &p.words {
-                    template.push(fill.word(w, true));
-                    argv.push(fill.word(w, false));
-                }
-                let upstream_keys: Vec<&String> =
-                    upstream.iter().filter_map(|u| keys.get(u)).collect();
-                let key = p.key(&template, &argv, &upstream_keys, ctx);
-                keys.insert(id.clone(), key.clone());
-                tasks.push(Task {
-                    id,
-                    point: labels.clone(),
-                    rep,
-                    rep_seed,
-                    seed,
-                    stage: stage.name.clone(),
-                    method: name.map(str::to_string),
-                    argv,
-                    env: p.env.clone(),
-                    threads: method.threads,
-                    mem_gb: method.mem_gb,
-                    gpus: method.gpus,
-                    timeout_secs: method.timeout_secs,
-                    max_running: method.max_running,
-                    dir,
-                    makes: method.makes.clone(),
-                    upstream,
-                    key,
-                });
             }
         }
     }
@@ -998,11 +1121,82 @@ fn named_path(token: &str) -> &Path {
 /// Listed seeds nearer than this overlap in data-beans' streams.
 const CLOSE_SEEDS: u64 = 1 << 20;
 
-/// What `{glob:<folder>/<pattern>}` gives when a task starts: every path
-/// under `folder` that `pattern` matches (`*` and `?` within a part of
-/// the path, a hidden name only by a part that starts with `.`, as in a
-/// shell), natural-sorted, joined by commas; refused when none does.
-pub fn glob(folder: &Path, pattern: &str) -> Result<String> {
+/// `argv` of a task reading the task folders `upstream`, with each
+/// `{glob:<path pattern>}` its plan holds expanded, as the task starts: a
+/// word that is a glob alone becomes a word per path it matches,
+/// natural-sorted; one inside a word, the paths joined by commas. A glob
+/// names a task folder (in a combine stage, a pattern matching each
+/// shard's) and a pattern inside it; it is matched in the folders of the
+/// tasks it reads alone, so a shard an earlier plan had is never read, and
+/// text of that shape naming no such folder is left as it is. Refused
+/// when a glob matches nothing.
+pub fn expand_globs(argv: &[String], upstream: &[&Path]) -> Result<Vec<String>> {
+    let paths = |pattern: &str| -> Result<Option<Vec<String>>> {
+        let mut named = false;
+        let mut found = Vec::new();
+        for d in upstream {
+            let (Some(tasks), Some(name)) = (d.parent(), d.file_name()) else {
+                continue;
+            };
+            let Ok(rest) = Path::new(pattern).strip_prefix(tasks) else {
+                continue;
+            };
+            let mut parts = rest.iter();
+            let Some(first) = parts.next() else {
+                continue;
+            };
+            if !wild(first.as_encoded_bytes(), name.as_encoded_bytes()) {
+                continue;
+            }
+            named = true;
+            let inside = parts.as_path().to_string_lossy();
+            found.extend(glob_paths(d, &inside).unwrap_or_default());
+        }
+        if !named {
+            return Ok(None);
+        }
+        if found.is_empty() {
+            return Err(refuse(format!(
+                "{{glob:{pattern}}} matches nothing in the folders of the tasks it reads"
+            )));
+        }
+        found.sort_by(|a, b| natural(a, b));
+        Ok(Some(found))
+    };
+    let mut out = Vec::with_capacity(argv.len());
+    for word in argv {
+        // Each glob in the word: alone, a word per path; else a list.
+        let mut w = String::new();
+        let mut rest = word.as_str();
+        let mut alone = None;
+        while let Some(at) = rest.find("{glob:") {
+            let Some(close) = rest[at..].find('}') else {
+                break;
+            };
+            let found = paths(&rest[at + "{glob:".len()..at + close])?;
+            let whole = at == 0 && close + 1 == rest.len() && w.is_empty();
+            match found {
+                Some(found) if whole => alone = Some(found),
+                Some(found) => w.push_str(&format!("{}{}", &rest[..at], found.join(","))),
+                None => w.push_str(&rest[..=at + close]),
+            }
+            rest = &rest[at + close + 1..];
+        }
+        match alone {
+            Some(found) => out.extend(found),
+            None => {
+                w.push_str(rest);
+                out.push(w);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Every path under `folder` that `pattern` matches (`*` and `?` within a
+/// part of the path, a hidden name only by a part that starts with `.`,
+/// as in a shell), natural-sorted; refused when none does.
+pub fn glob_paths(folder: &Path, pattern: &str) -> Result<Vec<String>> {
     let mut found = vec![folder.to_path_buf()];
     for part in pattern.split('/').filter(|p| !p.is_empty()) {
         let mut next = Vec::new();
@@ -1036,7 +1230,7 @@ pub fn glob(folder: &Path, pattern: &str) -> Result<String> {
     }
     let mut names: Vec<String> = found.iter().map(|p| p.display().to_string()).collect();
     names.sort_by(|a, b| natural(a, b));
-    Ok(names.join(","))
+    Ok(names)
 }
 
 /// `pattern` (with `*` and `?`) matches all of `s`.
@@ -1194,6 +1388,134 @@ mod tests {
           "M0": {"run": ["{legume}", "score", "{sim}/sim.tsv", "-o", "{out}/m.score.tsv"], "makes": ["m.score.tsv"]},
           "M1": {"run": ["{legume}", "score", "{fit}/fit.tsv", "-o", "{out}/m.score.tsv"], "makes": ["m.score.tsv"]}}}]}"#;
 
+    const SHARDS: &str = r#"{"name": "N1", "seeds": {"n": 1},
+      "stages": [
+        {"name": "sim", "run": ["TOOL1", "-o", "{out}/sim"], "makes": ["sim.tsv"]},
+        {"name": "lra", "shards": 3, "methods": {
+          "M1": {"run": ["TOOL2", "{sim}/sim.tsv", "--shard", "{shard}/{shards}", "-o", "{out}/x"],
+                 "makes": ["x.shard-{shard}-of-{shards}.tsv"]}}},
+        {"name": "both", "combine": "shards", "methods": {
+          "M1": {"run": ["TOOL2", "merge", "{glob:lra/x.shard-*.tsv}", "-o", "{out}/m.score.tsv"],
+                 "makes": ["m.score.tsv"]}}}]}"#;
+
+    // A sharded stage has a task per shard, each reading the one task
+    // upstream; the combine stage has one, reading every shard by a glob
+    // over their folders.
+    #[test]
+    fn shards_fan_out_and_a_combine_stage_reads_them_all() {
+        let tasks = expand(&spec(SHARDS));
+        let sim = task(&tasks, ".sim", 1);
+        let shards: Vec<&Task> = tasks.iter().filter(|t| t.stage == "lra").collect();
+        assert_eq!(shards.len(), 3);
+        for (k, t) in shards.iter().enumerate() {
+            assert!(t.id.ends_with(&format!(".lra-M1.shard{k}")), "{}", t.id);
+            assert_eq!(t.upstream, [sim.id.as_str()]);
+            assert_eq!(t.argv[3], format!("{k}/3"));
+            assert_eq!(t.makes, [format!("x.shard-{k}-of-3.tsv")]);
+            assert_eq!(t.seed, shards[0].seed);
+        }
+        let keys: HashSet<&str> = shards.iter().map(|t| t.key.as_str()).collect();
+        assert_eq!(keys.len(), 3, "each shard is keyed apart");
+        let both = task(&tasks, ".both-M1", 1);
+        let ids: Vec<&str> = shards.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(both.upstream, ids);
+        let base = shards[0].id.trim_end_matches("0");
+        assert_eq!(
+            both.argv[2],
+            format!("{{glob:/B/tasks/{base}*/x.shard-*.tsv}}")
+        );
+        // A shard's own key changes the combine's.
+        let other = SHARDS.replace("\"{shard}/{shards}\"", "\"{shard}:{shards}\"");
+        assert_ne!(task(&expand(&spec(&other)), ".both-M1", 1).key, both.key);
+    }
+
+    #[test]
+    fn shards_are_read_by_a_combine_stage_or_shard_by_shard() {
+        // A stage of as many shards reads them one to one.
+        let paired = SHARDS.replace(
+            r#""combine": "shards", "methods": {
+          "M1": {"run": ["TOOL2", "merge", "{glob:lra/x.shard-*.tsv}""#,
+            r#""shards": 3, "methods": {
+          "M1": {"run": ["TOOL2", "merge", "{lra}/x""#,
+        );
+        let tasks = expand(&spec(&paired));
+        let both: Vec<&Task> = tasks.iter().filter(|t| t.stage == "both").collect();
+        assert_eq!(both.len(), 3);
+        assert!(both[2].upstream[0].ends_with(".lra-M1.shard2"));
+        assert!(
+            both[2].argv[2].ends_with(".lra-M1.shard2/x"),
+            "{}",
+            both[2].argv[2]
+        );
+
+        let cases = [
+            (
+                SHARDS.replace(r#""combine": "shards", "#, ""),
+                "stages[2].methods.M1.run[2]: {glob:lra/x.shard-*.tsv}: stage lra has 3 shards \
+                 and this stage 1; a stage reads a sharded one shard by shard, with as many \
+                 shards, or combines them (\"combine\": \"shards\")",
+            ),
+            (
+                SHARDS.replace("{glob:lra/x.shard-*.tsv}", "{lra}/x"),
+                "stages[2].methods.M1.run[2]: {lra}: stage lra has 3 shards, each a folder of \
+                 its own; a combine stage reads them with {glob:lra/PATTERN}",
+            ),
+            (
+                SHARDS.replace("{glob:lra/x.shard-*.tsv}", "{sim}/sim.tsv"),
+                "stages[2].methods.M1.run: a combine stage reads a sharded stage, with \
+                 {glob:STAGE/PATTERN}; this one reads none",
+            ),
+            (
+                SHARDS.replace(
+                    r#"{"name": "sim", "run": ["TOOL1", "-o", "{out}/sim"]"#,
+                    r#"{"name": "sim", "run": ["TOOL1", "-o", "{out}/{shard}"]"#,
+                ),
+                "stages[0].run[2]: {shard} is for a stage with shards, and this one has none",
+            ),
+        ];
+        for (text, want) in cases {
+            assert_eq!(refused(&text), want);
+        }
+    }
+
+    #[test]
+    fn a_glob_alone_is_a_word_per_path_and_inside_a_word_a_list() {
+        let d = tempfile::tempdir().unwrap();
+        // Shard 11 is an earlier plan's, no longer read.
+        for k in [0, 2, 10, 11] {
+            let f = d.path().join(format!("t.shard{k}"));
+            std::fs::create_dir_all(&f).unwrap();
+            std::fs::write(f.join("x.tsv"), "").unwrap();
+        }
+        let pattern = format!("{}/t.shard*/x.tsv", d.path().display());
+        let paths: Vec<String> = [0, 2, 10]
+            .iter()
+            .map(|k| format!("{}/t.shard{k}/x.tsv", d.path().display()))
+            .collect();
+        let argv = vec![
+            "T".to_string(),
+            format!("{{glob:{pattern}}}"),
+            format!("--in={{glob:{pattern}}}"),
+            "{print $1}".to_string(),
+            "{glob:/elsewhere/*}".to_string(),
+        ];
+        let dirs: Vec<PathBuf> = [0, 2, 10]
+            .iter()
+            .map(|k| d.path().join(format!("t.shard{k}")))
+            .collect();
+        let upstream: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+        let mut want = vec!["T".to_string()];
+        want.extend(paths.iter().cloned());
+        want.push(format!("--in={}", paths.join(",")));
+        want.push("{print $1}".to_string());
+        // Not in the tasks' folder: text, as written.
+        want.push("{glob:/elsewhere/*}".to_string());
+        assert_eq!(expand_globs(&argv, &upstream).unwrap(), want);
+        let none = vec![format!("{{glob:{}/t.shard*/nope}}", d.path().display())];
+        let e = expand_globs(&none, &upstream).unwrap_err();
+        assert!(e.to_string().contains("matches nothing"), "{e}");
+    }
+
     // A method that an upstream methods stage lacks (M0 skips fit) may not
     // use that stage's placeholder; one it has may; a stage without
     // methods names no one method of one with.
@@ -1233,7 +1555,7 @@ mod tests {
     fn placeholders_name_something_in_its_place() {
         let cases: &[(&str, &str)] = &[
             ("{bogus}", "{bogus} is no placeholder: not an axis, a binding, a stage, inputs.NAME, \
-              glob:STAGE/PATTERN, or one of rep, rep_seed, seed, method, threads, gpu, out, legume"),
+              glob:STAGE/PATTERN, or one of rep, rep_seed, seed, method, threads, gpu, out, legume, shard, shards"),
             ("{method}", "{method} is for a stage with methods"),
             ("{gpu}", "{gpu} names a GPU, and this task asks for none"),
             ("{inputs.RUN2}", "{inputs.RUN2}: \"RUN2\" is no declared input"),
@@ -1523,7 +1845,7 @@ mod tests {
         assert_eq!(
             refused(&no_score),
             "stages[2].methods.M1.makes: lists 0 *.score.tsv; method M1 ends here, and the last \
-             stage of each method makes exactly one"
+             stage of each method makes exactly one (or, with no compare or plot, none does)"
         );
         let ends_early = METHODS.replace(
             r#""M1": {"run": ["TOOL2", "{sim}/sim.tsv", "{out}/fit"], "makes": ["fit.tsv"]}"#,
@@ -1533,7 +1855,7 @@ mod tests {
         assert_eq!(
             refused(&ends_early),
             "stages[1].methods.M3.makes: lists 0 *.score.tsv; method M3 ends here, and the last \
-             stage of each method makes exactly one"
+             stage of each method makes exactly one (or, with no compare or plot, none does)"
         );
         let two_scores = METHODS.replace(
             r#""makes": ["m.score.tsv"]}}}]}"#,
@@ -1542,7 +1864,20 @@ mod tests {
         assert_eq!(
             refused(&two_scores),
             "stages[2].methods.M1.makes: lists 2 *.score.tsv; method M1 ends here, and the last \
-             stage of each method makes exactly one"
+             stage of each method makes exactly one (or, with no compare or plot, none does)"
+        );
+    }
+
+    #[test]
+    fn a_spec_whose_methods_make_no_score_runs_unscored() {
+        let unscored = METHODS.replace("m.score.tsv", "m.tsv");
+        assert_eq!(expand(&spec(&unscored)).len(), 4);
+        let plotted =
+            unscored.replacen(r#""seeds""#, r#""compare": [["M1/t", "M0/t"]], "seeds""#, 1);
+        assert!(
+            refused(&plotted).contains("lists 0 *.score.tsv"),
+            "{}",
+            refused(&plotted)
         );
     }
 
@@ -1664,14 +1999,18 @@ mod tests {
         }
         let at = |n: &str| sec.join(n).display().to_string();
         assert_eq!(
-            glob(d.path(), "sim/sections/S*.zarr").unwrap(),
+            glob_paths(d.path(), "sim/sections/S*.zarr")
+                .unwrap()
+                .join(","),
             [at("S1.zarr"), at("S2.zarr"), at("S10.zarr")].join(",")
         );
         assert_eq!(
-            glob(d.path(), "sim/sections/S?.coords.*").unwrap(),
+            glob_paths(d.path(), "sim/sections/S?.coords.*")
+                .unwrap()
+                .join(","),
             at("S2.coords.parquet")
         );
-        let e = glob(d.path(), "sim/sections/T*.zarr").unwrap_err();
+        let e = glob_paths(d.path(), "sim/sections/T*.zarr").unwrap_err();
         assert_eq!(code(&e), 3);
         assert!(e
             .to_string()
@@ -1684,12 +2023,9 @@ mod tests {
         // A wildcard part, as in a shell, leaves out a hidden file (an
         // atomic write's temporary) unless it starts with a dot itself.
         std::fs::write(sec.join(".S3.zarr.123"), b"").unwrap();
+        assert_eq!(glob_paths(d.path(), "sim/sections/*").unwrap().len(), 4);
         assert_eq!(
-            glob(d.path(), "sim/sections/*").unwrap().split(',').count(),
-            4
-        );
-        assert_eq!(
-            glob(d.path(), "sim/sections/.S*").unwrap(),
+            glob_paths(d.path(), "sim/sections/.S*").unwrap().join(","),
             at(".S3.zarr.123")
         );
     }

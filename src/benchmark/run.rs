@@ -44,9 +44,13 @@ the plan books, and each method's max_running, allow. Tasks done in an
 earlier run are reused; at the end the scores are gathered.
 
 With --on, runs it on the cluster REMOTE, from here:
-the spec is planned on a compute node there, and each task runs as a
-Slurm array task under the wrapper, as many at once as Slurm and each
-method's max_running allow. A remote not in remotes.toml (in
+the spec is planned on a compute node there, and every stage is
+submitted at once, as Slurm array jobs (one per stage, method and task
+shape, of at most the cluster's MaxArraySize tasks), each held until the
+array jobs of the stages it reads have ended. Each task runs as an array
+task under the wrapper, as many at once as Slurm and each method's
+max_running (its array job's throttle) allow; one whose upstream did not
+end done is cancelled while it waits, and counted skipped. A remote not in remotes.toml (in
 ~/.config/legume, or $LEGUME_REMOTES) is asked for and kept there: its
 SSH target, the folder on the cluster for benchmarks, the folder of
 legume's tools there, and a Slurm partition and account. Tasks done in
@@ -388,7 +392,7 @@ impl Cluster<'_> {
             run,
             partition: self.remote.partition.clone(),
             account: self.remote.account.clone(),
-            max_array: 1000,
+            max_array: usize::MAX,
         };
         let budget = Budget {
             cores: CLUSTER_CORES,
@@ -497,7 +501,10 @@ impl<'a> Runner<'a> {
         dir: &Path,
     ) -> Result<Self> {
         let stages: Vec<&str> = spec.stages.iter().map(|s| s.name.as_str()).collect();
-        let pool = Pool::new(Want::of_plan(tasks, &stages)?, budget)?;
+        let mut pool = Pool::new(Want::of_plan(tasks, &stages)?, budget)?;
+        if ex.queues_ahead() {
+            pool.queue_ahead();
+        }
         Ok(Runner {
             skipped_said: vec![false; tasks.len()],
             tasks,
@@ -655,8 +662,16 @@ impl<'a> Runner<'a> {
         } in &round.ended
         {
             let at = self.submitted.get(task).copied();
+            // One launched ahead and cancelled behind an upstream that did
+            // not end done never ran: skipped, not stopped.
+            let word = if matches!(self.pool.state(*task), State::Skipped { .. }) {
+                self.skipped_said[*task] = true;
+                SKIPPED
+            } else {
+                outcome.word()
+            };
             self.events
-                .row(&self.tasks[*task], outcome.word(), exit.as_ref(), at)?;
+                .row(&self.tasks[*task], word, exit.as_ref(), at)?;
         }
         let at = unix_secs();
         for l in &round.launched {

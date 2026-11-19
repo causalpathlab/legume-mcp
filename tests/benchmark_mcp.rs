@@ -102,6 +102,7 @@ impl World {
             .current_dir(self.project())
             .env("PATH", std::env::join_paths(path).unwrap())
             .env("FAKE_SLURM", self.root().join("state"))
+            .env("LEGUME_BENCHMARK_UPSTREAM_WAIT_MS", "200")
             .env("LEGUME_REMOTES", self.remotes())
             .env("LEGUME_MCP_PROJECT", self.project())
             .env("LEGUME_MCP_WATCH", "off")
@@ -446,7 +447,8 @@ fn a_stop_ends_a_live_run_and_its_tasks() {
         error && text.contains("is running already, as pid"),
         "{text}"
     );
-    // Both sims in the stand-in queue, running.
+    // Both sims in the stand-in queue, running, and both scores queued
+    // behind them.
     let until = Instant::now() + Duration::from_secs(20);
     let running = || {
         std::fs::read_dir(w.root().join("state/q"))
@@ -461,10 +463,18 @@ fn a_stop_ends_a_live_run_and_its_tasks() {
         assert!(Instant::now() < until, "never ran");
         std::thread::sleep(Duration::from_millis(50));
     }
-    let (text, error) = s.call("benchmark_status", json!({ "name": "N1" }));
-    assert!(!error, "{text}");
+    let status = |s: &mut Server| {
+        let (text, error) = s.call("benchmark_status", json!({ "name": "N1" }));
+        assert!(!error, "{text}");
+        text
+    };
+    let mut text = status(&mut s);
+    while !text.contains("4 running, 0 pending") {
+        assert!(Instant::now() < until, "{text}");
+        std::thread::sleep(Duration::from_millis(50));
+        text = status(&mut s);
+    }
     assert!(text.contains(": alive\n"), "{text}");
-    assert!(text.contains("2 running, 2 pending"), "{text}");
     std::thread::sleep(Duration::from_millis(300));
     let (text, error) = s.call("benchmark_stop", json!({ "name": "N1" }));
     assert!(!error, "{text}");
@@ -474,10 +484,15 @@ fn a_stop_ends_a_live_run_and_its_tasks() {
     );
     assert_eq!(ended(&w, Duration::from_secs(30)), 130);
     let cancelled = std::fs::read_to_string(w.root().join("state/scancel.log")).unwrap();
-    assert_eq!(cancelled.split_whitespace().count(), 2, "{cancelled}");
+    // Each array job's two tasks, as one range.
+    assert_eq!(cancelled.trim(), "101_[0-1] 102_[0-1]", "{cancelled}");
     let (text, _) = s.call("benchmark_status", json!({ "name": "N1" }));
     assert!(text.contains(", exit 130\n"), "{text}");
-    assert!(text.contains("2 stopped"), "{text}");
+    // The scores queued behind the sims are stopped with them.
+    assert!(
+        text.contains("0 skipped, 0 running, 0 pending, 4 stopped"),
+        "{text}"
+    );
     let (text, error) = s.call("benchmark_stop", json!({ "name": "N1" }));
     assert!(
         error && text.contains("no live runner (its runner ended, exit 130)"),

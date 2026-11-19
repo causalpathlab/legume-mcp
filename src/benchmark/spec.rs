@@ -29,9 +29,19 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 4 * 3600;
 
 /// The placeholders every task has; no axis, binding or stage may take
 /// these names.
-pub const RESERVED: [&str; 10] = [
+pub const RESERVED: [&str; 12] = [
     "rep", "rep_seed", "seed", "method", "threads", "gpu", "out", "legume", "inputs", "glob",
+    "shard", "shards",
 ];
+
+/// The placeholders a stage's `makes` may use: its shard's.
+const SHARD_PHS: [&str; 2] = ["{shard}", "{shards}"];
+
+/// `m` with its shard placeholders filled by `shard` of `shards`.
+pub fn fill_shard(m: &str, shard: u32, shards: u32) -> String {
+    m.replace("{shards}", &shards.to_string())
+        .replace("{shard}", &shard.to_string())
+}
 
 /// A parsed spec.
 #[derive(Clone, Debug)]
@@ -103,6 +113,12 @@ pub struct Input {
 pub struct Stage {
     pub name: String,
     pub methods: Vec<Method>,
+    /// Each of its tasks is this many shards, each a task of its own: 1
+    /// when not given.
+    pub shards: u32,
+    /// A combine stage: one task per point, replicate and method, behind
+    /// every shard of the sharded stages it reads.
+    pub combine: bool,
 }
 
 impl Stage {
@@ -470,7 +486,8 @@ fn parse_method(o: &mut Obj, name: Option<String>, needs: Needs) -> Result<Metho
         ));
     }
     for (i, m) in makes.iter().enumerate() {
-        if m.contains('{') || !is_plain_relative(m) {
+        let plain = fill_shard(m, 0, 1);
+        if plain.contains('{') || !is_plain_relative(&plain) {
             return Err(bad(
                 &o.at(&format!("makes[{i}]")),
                 format!("{m:?} is not a plain path inside the task's folder"),
@@ -510,6 +527,25 @@ fn stage(at: String, v: &Value) -> Result<Stage> {
         ));
     }
     let needs = Needs::take(&mut o)?;
+    let shards = o
+        .nonzero_u32("shards", "is 0; a task is at least one shard")?
+        .unwrap_or(1);
+    let combine = match o.string("combine")?.as_deref() {
+        None => false,
+        Some("shards") => true,
+        Some(other) => {
+            return Err(bad(
+                &o.at("combine"),
+                format!("{other:?}: a combine stage combines \"shards\""),
+            ))
+        }
+    };
+    if combine && shards > 1 {
+        return Err(bad(
+            &o.at("shards"),
+            "a combine stage is not sharded: it combines the shards of the stage it reads",
+        ));
+    }
     let listed = o.get("methods");
     let has_run = o.map.contains_key("run") || o.map.contains_key("makes");
     let methods = match listed {
@@ -543,7 +579,25 @@ fn stage(at: String, v: &Value) -> Result<Stage> {
         }
     };
     o.done()?;
-    Ok(Stage { name, methods })
+    if shards == 1 {
+        for m in &methods {
+            if m.makes
+                .iter()
+                .any(|f| SHARD_PHS.iter().any(|p| f.contains(p)))
+            {
+                return Err(bad(
+                    &format!("{}.makes", m.at),
+                    "names {shard} or {shards}, and the stage has no shards",
+                ));
+            }
+        }
+    }
+    Ok(Stage {
+        name,
+        methods,
+        shards,
+        combine,
+    })
 }
 
 fn axis(at: String, name: &str, v: &Value) -> Result<Axis> {
@@ -942,6 +996,57 @@ mod tests {
 
     fn with(extra: &str) -> String {
         format!("{ONE}, {extra}}}")
+    }
+
+    #[test]
+    fn shards_and_combine_are_checked() {
+        let stage = |fields: &str| {
+            spec(
+                "N1",
+                r#"{"n": 1}"#,
+                &format!(r#"{{"name": "s", {fields} "run": ["T"], "makes": ["m"]}}"#),
+            )
+        };
+        let s = parse(&stage(r#""shards": 4,"#)).unwrap().0;
+        assert_eq!((s.stages[0].shards, s.stages[0].combine), (4, false));
+        let s = parse(&stage(r#""combine": "shards","#)).unwrap().0;
+        assert_eq!((s.stages[0].shards, s.stages[0].combine), (1, true));
+        for (fields, want) in [
+            (
+                r#""shards": 0,"#,
+                "stages[0].shards: is 0; a task is at least one shard",
+            ),
+            (
+                r#""combine": "reps","#,
+                "stages[0].combine: \"reps\": a combine stage combines \"shards\"",
+            ),
+            (
+                r#""combine": "shards", "shards": 2,"#,
+                "stages[0].shards: a combine stage is not sharded: it combines the shards of \
+                 the stage it reads",
+            ),
+        ] {
+            assert_eq!(refused(&stage(fields)), want);
+        }
+        let makes = spec(
+            "N1",
+            r#"{"n": 1}"#,
+            r#"{"name": "s", "run": ["T"], "makes": ["m.{shard}"]}"#,
+        );
+        assert_eq!(
+            refused(&makes),
+            "stages[0].makes: names {shard} or {shards}, and the stage has no shards"
+        );
+        let other = spec(
+            "N1",
+            r#"{"n": 1}"#,
+            r#"{"name": "s", "shards": 2, "run": ["T"], "makes": ["m.{rep}"]}"#,
+        );
+        assert!(
+            refused(&other).contains("is not a plain path"),
+            "{}",
+            refused(&other)
+        );
     }
 
     /// The smallest stage, for specs that vary something else.
