@@ -260,9 +260,10 @@ struct Job {
 }
 
 impl Job {
-    /// Stand-ins: `cargo install ... --root R ... NAME` writes R/bin/<bin of
-    /// NAME> and adds it to a record that `cargo install --list --root R`
-    /// prints as cargo does; `rustc` prints a version; `rustup` keeps its
+    /// Stand-ins: `cargo install ... --root R ... NAME` puts R/bin/<bin of
+    /// NAME> in place with a rename, as cargo does, keeps the CARGO_HOME it
+    /// saw in $HOME/cargo-home-seen and adds it to a record that `cargo
+    /// install --list --root R` prints as cargo does; `rustc` prints a version; `rustup` keeps its
     /// arguments in $HOME/rustup-calls. `sbatch` keeps its arguments and
     /// the status it was called with, runs the job with bash into its
     /// --output, keeps the job's exit code in $HOME/job-exit and prints a
@@ -283,6 +284,7 @@ if [ "$2" = "--list" ]; then
 fi
 echo "$@" >> "$HOME/cargo-calls"
 echo "${LIBCLANG_PATH:-}|${BINDGEN_EXTRA_CLANG_ARGS:-}" >> "$HOME/cargo-env"
+echo "${CARGO_HOME:-}" > "$HOME/cargo-home-seen"
 [ -n "$CARGO_TARGET_DIR" ] && mkdir -p "$CARGO_TARGET_DIR" && echo "$CARGO_TARGET_DIR" > "$HOME/target-dir"
 case "$name" in
 legume-mcp) b=legume ;; pinto-rs) b=pinto ;; broken*) exit 101 ;;
@@ -290,8 +292,9 @@ stopped) kill -TERM "$PPID"; sleep 1; : > "$HOME/build-finished"; exit 0 ;;
 *) b="$name" ;;
 esac
 mkdir -p "$root/bin"
-printf '#!/bin/sh\n' > "$root/bin/$b"
-chmod +x "$root/bin/$b"
+printf '#!/bin/sh\n' > "$root/bin/.$b.new"
+chmod +x "$root/bin/.$b.new"
+mv -f "$root/bin/.$b.new" "$root/bin/$b"
 echo "$name $b" >> "$record"
 "#,
         );
@@ -596,4 +599,76 @@ fn versions_name_only_what_this_job_installed() {
     assert!(!versions.contains("pinto"), "{versions}");
     assert!(!versions.contains("OTHER1"), "{versions}");
     assert!(!ran.exists(), "an unrelated program was run");
+}
+
+#[test]
+fn binaries_replaced_under_running_jobs_are_kept() {
+    let job = Job::new();
+    let bin = job.prefix().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_exe(&bin.join("legume"), "echo old legume");
+    write_exe(&bin.join("pinto"), "echo old pinto");
+    ok(&job.run(&["--no-rust-update", "legume-mcp:benchmark"]));
+    assert_eq!(job.status(), "done", "{}", job.run_file("slurm.log"));
+    // The new one is in bin, and the old file, which a job started before
+    // may still run, has a name in this install's folder.
+    assert_eq!(job.file("bin/legume").unwrap(), "#!/bin/sh\n");
+    let previous = only_run(job.prefix()).join("previous");
+    assert!(std::fs::read_to_string(previous.join("legume"))
+        .unwrap()
+        .contains("old legume"));
+    // A binary this install did not replace is not kept.
+    assert!(!previous.join("pinto").exists());
+}
+
+#[test]
+fn only_the_last_three_installs_keep_their_binaries() {
+    let job = Job::new();
+    let bin = job.prefix().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_exe(&bin.join("legume"), "echo old legume");
+    let installs = job.prefix().join("install");
+    for t in ["20200101-000000", "20200102-000000", "20200103-000000"] {
+        let p = installs.join(t).join("previous");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("legume"), "").unwrap();
+    }
+    ok(&job.run(&["--no-rust-update", "legume-mcp:benchmark"]));
+    assert_eq!(job.exit(), "0");
+    let kept: Vec<String> = std::fs::read_dir(&installs)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.join("previous").is_dir())
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(kept.len(), 3, "{kept:?}");
+    assert!(!kept.contains(&"20200101-000000".to_string()), "{kept:?}");
+    // The folder itself, with its log and status, stays.
+    assert!(installs.join("20200101-000000").is_dir());
+}
+
+#[test]
+fn cargo_downloads_go_in_the_prefix_with_cargo_settings() {
+    let job = Job::new();
+    // HOME is the prefix here, so the home folder's cargo is $HOME/.cargo.
+    let home_cargo = job.prefix().join(".cargo");
+    std::fs::create_dir_all(&home_cargo).unwrap();
+    std::fs::write(home_cargo.join("config.toml"), "[net]\nretry = 9\n").unwrap();
+    ok(&job.run(&["--no-rust-update", "legume-mcp:benchmark"]));
+    assert_eq!(job.status(), "done", "{}", job.run_file("slurm.log"));
+    let seen = job.file("cargo-home-seen").unwrap();
+    let cargo_home = job.prefix().join("cargo-home");
+    assert_eq!(seen.trim(), cargo_home.to_str().unwrap());
+    assert_eq!(
+        job.file("cargo-home/config.toml").unwrap(),
+        "[net]\nretry = 9\n"
+    );
+}
+
+#[test]
+fn an_install_that_replaced_nothing_keeps_nothing() {
+    let job = Job::new();
+    ok(&job.run(&["--no-rust-update", "legume-mcp:benchmark"]));
+    assert_eq!(job.status(), "done", "{}", job.run_file("slurm.log"));
+    assert!(!only_run(job.prefix()).join("previous").exists());
 }

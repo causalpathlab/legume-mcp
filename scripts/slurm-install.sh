@@ -17,6 +17,14 @@
 #
 # The build happens in node-local scratch (--build-tmp, /tmp by default)
 # and is removed after, so only the installed binaries land in PREFIX.
+# cargo's download cache goes in PREFIX/cargo-home, not the home folder.
+#
+# Jobs still running a tool keep it: each binary as it was is kept under
+# a second name in PREFIX/install/<time>/previous/ (a hard link, no copy),
+# as on a shared filesystem such as NFS a binary replaced under running
+# jobs on other nodes kills them. The last 3 installs that replaced
+# one keep theirs. PREFIX/cargo-home grows with the crates downloaded; it
+# gets the home folder's cargo config on each install.
 #
 # Usage:
 #   slurm-install.sh --prefix DIR [options] [CRATE[@VERSION][:FEATURES] ...]
@@ -203,8 +211,31 @@ elif [ "$rust_update" = 1 ] && command -v rustup > /dev/null 2>&1; then
 fi
 say "$(cargo --version), $(rustc --version)"
 
+# cargo's download cache in the prefix (see above); the toolchain stays.
+case "${CARGO_HOME:-}" in
+"$prefix"/*) ;;
+*)
+    old="${CARGO_HOME:-$HOME/.cargo}"
+    export CARGO_HOME="$prefix/cargo-home"
+    mkdir -p "$CARGO_HOME"
+    for f in config config.toml; do
+        [ -f "$old/$f" ] && cp "$old/$f" "$CARGO_HOME/"
+    done
+    ;;
+esac
+
 export CARGO_TARGET_DIR="$build_tmp/legume-install.${SLURM_JOB_ID:-$$}"
 mkdir -p "$CARGO_TARGET_DIR" "$prefix/bin"
+
+# Each binary as it was (see above): cargo renames each new one over it,
+# and on NFS the server frees a file once no name is left on it, while
+# jobs on other nodes may still run it.
+keep="$run/previous"
+mkdir -p "$keep"
+for f in "$prefix/bin"/*; do
+    [ -f "$f" ] || continue
+    ln -f "$f" "$keep/" 2> /dev/null || say "could not keep $f for the jobs running it"
+done
 
 # libclang for crates whose C bindings are made at build time.
 needs_libclang=0
@@ -279,6 +310,15 @@ for spec in "${crates[@]}"; do
     fi
     build=""
 done
+
+# Only the binaries this install replaced stay kept, so an install that
+# replaced none takes none of the 3 places.
+for f in "$keep"/*; do
+    [ "$f" -ef "$prefix/bin/${f##*/}" ] && rm -f "$f"
+done
+rmdir "$keep" 2> /dev/null
+kept=("$prefix"/install/2*/previous)
+for ((i = 0; i < ${#kept[@]} - 3; i++)); do rm -rf "${kept[i]}"; done
 
 {
     echo "node: $node"
