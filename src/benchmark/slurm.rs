@@ -27,12 +27,11 @@
 //! but bash, coreutils and Slurm's own commands.
 
 use super::executor::{Ended, Executor, Resumed, TaskExit};
-use super::plan::{Task, ATTEMPTS, PLACED};
+use super::plan::{Placed, Task, ATTEMPTS, PLACED};
 use super::pool::{Launch, Live, Outcome};
 use super::remote::Shell;
 use crate::project::quote;
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
@@ -88,6 +87,8 @@ pub struct Slurm {
     pending: HashSet<Job>,
     /// Tasks a person stopped: one lost is stopped, not lost.
     stopping: HashSet<usize>,
+    /// Array tasks resume found queued for a task under another key.
+    stale: Vec<Job>,
     /// How long a task gone from the queue without an `exit.json` is
     /// waited for (a shared filesystem may show a new file late).
     pub lost_after: Duration,
@@ -105,6 +106,7 @@ impl Slurm {
             running: BTreeMap::new(),
             pending: HashSet::new(),
             stopping: HashSet::new(),
+            stale: Vec::new(),
             lost_after: Duration::from_secs(60),
         }
     }
@@ -114,11 +116,11 @@ impl Slurm {
     /// still in the queue (`slurm.json` names an array task the queue
     /// has, and no `exit.json` says it ended), which are adopted. A task
     /// done, or still queued, for another key is rekeyed; one still
-    /// queued is cancelled only when `rerun_changed`. The script is the
+    /// queued is kept for [`Executor::cancel_rekeyed`]. The script is the
     /// same size for any number of tasks: one `find` at the tasks' depth
     /// under their common folder, and one `awk` that prints each file
     /// found.
-    fn resumed(&mut self, rerun_changed: bool) -> Result<Resumed> {
+    fn resumed(&mut self) -> Result<Resumed> {
         let root = common_folder(self.tasks.iter().map(|t| t.dir.as_path()))
             .context("a plan with no tasks")?;
         let depths = self.tasks.iter().map(|t| {
@@ -148,19 +150,14 @@ impl Slurm {
         let files = task_files(&ran.stdout, &self.tasks);
         let mut resumed = Resumed::default();
         let mut watched = Vec::new();
-        let mut stale = Vec::new();
         for (i, t) in self.tasks.iter().enumerate() {
             let f = files.get(&i);
             let done = f
                 .and_then(|f| f.done.as_deref())
                 .and_then(|j| super::plan::done_key(j.as_bytes()));
-            match done {
-                Some(k) if k == t.key => {
-                    resumed.done.push(i);
-                    continue;
-                }
-                Some(_) => resumed.rekeyed.push(i),
-                None => {}
+            if done.as_deref() == Some(t.key.as_str()) {
+                resumed.done.push(i);
+                continue;
             }
             let placed = f
                 .filter(|f| !f.exit)
@@ -174,26 +171,18 @@ impl Slurm {
                     (job, p.key == t.key)
                 })
                 .filter(|(j, _)| poll.queued.contains(j) || poll.pending.contains(j));
+            if done.is_some() || matches!(placed, Some((_, false))) {
+                resumed.rekeyed.push(i);
+            }
             match placed {
                 Some((job, true)) => watched.push((i, job)),
-                Some((job, false)) => {
-                    stale.push(quote(&job.id()));
-                    if resumed.rekeyed.last() != Some(&i) {
-                        resumed.rekeyed.push(i);
-                    }
-                }
+                Some((job, false)) => self.stale.push(job),
                 None => {}
             }
         }
         for (i, job) in watched {
             self.watch(i, job);
             resumed.adopted.push(i);
-        }
-        if rerun_changed && !stale.is_empty() {
-            self.shell.check(
-                &format!("scancel {} || true", stale.join(" ")),
-                "cancelling attempts of tasks rekeyed since",
-            )?;
         }
         self.pending = poll.pending;
         Ok(resumed)
@@ -300,15 +289,6 @@ fn parse_range(s: &str) -> Option<Vec<Job>> {
         }
     }
     Some(jobs)
-}
-
-/// A `slurm.json`: the array task a task was put in, for its key.
-#[derive(Deserialize)]
-struct Placed {
-    array_job_id: String,
-    index: usize,
-    #[serde(default)]
-    key: String,
 }
 
 /// The files of one task's folder that resume reads.
@@ -425,8 +405,20 @@ fn aside_fn() -> String {
 const GROUP: &str = "@@group ";
 
 impl Executor for Slurm {
-    fn resume(&mut self, rerun_changed: bool) -> Result<Resumed> {
-        self.resumed(rerun_changed)
+    fn resume(&mut self) -> Result<Resumed> {
+        self.resumed()
+    }
+
+    fn cancel_rekeyed(&mut self) -> Result<()> {
+        let stale: Vec<String> = self.stale.drain(..).map(|j| quote(&j.id())).collect();
+        if stale.is_empty() {
+            return Ok(());
+        }
+        self.shell.check(
+            &format!("scancel {} || true", stale.join(" ")),
+            "cancelling attempts of tasks rekeyed since",
+        )?;
+        Ok(())
     }
 
     fn live(&mut self) -> Result<Live> {

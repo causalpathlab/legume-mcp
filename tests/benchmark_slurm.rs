@@ -377,15 +377,14 @@ fn resume_finds_done_tasks_by_key_and_adopts_queued_ones() {
         c.queue(&format!("77_{n}"), "R");
     }
     std::fs::write(dir(4).join("exit.json"), "{}").unwrap();
-    // Without rerun_changed, the queued attempt of another key is left.
-    let r = c.slurm(100).resume(false).unwrap();
-    assert_eq!(r.rekeyed, vec![ids[1], ids[4]]);
-    assert_eq!(c.log("scancel.log").trim(), "");
     let mut s = c.slurm(100);
-    let r = s.resume(true).unwrap();
+    let r = s.resume().unwrap();
     assert_eq!(r.done, vec![ids[0]]);
     assert_eq!(r.adopted, vec![ids[2]]);
     assert_eq!(r.rekeyed, vec![ids[1], ids[4]]);
+    // Resume changes nothing; the runner cancels once it goes ahead.
+    assert_eq!(c.log("scancel.log").trim(), "");
+    s.cancel_rekeyed().unwrap();
     assert_eq!(c.log("scancel.log").trim(), "77_5");
     // The adopted task is watched, and ends by its exit.json.
     assert!(s.poll().unwrap().is_empty());

@@ -286,18 +286,13 @@ pub(crate) fn detach(
         .open(&log_path)
         .with_context(|| format!("opening {}", log_path.display()))?;
     let started = crate::project::rfc3339();
-    writeln!(
-        log,
-        "== {started}: legume benchmark run {}{}{}",
-        d.spec_file.display(),
-        d.on.map_or(String::new(), |on| format!(" --on {on}")),
-        if d.rerun_changed {
-            " --rerun-changed"
-        } else {
-            ""
-        }
-    )?;
     let mut cmd = run_command(d.spec_file, d.on, d.rerun_changed)?;
+    // The command as run, but for this legume's own path.
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    writeln!(log, "== {started}: legume {}", args.join(" "))?;
     cmd.current_dir(d.root)
         .env(crate::project::ROOT_ENV, d.root)
         .env(RUNNER_ENV, dir.join(RUNNER_FILE))

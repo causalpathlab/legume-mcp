@@ -229,7 +229,7 @@ fn run_here(
     )?;
     if let Err(e) = r.resume(rerun_changed, out) {
         if let Some(last) = last_plan {
-            crate::job::replace(&dir, "plan.json", &last)?;
+            super::gather::write(&dir, "plan.json", &last)?;
         }
         return Err(e);
     }
@@ -498,7 +498,7 @@ impl<'a> Runner<'a> {
     ) -> Result<Self> {
         let stages: Vec<&str> = spec.stages.iter().map(|s| s.name.as_str()).collect();
         let pool = Pool::new(Want::of_plan(tasks, &stages)?, budget)?;
-        let r = Runner {
+        Ok(Runner {
             skipped_said: vec![false; tasks.len()],
             tasks,
             pool,
@@ -507,8 +507,7 @@ impl<'a> Runner<'a> {
             events: Events::open(dir)?,
             submitted: HashMap::new(),
             started: Instant::now(),
-        };
-        Ok(r)
+        })
     }
 
     /// Rounds until the pool is finished, then how it ended, said on
@@ -527,7 +526,7 @@ impl<'a> Runner<'a> {
     /// changes, when tasks finished or queued under another key would run
     /// again, unless `rerun_changed`.
     fn resume(&mut self, rerun_changed: bool, out: &mut dyn Write) -> Result<()> {
-        let resumed = self.ex.resume(rerun_changed)?;
+        let resumed = self.ex.resume()?;
         if !resumed.rekeyed.is_empty() {
             let n = resumed.rekeyed.len();
             let some: Vec<&str> = resumed
@@ -545,12 +544,15 @@ impl<'a> Runner<'a> {
             );
             if !rerun_changed {
                 return Err(refuse(format!(
-                    "{said}. Nothing was started or cancelled. Put the spec back to reuse \
-                     them, or run with --rerun-changed (benchmark_start's rerun_changed) to \
-                     run them anew; their earlier attempts are kept under tasks/.attempts"
+                    "{said}. Nothing was started or cancelled (an attempt still queued under \
+                     an old key is refused when it starts, not run anew). Put the spec back \
+                     to reuse them, or run with --rerun-changed (benchmark_start's \
+                     rerun_changed) to run them anew; their earlier attempts are kept under \
+                     tasks/.attempts"
                 )));
             }
             writeln!(out, "{said}; running them anew (--rerun-changed)")?;
+            self.ex.cancel_rekeyed()?;
         }
         self.pool.resume(0, &resumed.done, &resumed.adopted)?;
         for (list, event) in [(&resumed.done, REUSED), (&resumed.adopted, ADOPTED)] {

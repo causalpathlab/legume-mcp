@@ -129,17 +129,12 @@ fn failed_itself(t: &Task) {
 /// another key): the plan was made anew since, and this job runs only
 /// what it was placed for. A refused run leaves such jobs queued.
 fn placed_for(t: &Task) -> Result<()> {
-    #[derive(serde::Deserialize)]
-    struct Placed {
-        array_job_id: String,
-        key: String,
-    }
     let Ok(job) = std::env::var("SLURM_ARRAY_JOB_ID") else {
         return Ok(());
     };
     let placed = std::fs::read(t.dir.join(PLACED))
         .ok()
-        .and_then(|b| serde_json::from_slice::<Placed>(&b).ok());
+        .and_then(|b| serde_json::from_slice::<super::plan::Placed>(&b).ok());
     match placed {
         Some(p) if p.array_job_id == job && p.key != t.key => Err(usage(format!(
             "task {}: array job {job} was placed for key {}, and the plan now has {}; \

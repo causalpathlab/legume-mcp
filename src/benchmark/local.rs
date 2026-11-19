@@ -83,16 +83,12 @@ impl Executor for Local {
     /// The tasks done in an earlier run (their `done.json` has their
     /// key), and those done under another key. A local run adopts
     /// nothing: its wrappers ended with it.
-    fn resume(&mut self, _rerun_changed: bool) -> Result<Resumed> {
+    fn resume(&mut self) -> Result<Resumed> {
         let mut resumed = Resumed::default();
         for (i, t) in self.tasks.iter().enumerate() {
-            let Ok(done) = std::fs::read(t.dir.join("done.json")) else {
-                continue;
-            };
-            match super::plan::done_key(&done) {
+            match super::plan::done_key_in(&t.dir) {
                 Some(k) if k == t.key => resumed.done.push(i),
                 Some(_) => resumed.rekeyed.push(i),
-                // Not whole: not done, as Slurm's resume reads it.
                 None => {}
             }
         }

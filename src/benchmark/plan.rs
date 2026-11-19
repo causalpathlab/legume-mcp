@@ -123,13 +123,27 @@ pub(crate) const ATTEMPTS: &str = ".attempts";
 /// a Slurm launch writes before the attempt starts.
 pub(crate) const PLACED: &str = "slurm.json";
 
+/// A `slurm.json`: the array task a task was put in, for its key.
+#[derive(Deserialize)]
+pub(crate) struct Placed {
+    pub(crate) array_job_id: String,
+    pub(crate) index: usize,
+    #[serde(default)]
+    pub(crate) key: String,
+}
+
 impl Task {
     /// It is done in `dir`, where its files are: its `done.json` has its
     /// key.
     pub fn done_in(&self, dir: &Path) -> bool {
-        std::fs::read(dir.join("done.json"))
-            .is_ok_and(|b| done_key(&b).as_deref() == Some(self.key.as_str()))
+        done_key_in(dir).as_deref() == Some(self.key.as_str())
     }
+}
+
+/// The key of the `done.json` in `dir`: none when there is none, or it is
+/// not whole.
+pub fn done_key_in(dir: &Path) -> Option<String> {
+    done_key(&std::fs::read(dir.join("done.json")).ok()?)
 }
 
 /// The key a `done.json` holds.
