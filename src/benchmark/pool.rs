@@ -251,8 +251,8 @@ pub struct Pool {
     /// Launched tasks to cancel, with why: the upstream task that did not
     /// end done, or `None` for their method's halt.
     doomed: HashMap<usize, Option<usize>>,
-    /// Of `doomed`, those not yet [`Pool::cancelled`].
-    cancels: Vec<usize>,
+    /// Of `doomed`, those not yet [`Pool::cancelled`], with their cause.
+    cancels: Vec<(usize, Option<usize>)>,
     /// How long a task may be passed over; [`STARVE_MS`] by default.
     pub starve_ms: u64,
     acct: Acct,
@@ -393,9 +393,11 @@ impl Pool {
         self.ahead = true;
     }
 
-    /// The launched tasks to cancel: behind a task that did not end done,
-    /// or of a method that halted; until [`Pool::cancelled`].
-    pub fn cancels(&self) -> &[usize] {
+    /// The launched tasks to cancel, until [`Pool::cancelled`]: each with
+    /// the upstream task that did not end done (it cannot run, started or
+    /// not), or `None` when its method halted (only one not started is
+    /// cancelled).
+    pub fn cancels(&self) -> &[(usize, Option<usize>)] {
         &self.cancels
     }
 
@@ -443,14 +445,17 @@ impl Pool {
         self.event(now, |p| {
             p.rss.remove(&i);
             // Launched ahead and stopped (cancelled, or refused by a
-            // wrapper) behind an upstream task that is not done: skipped.
+            // wrapper) behind an upstream task that ended and is not done:
+            // skipped. One a person stopped, whose upstream still runs, is
+            // stopped.
             let cause = p.doomed.remove(&i);
             if outcome == Outcome::Stopped && p.ahead {
-                let not_done = p.wants[i]
-                    .upstream
-                    .iter()
-                    .copied()
-                    .find(|&j| p.state[j] != State::Ended(Outcome::Done));
+                let not_done = p.wants[i].upstream.iter().copied().find(|&j| {
+                    matches!(
+                        p.state[j],
+                        State::Ended(o) if o != Outcome::Done
+                    ) || matches!(p.state[j], State::Skipped { .. })
+                });
                 if let Some(upstream) = cause.or(not_done.map(Some)) {
                     p.state[i] = State::Skipped { upstream };
                     p.skip_downstream(i);
@@ -688,7 +693,7 @@ impl Pool {
     fn doom(&mut self, i: usize, cause: Option<usize>) {
         if let std::collections::hash_map::Entry::Vacant(e) = self.doomed.entry(i) {
             e.insert(cause);
-            self.cancels.push(i);
+            self.cancels.push((i, cause));
         }
     }
 

@@ -57,7 +57,7 @@ pub struct Site {
     pub run: String,
     pub partition: Option<String>,
     pub account: Option<String>,
-    /// Tasks in one array job at most.
+    /// Tasks in one array job at most, besides the cluster's MaxArraySize.
     pub max_array: usize,
 }
 
@@ -93,8 +93,13 @@ pub struct Slurm {
     /// The array tasks the last poll saw pending, whose files are not
     /// looked at.
     pending: HashSet<Job>,
-    /// The array tasks the last poll saw started.
-    started: HashSet<Job>,
+    /// The array jobs the last poll that read the queue saw in it, once
+    /// one has.
+    queued_arrays: Option<HashSet<String>>,
+    /// The last array job of each capped method (stage, method): the next
+    /// one waits for it, so the method's tasks never run more than its
+    /// `max_running` at once.
+    capped_last: HashMap<(String, Option<String>), String>,
     /// Each task's index in the plan, by id.
     index: HashMap<String, usize>,
     /// The most tasks one array job takes: the cluster's MaxArraySize,
@@ -102,9 +107,9 @@ pub struct Slurm {
     max_array: Option<usize>,
     /// Tasks a person stopped: one lost is stopped, not lost.
     stopping: HashSet<usize>,
-    /// Of `stopping`, those cancelled before the last poll saw them start:
-    /// one gone from the queue never writes an `exit.json`, so it ends at
-    /// once.
+    /// Of `stopping`, those cancelled before the last poll saw them start,
+    /// or that cannot run: one gone from the queue ends at once, its
+    /// `exit.json` (if any) not waited for.
     unstarted: HashSet<usize>,
     /// Array tasks resume found queued for a task under another key.
     stale: Vec<Job>,
@@ -129,7 +134,8 @@ impl Slurm {
             tasks,
             running: BTreeMap::new(),
             pending: HashSet::new(),
-            started: HashSet::new(),
+            queued_arrays: None,
+            capped_last: HashMap::new(),
             max_array: None,
             stopping: HashSet::new(),
             unstarted: HashSet::new(),
@@ -215,9 +221,9 @@ impl Slurm {
         Ok(resumed)
     }
 
-    /// Task `i` watched as array task `job`.
     /// The most tasks one array job takes: the cluster's MaxArraySize, read
-    /// once, or `site.max_array` when the cluster does not say.
+    /// once ([`DEFAULT_MAX_ARRAY`] when the cluster does not say), and at
+    /// most `site.max_array`.
     fn max_array(&mut self) -> Result<usize> {
         if let Some(n) = self.max_array {
             return Ok(n);
@@ -231,13 +237,14 @@ impl Slurm {
             .parse::<usize>()
             .ok()
             .filter(|&n| ran.ok() && n > 0)
-            .unwrap_or(self.site.max_array);
+            .unwrap_or(DEFAULT_MAX_ARRAY)
+            .min(self.site.max_array);
         self.max_array = Some(n);
         Ok(n)
     }
 
-    /// Those of `tasks` watched here whose array task the last poll did
-    /// not see started.
+    /// Those of `tasks` watched here whose array task the last poll saw
+    /// pending.
     fn unstarted_of(&self, tasks: &[usize]) -> Vec<usize> {
         tasks
             .iter()
@@ -245,11 +252,12 @@ impl Slurm {
             .filter(|i| {
                 self.running
                     .get(i)
-                    .is_some_and(|r| !self.started.contains(&r.job))
+                    .is_some_and(|r| self.pending.contains(&r.job))
             })
             .collect()
     }
 
+    /// Task `i` watched as array task `job`.
     fn watch(&mut self, i: usize, job: Job) {
         self.running.insert(
             i,
@@ -444,6 +452,10 @@ fn squeue_line(run: &str) -> String {
     )
 }
 
+/// Slurm's own default MaxArraySize, less one: the most tasks an array job
+/// takes when the cluster does not say.
+const DEFAULT_MAX_ARRAY: usize = 1000;
+
 /// Tasks of one stage, method and shape go in as one array job: a
 /// method's tasks share its throttle, and a stage's wait for the same
 /// upstream.
@@ -505,6 +517,13 @@ impl Executor for Slurm {
         true
     }
 
+    fn cancel_unrunnable(&mut self, tasks: &[usize]) -> Result<()> {
+        self.cancel(tasks)?;
+        let watched = tasks.iter().filter(|i| self.running.contains_key(i));
+        self.unstarted.extend(watched);
+        Ok(())
+    }
+
     fn cancel_queued(&mut self, tasks: &[usize]) -> Result<()> {
         let mut queued = self.unstarted_of(tasks);
         queued.retain(|i| !self.stopping.contains(i));
@@ -535,9 +554,13 @@ impl Executor for Slurm {
             group_of.insert(i, g);
         }
         // What each group waits for: the array jobs of upstream tasks
-        // already in, and the groups of those in this launch.
+        // already in, and the groups of those in this launch; for a capped
+        // method, its array job before. An array job the queue no longer
+        // has has ended, so is not waited for (Slurm may have forgotten
+        // it, and refuse the dependency).
         let mut jobs_after: Vec<BTreeSet<String>> = vec![BTreeSet::new(); groups.len()];
         let mut groups_after: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); groups.len()];
+        let mut capped: HashMap<(String, Option<String>), usize> = HashMap::new();
         for (g, members) in groups.iter().enumerate() {
             for &i in members {
                 for id in &self.tasks[i].upstream {
@@ -550,6 +573,23 @@ impl Executor for Slurm {
                         jobs_after[g].insert(r.job.array_job.clone());
                     }
                 }
+            }
+            let t = &self.tasks[members[0]];
+            if t.max_running.is_some() {
+                let method = (t.stage.clone(), t.method.clone());
+                match capped.insert(method.clone(), g) {
+                    Some(h) => {
+                        groups_after[g].insert(h);
+                    }
+                    None => {
+                        if let Some(j) = self.capped_last.get(&method) {
+                            jobs_after[g].insert(j.clone());
+                        }
+                    }
+                }
+            }
+            if let Some(queued) = &self.queued_arrays {
+                jobs_after[g].retain(|j| queued.contains(j));
             }
         }
         // Each group after those it waits for: upstream tasks are before
@@ -637,6 +677,9 @@ impl Executor for Slurm {
                 ran.stderr.trim()
             );
         };
+        for (method, g) in capped {
+            self.capped_last.insert(method, jids[g].clone());
+        }
         for (members, array_job) in groups.iter().zip(jids) {
             for (index, &i) in members.iter().enumerate() {
                 let job = Job {
@@ -673,8 +716,9 @@ impl Executor for Slurm {
         }
         let poll = parse_poll(&ran.stdout);
         if poll.queue_ok {
+            let arrays = poll.queued.iter().chain(&poll.pending);
+            self.queued_arrays = Some(arrays.map(|j| j.array_job.clone()).collect());
             self.pending = poll.pending;
-            self.started.clone_from(&poll.queued);
         }
         let now = Instant::now();
         let mut ended = Vec::new();

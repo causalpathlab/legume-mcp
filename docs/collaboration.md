@@ -956,7 +956,9 @@ person's `remotes.toml`; it is theirs, so an agent never makes one up: when
     earlier stage that has methods.
   - `makes`: the files the task writes in `{out}`; it is done when they are
     there. The last stage of each method makes exactly one `*.score.tsv`
-    (columns `score`, `metric`, `value`, `part`), as `{legume} score` does.
+    (columns `score`, `metric`, `value`, `part`), as `{legume} score` does;
+    or, in a spec with no `compare` or `plot`, none does: an unscored
+    benchmark, such as one on real data with no truth to score against.
   - What a task books, on a stage or on one method (a method's own wins):
     `threads` (1), `mem_gb` (0), `gpus` (0), `timeout` (`"30m"`, `"1h30m"`;
     4h when not given), `max_running` (at most this many at once), `tool`

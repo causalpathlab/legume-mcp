@@ -392,7 +392,7 @@ impl Cluster<'_> {
             run,
             partition: self.remote.partition.clone(),
             account: self.remote.account.clone(),
-            max_array: 1000,
+            max_array: usize::MAX,
         };
         let budget = Budget {
             cores: CLUSTER_CORES,

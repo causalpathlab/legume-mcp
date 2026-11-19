@@ -882,16 +882,16 @@ fn ahead_what_waits_on_a_failed_task_is_cancelled_and_skipped() {
     p.ended(1, 0, Outcome::Done).unwrap();
     p.ended(2, 1, Outcome::Failed).unwrap();
     // fit M1 failed: score M1, queued behind it, is to be cancelled.
-    assert_eq!(p.cancels(), [3]);
+    assert_eq!(p.cancels(), [(3, Some(1))]);
     p.cancelled();
     assert!(p.cancels().is_empty());
     // Cancelled before it ran: skipped for fit M1, not stopped.
     p.ended(3, 3, Outcome::Stopped).unwrap();
     assert_eq!(*p.state(3), State::Skipped { upstream: Some(1) });
-    // A task refused by its wrapper, its upstream not done, before the
-    // pool hears of the upstream's end, is skipped too.
+    // One stopped while its upstream still runs (a person's stop) is
+    // stopped, not skipped.
     p.ended(4, 4, Outcome::Stopped).unwrap();
-    assert_eq!(*p.state(4), State::Skipped { upstream: Some(2) });
+    assert_eq!(*p.state(4), State::Ended(Outcome::Stopped));
     p.ended(5, 2, Outcome::Done).unwrap();
     assert!(p.finished());
 }
@@ -913,7 +913,7 @@ fn ahead_a_halted_methods_queued_tasks_are_cancelled() {
         p.ended(2, i, Outcome::Failed).unwrap();
     }
     assert_eq!(p.halted_methods().len(), 1);
-    assert_eq!(p.cancels(), [4]);
+    assert_eq!(p.cancels(), [(4, None)]);
     p.ended(3, 4, Outcome::Stopped).unwrap();
     assert_eq!(*p.state(4), State::Skipped { upstream: None });
 }

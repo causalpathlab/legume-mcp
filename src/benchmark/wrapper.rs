@@ -54,6 +54,16 @@ const STOP_GRACE: Duration = Duration::from_secs(20);
 /// tool itself has ended.
 const LINGER: Duration = Duration::from_secs(1);
 
+/// How long a task waits for its upstream's done.json to show on this
+/// node before it is refused: as long as the runner waits for a lagging
+/// exit.json; `$LEGUME_BENCHMARK_UPSTREAM_WAIT_MS` when set (for tests).
+fn upstream_wait() -> Duration {
+    std::env::var("LEGUME_BENCHMARK_UPSTREAM_WAIT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(Duration::from_secs(60), Duration::from_millis)
+}
+
 /// How often the wrapper looks at the tool, its clock and its own stop.
 const TICK: Duration = Duration::from_millis(50);
 
@@ -88,15 +98,28 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
     // A folder whose earlier attempt cannot be set aside is not written
     // to at all: the runner counts the task lost.
     let attempt = set_aside(&task.dir)?;
+    let upstream: Vec<&Task> = task
+        .upstream
+        .iter()
+        .filter_map(|id| plan.tasks.iter().find(|u| &u.id == id))
+        .collect();
     // A task queued ahead whose upstream did not end done is not run: it
-    // ends stopped, and the runner counts it skipped.
-    if let Some(up) = task.upstream.iter().find(|id| {
-        !plan
-            .tasks
+    // ends stopped, and the runner counts it skipped. A done.json written
+    // on another node may show here late, so it is waited for a while.
+    let not_done = || {
+        upstream
             .iter()
-            .find(|u| &u.id == *id)
-            .is_some_and(|u| u.done_in(&u.dir))
-    }) {
+            .find(|u| !u.done_in(&u.dir))
+            .map(|u| u.id.clone())
+            .or_else(|| (upstream.len() < task.upstream.len()).then(|| "(not in the plan)".into()))
+    };
+    let (waited, wait) = (Instant::now(), upstream_wait());
+    let mut missing = not_done();
+    while missing.is_some() && waited.elapsed() < wait {
+        std::thread::sleep(Duration::from_secs(2).min(wait));
+        missing = not_done();
+    }
+    if let Some(up) = missing {
         let mut exit = ended_unrun(task, Outcome::Stopped);
         exit.attempt = attempt;
         exit.stopped = true;
@@ -104,7 +127,8 @@ pub fn main(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> Result
         writeln!(err, "task {}: upstream {up} is not done; not run", task.id)?;
         return Ok(());
     }
-    let ran = run(task, attempt, Duration::from_secs(plan.grace_secs));
+    let dirs: Vec<&Path> = upstream.iter().map(|u| u.dir.as_path()).collect();
+    let ran = run(task, attempt, &dirs, Duration::from_secs(plan.grace_secs));
     if ran.is_err() {
         failed_itself(task);
     }
@@ -190,9 +214,14 @@ fn listed(list: &Path, index: Option<String>) -> Result<String> {
 
 /// Task `t` run once under the wrapper, as attempt `attempt`, with
 /// `grace` between TERM and KILL: `None` when it is done, or the wrapper's exit code and why not.
-fn run(t: &Task, attempt: u32, grace: Duration) -> Result<Option<(i32, String)>> {
+fn run(
+    t: &Task,
+    attempt: u32,
+    upstream: &[&Path],
+    grace: Duration,
+) -> Result<Option<(i32, String)>> {
     let dir = &t.dir;
-    let argv = super::plan::expand_globs(&t.argv)?;
+    let argv = super::plan::expand_globs(&t.argv, upstream)?;
     let (first, rest) = argv.split_first().context("a task's argv is empty")?;
     let log_path = dir.join("log");
     let log = std::fs::File::create(&log_path)

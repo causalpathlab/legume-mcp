@@ -67,6 +67,12 @@ pub trait Executor {
     fn cancel_queued(&mut self, _tasks: &[usize]) -> Result<()> {
         Ok(())
     }
+    /// Cancels `tasks`, which cannot run (an upstream task did not end
+    /// done), started or not; each ends stopped once gone, its `exit.json`
+    /// not waited for. For an executor that [`Executor::queues_ahead`].
+    fn cancel_unrunnable(&mut self, tasks: &[usize]) -> Result<()> {
+        self.cancel(tasks)
+    }
     /// The machine now. An executor whose scheduler places memory itself
     /// leaves `mem_available_gb` empty.
     fn live(&mut self) -> Result<Live>;
@@ -131,6 +137,9 @@ pub fn round(pool: &mut Pool, ex: &mut dyn Executor, clock: &mut dyn FnMut() -> 
         }
     }
     let now = clock();
+    // Upstream first (a task is after those it reads in the plan), so a
+    // task stopped behind one that failed is known skipped.
+    r.ended.sort_by_key(|e| e.task);
     for e in &r.ended {
         if let Err(err) = pool.ended(now, e.task, e.outcome) {
             r.error.get_or_insert(err);
@@ -141,8 +150,15 @@ pub fn round(pool: &mut Pool, ex: &mut dyn Executor, clock: &mut dyn FnMut() -> 
     }
     // Kept until cancelled, so a round that fails here tries again.
     if !pool.cancels().is_empty() {
-        let doomed = pool.cancels().to_vec();
-        if let Err(e) = ex.cancel_queued(&doomed) {
+        let (behind, halted): (Vec<_>, Vec<_>) = pool
+            .cancels()
+            .iter()
+            .partition(|(_, cause)| cause.is_some());
+        let ids = |v: Vec<&(usize, Option<usize>)>| v.iter().map(|c| c.0).collect::<Vec<_>>();
+        if let Err(e) = ex
+            .cancel_unrunnable(&ids(behind))
+            .and_then(|()| ex.cancel_queued(&ids(halted)))
+        {
             r.error = Some(e);
             return r;
         }

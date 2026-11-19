@@ -546,34 +546,43 @@ fn method_names(stage: &Stage) -> Vec<&str> {
 }
 
 /// The last stage of each method (and the last stage) makes exactly one
-/// `*.score.tsv`.
+/// `*.score.tsv`; or none makes one, in a spec with no `compare` or
+/// `plot`: an unscored benchmark, such as one on real data with no truth
+/// to score against.
 fn scores_made(spec: &Spec) -> Result<()> {
     let last = spec.stages.len() - 1;
+    let mut ends = Vec::new();
     for (si, stage) in spec.stages.iter().enumerate() {
         for method in &stage.methods {
-            let ends = si == last
+            let end = si == last
                 || method.name.as_ref().is_some_and(|m| {
                     !spec.stages[si + 1..]
                         .iter()
                         .any(|s| s.methods.iter().any(|o| o.name.as_ref() == Some(m)))
                 });
-            if !ends {
-                continue;
+            if end {
+                ends.push((stage, method));
             }
-            let n = scores(method);
-            if n != 1 {
-                let what = method
-                    .name
-                    .as_ref()
-                    .map_or(format!("stage {}", stage.name), |m| format!("method {m}"));
-                return Err(bad(
-                    &format!("{}.makes", method.at),
-                    format!(
-                        "lists {n} *.score.tsv; {what} ends here, and the last stage of each \
-                         method makes exactly one"
-                    ),
-                ));
-            }
+        }
+    }
+    let unscored = ends.iter().all(|(_, m)| scores(m) == 0);
+    if unscored && spec.compare.is_empty() && spec.plot.is_none() {
+        return Ok(());
+    }
+    for (stage, method) in ends {
+        let n = scores(method);
+        if n != 1 {
+            let what = method
+                .name
+                .as_ref()
+                .map_or(format!("stage {}", stage.name), |m| format!("method {m}"));
+            return Err(bad(
+                &format!("{}.makes", method.at),
+                format!(
+                    "lists {n} *.score.tsv; {what} ends here, and the last stage of each \
+                     method makes exactly one (or, with no compare or plot, none does)"
+                ),
+            ));
         }
     }
     Ok(())
@@ -1117,11 +1126,34 @@ pub fn glob(folder: &Path, pattern: &str) -> Result<String> {
     Ok(glob_paths(folder, pattern)?.join(","))
 }
 
-/// `argv` with each `{glob:<path pattern>}` its plan holds expanded, as
-/// the task starts: a word that is a glob alone becomes a word per path
-/// it matches, natural-sorted; one inside a word, the paths joined by
-/// commas. Refused when a glob matches nothing.
-pub fn expand_globs(argv: &[String]) -> Result<Vec<String>> {
+/// `argv` of a task reading the task folders `upstream`, with each
+/// `{glob:<path pattern>}` its plan holds expanded, as the task starts: a
+/// word that is a glob alone becomes a word per path it matches,
+/// natural-sorted; one inside a word, the paths joined by commas. Only a
+/// pattern in the folder of the tasks it reads is a glob (other text of
+/// that shape is left as it is), and only paths in those tasks' own
+/// folders count (not those of a shard the plan no longer has). Refused
+/// when a glob matches nothing.
+pub fn expand_globs(argv: &[String], upstream: &[&Path]) -> Result<Vec<String>> {
+    let Some(tasks) = upstream.first().and_then(|d| d.parent()) else {
+        return Ok(argv.to_vec());
+    };
+    let paths = |pattern: &str| -> Result<Option<Vec<String>>> {
+        if !Path::new(pattern).starts_with(tasks) {
+            return Ok(None);
+        }
+        let found: Vec<String> = glob_paths(Path::new("/"), pattern)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| upstream.iter().any(|d| Path::new(p).starts_with(d)))
+            .collect();
+        if found.is_empty() {
+            return Err(refuse(format!(
+                "{{glob:{pattern}}} matches nothing in the folders of the tasks it reads"
+            )));
+        }
+        Ok(Some(found))
+    };
     let mut out = Vec::with_capacity(argv.len());
     for word in argv {
         if let Some(pattern) = word
@@ -1129,7 +1161,10 @@ pub fn expand_globs(argv: &[String]) -> Result<Vec<String>> {
             .and_then(|r| r.strip_suffix('}'))
             .filter(|p| !p.contains('}'))
         {
-            out.extend(glob_paths(Path::new("/"), pattern)?);
+            match paths(pattern)? {
+                Some(found) => out.extend(found),
+                None => out.push(word.clone()),
+            }
             continue;
         }
         let mut w = String::new();
@@ -1139,8 +1174,10 @@ pub fn expand_globs(argv: &[String]) -> Result<Vec<String>> {
                 break;
             };
             w.push_str(&rest[..at]);
-            let pattern = &rest[at + "{glob:".len()..at + close];
-            w.push_str(&glob_paths(Path::new("/"), pattern)?.join(","));
+            match paths(&rest[at + "{glob:".len()..at + close])? {
+                Some(found) => w.push_str(&found.join(",")),
+                None => w.push_str(&rest[at..=at + close]),
+            }
             rest = &rest[at + close + 1..];
         }
         w.push_str(rest);
@@ -1435,7 +1472,8 @@ mod tests {
     #[test]
     fn a_glob_alone_is_a_word_per_path_and_inside_a_word_a_list() {
         let d = tempfile::tempdir().unwrap();
-        for k in [0, 2, 10] {
+        // Shard 11 is an earlier plan's, no longer read.
+        for k in [0, 2, 10, 11] {
             let f = d.path().join(format!("t.shard{k}"));
             std::fs::create_dir_all(&f).unwrap();
             std::fs::write(f.join("x.tsv"), "").unwrap();
@@ -1450,17 +1488,23 @@ mod tests {
             format!("{{glob:{pattern}}}"),
             format!("--in={{glob:{pattern}}}"),
             "{print $1}".to_string(),
+            "{glob:/elsewhere/*}".to_string(),
         ];
+        let dirs: Vec<PathBuf> = [0, 2, 10]
+            .iter()
+            .map(|k| d.path().join(format!("t.shard{k}")))
+            .collect();
+        let upstream: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
         let mut want = vec!["T".to_string()];
         want.extend(paths.iter().cloned());
         want.push(format!("--in={}", paths.join(",")));
         want.push("{print $1}".to_string());
-        assert_eq!(expand_globs(&argv).unwrap(), want);
+        // Not in the tasks' folder: text, as written.
+        want.push("{glob:/elsewhere/*}".to_string());
+        assert_eq!(expand_globs(&argv, &upstream).unwrap(), want);
         let none = vec![format!("{{glob:{}/u*/x}}", d.path().display())];
-        assert!(expand_globs(&none)
-            .unwrap_err()
-            .to_string()
-            .contains("matches nothing"));
+        let e = expand_globs(&none, &upstream).unwrap_err();
+        assert!(e.to_string().contains("matches nothing"), "{e}");
     }
 
     // A method that an upstream methods stage lacks (M0 skips fit) may not
@@ -1792,7 +1836,7 @@ mod tests {
         assert_eq!(
             refused(&no_score),
             "stages[2].methods.M1.makes: lists 0 *.score.tsv; method M1 ends here, and the last \
-             stage of each method makes exactly one"
+             stage of each method makes exactly one (or, with no compare or plot, none does)"
         );
         let ends_early = METHODS.replace(
             r#""M1": {"run": ["TOOL2", "{sim}/sim.tsv", "{out}/fit"], "makes": ["fit.tsv"]}"#,
@@ -1802,7 +1846,7 @@ mod tests {
         assert_eq!(
             refused(&ends_early),
             "stages[1].methods.M3.makes: lists 0 *.score.tsv; method M3 ends here, and the last \
-             stage of each method makes exactly one"
+             stage of each method makes exactly one (or, with no compare or plot, none does)"
         );
         let two_scores = METHODS.replace(
             r#""makes": ["m.score.tsv"]}}}]}"#,
@@ -1811,7 +1855,20 @@ mod tests {
         assert_eq!(
             refused(&two_scores),
             "stages[2].methods.M1.makes: lists 2 *.score.tsv; method M1 ends here, and the last \
-             stage of each method makes exactly one"
+             stage of each method makes exactly one (or, with no compare or plot, none does)"
+        );
+    }
+
+    #[test]
+    fn a_spec_whose_methods_make_no_score_runs_unscored() {
+        let unscored = METHODS.replace("m.score.tsv", "m.tsv");
+        assert_eq!(expand(&spec(&unscored)).len(), 4);
+        let plotted =
+            unscored.replacen(r#""seeds""#, r#""compare": [["M1/t", "M0/t"]], "seeds""#, 1);
+        assert!(
+            refused(&plotted).contains("lists 0 *.score.tsv"),
+            "{}",
+            refused(&plotted)
         );
     }
 

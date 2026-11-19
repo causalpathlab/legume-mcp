@@ -265,3 +265,23 @@ printf 'score\tmetric\tvalue\tpart\nt\tauprc\t%s\tall\n' "$v" > "$o""#,
     let summary = std::fs::read_to_string(w.bench().join("summary.tsv")).unwrap();
     assert!(summary.contains("\t0.012\t"), "{summary}");
 }
+
+#[test]
+fn a_spec_with_no_score_runs_unscored() {
+    let w = World::new("0");
+    write_tool(&w.bin().join("TOOL3"), r#"printf %s "$1" > "$2""#);
+    write_tool(&w.bin().join("TOOL4"), r#"o=$1; shift; cat "$@" > "$o""#);
+    let spec = SHARDED.replace("m.score.tsv", "all.tsv");
+    std::fs::write(w.root().join("spec.json"), spec).unwrap();
+    let o = w.run();
+    let s = said(&o);
+    assert!(o.status.success(), "{s}");
+    assert!(s.contains("4 tasks: 4 done"), "{s}");
+    let combined: Vec<PathBuf> = std::fs::read_dir(w.bench().join("tasks"))
+        .unwrap()
+        .map(|e| e.unwrap().path().join("all.tsv"))
+        .filter(|p| p.exists())
+        .collect();
+    assert_eq!(combined.len(), 1);
+    assert_eq!(std::fs::read_to_string(&combined[0]).unwrap(), "012");
+}

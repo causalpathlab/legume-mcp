@@ -102,6 +102,7 @@ impl World {
             .current_dir(self.project())
             .env("PATH", std::env::join_paths(path).unwrap())
             .env("FAKE_SLURM", self.root().join("state"))
+            .env("LEGUME_BENCHMARK_UPSTREAM_WAIT_MS", "200")
             .env("LEGUME_REMOTES", self.remotes())
             .env("LEGUME_MCP_PROJECT", self.project())
             .env("LEGUME_MCP_WATCH", "off")
@@ -486,9 +487,11 @@ fn a_stop_ends_a_live_run_and_its_tasks() {
     assert_eq!(cancelled.split_whitespace().count(), 4, "{cancelled}");
     let (text, _) = s.call("benchmark_status", json!({ "name": "N1" }));
     assert!(text.contains(", exit 130\n"), "{text}");
-    // The scores, cancelled behind stopped sims, never ran: skipped.
-    assert!(text.contains("2 stopped"), "{text}");
-    assert!(text.contains("0 done, 0 failed, 2 skipped"), "{text}");
+    // The scores queued behind the sims are stopped with them.
+    assert!(
+        text.contains("0 skipped, 0 running, 0 pending, 4 stopped"),
+        "{text}"
+    );
     let (text, error) = s.call("benchmark_stop", json!({ "name": "N1" }));
     assert!(
         error && text.contains("no live runner (its runner ended, exit 130)"),

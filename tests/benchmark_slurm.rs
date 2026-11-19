@@ -64,6 +64,7 @@ impl Cluster {
         );
         sh.with_env("PATH", path)
             .with_env("FAKE_SLURM", self.state())
+            .with_env("LEGUME_BENCHMARK_UPSTREAM_WAIT_MS", "200")
     }
 
     fn shell(&self) -> Shell {
