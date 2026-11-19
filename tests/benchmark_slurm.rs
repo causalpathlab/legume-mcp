@@ -396,3 +396,101 @@ fn resume_finds_done_tasks_by_key_and_adopts_queued_ones() {
     std::fs::write(dir(3).join("exit.json"), exit.to_string()).unwrap();
     assert_eq!(ends(&mut s, 1), vec![(ids[2], Outcome::Done)]);
 }
+
+impl Cluster {
+    /// Task `i` of stage `stage` and `method`, reading the tasks `upstream`,
+    /// at most `cap` of its method at once.
+    fn downstream(&mut self, i: usize, stage: &str, method: &str, upstream: &[&str], cap: u32) {
+        let t = &mut self.plan[i];
+        t["stage"] = json!(stage);
+        t["method"] = json!(method);
+        t["upstream"] = json!(upstream);
+        t["max_running"] = json!(cap);
+    }
+}
+
+#[test]
+fn a_stage_goes_in_behind_its_upstream_array_and_its_cap_throttles_it() {
+    let mut c = Cluster::new();
+    let u = c.task("U", "sleep 0.3", 1, 1.0, 30);
+    let d1 = c.task("D1", "true", 1, 1.0, 30);
+    let d2 = c.task("D2", "true", 1, 1.0, 30);
+    c.downstream(d1, "t", "M", &["U"], 1);
+    c.downstream(d2, "t", "M", &["U"], 1);
+    let mut s = c.slurm(100);
+    // Downstream first, as the pool gives them: the upstream still goes
+    // in first.
+    s.launch(&launch(&[d2, d1, u])).unwrap();
+    // Each ran after U was done: the wrapper refuses one whose upstream
+    // is not (it would end stopped).
+    assert_eq!(
+        ends(&mut s, 3),
+        vec![(u, Outcome::Done), (d1, Outcome::Done), (d2, Outcome::Done)]
+    );
+    let sbatch = c.log("sbatch.log");
+    let calls: Vec<&str> = sbatch.lines().collect();
+    assert_eq!(calls.len(), 2, "{sbatch}");
+    assert!(calls[0].contains("--array=0-0 "), "{}", calls[0]);
+    assert!(!calls[0].contains("--dependency"), "{}", calls[0]);
+    assert!(
+        calls[1].contains("--array=0-1%1 --dependency=afterany:101 "),
+        "{}",
+        calls[1]
+    );
+}
+
+#[test]
+fn a_task_whose_upstream_is_not_done_is_not_run() {
+    let mut c = Cluster::new();
+    c.task("U", "true", 1, 1.0, 30);
+    let d = c.task("D", "touch ran", 1, 1.0, 30);
+    c.downstream(d, "t", "M", &["U"], 4);
+    let mut s = c.slurm(100);
+    s.launch(&launch(&[d])).unwrap();
+    assert_eq!(ends(&mut s, 1), vec![(d, Outcome::Stopped)]);
+    assert!(!c.root().join("tasks/D/ran").exists());
+    assert!(!c.root().join("tasks/D/done.json").exists());
+}
+
+#[test]
+fn a_queued_task_is_cancelled_and_one_running_is_left() {
+    let mut c = Cluster::new();
+    let u = c.task("U", "sleep 2", 1, 1.0, 30);
+    let d = c.task("D", "true", 1, 1.0, 30);
+    c.downstream(d, "t", "M", &["U"], 4);
+    let mut s = c.slurm(100);
+    s.launch(&launch(&[u, d])).unwrap();
+    // Once U runs, and a poll has seen it start.
+    let start = Instant::now();
+    while !c.state().join("q/101_0/pid").exists() {
+        assert!(start.elapsed() < Duration::from_secs(10), "U never ran");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(s.poll().unwrap().is_empty());
+    s.cancel_queued(&[u, d]).unwrap();
+    // D ends at once, stopped; U runs on to its end.
+    assert_eq!(ends(&mut s, 1), vec![(d, Outcome::Stopped)]);
+    assert_eq!(c.log("scancel.log").trim(), "102_0");
+    assert_eq!(ends(&mut s, 1), vec![(u, Outcome::Done)]);
+}
+
+#[test]
+fn an_array_job_holds_at_most_the_clusters_max_array_size() {
+    let mut c = Cluster::new();
+    let scontrol = c.root().join("bin/scontrol");
+    std::fs::write(&scontrol, "#!/bin/sh\necho 'MaxArraySize            = 2'\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&scontrol, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ids: Vec<usize> = (1..=3)
+        .map(|n| c.task(&format!("T{n}"), "true", 1, 1.0, 30))
+        .collect();
+    let mut s = c.slurm(100);
+    s.launch(&launch(&ids)).unwrap();
+    ends(&mut s, 3);
+    let sbatch = c.log("sbatch.log");
+    let arrays: Vec<&str> = sbatch
+        .split_whitespace()
+        .filter(|a| a.starts_with("--array="))
+        .collect();
+    assert_eq!(arrays, ["--array=0-1", "--array=0-0"]);
+}

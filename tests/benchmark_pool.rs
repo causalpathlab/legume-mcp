@@ -838,3 +838,82 @@ fn resume_reuses_and_adopts_in_one_change() {
     assert_eq!(tasks(&p.next(1, &calm())), vec![2]);
     assert!(p.resume(2, &[0], &[]).is_err());
 }
+
+/// sim (0) -> fit M1 (1, capped at 1) and fit M2 (2) -> score M1 (3) and
+/// score M2 (4), for one rep.
+fn chain() -> Vec<Want> {
+    let mut sim = want(0, None, 0, 1, 1.0);
+    sim.id = "sim".into();
+    let mut fit1 = want(1, Some("M1"), 0, 1, 1.0);
+    fit1.upstream = vec![0];
+    fit1.max_running = Some(1);
+    let mut fit2 = want(1, Some("M2"), 0, 1, 1.0);
+    fit2.upstream = vec![0];
+    let mut score1 = want(2, Some("M1"), 0, 1, 1.0);
+    score1.upstream = vec![1];
+    let mut score2 = want(2, Some("M2"), 0, 1, 1.0);
+    score2.upstream = vec![2];
+    vec![sim, fit1, fit2, score1, score2]
+}
+
+#[test]
+fn ahead_every_task_goes_in_at_once_and_caps_are_the_schedulers() {
+    let mut w = chain();
+    let mut extra = want(1, Some("M1"), 1, 1, 1.0);
+    extra.upstream = vec![0];
+    extra.max_running = Some(1);
+    w.push(extra);
+    let mut p = Pool::new(w, budget(100, 100.0)).unwrap();
+    p.queue_ahead();
+    let mut got = tasks(&p.next(0, &calm()));
+    got.sort_unstable();
+    // Both of M1's fits too: its cap is the array's throttle.
+    assert_eq!(got, [0, 1, 2, 3, 4, 5]);
+    // Without it, nothing behind the sim goes in.
+    let mut p = Pool::new(chain(), budget(100, 100.0)).unwrap();
+    assert_eq!(tasks(&p.next(0, &calm())), [0]);
+}
+
+#[test]
+fn ahead_what_waits_on_a_failed_task_is_cancelled_and_skipped() {
+    let mut p = Pool::new(chain(), budget(100, 100.0)).unwrap();
+    p.queue_ahead();
+    assert_eq!(p.next(0, &calm()).len(), 5);
+    p.ended(1, 0, Outcome::Done).unwrap();
+    p.ended(2, 1, Outcome::Failed).unwrap();
+    // fit M1 failed: score M1, queued behind it, is to be cancelled.
+    assert_eq!(p.cancels(), [3]);
+    p.cancelled();
+    assert!(p.cancels().is_empty());
+    // Cancelled before it ran: skipped for fit M1, not stopped.
+    p.ended(3, 3, Outcome::Stopped).unwrap();
+    assert_eq!(*p.state(3), State::Skipped { upstream: Some(1) });
+    // A task refused by its wrapper, its upstream not done, before the
+    // pool hears of the upstream's end, is skipped too.
+    p.ended(4, 4, Outcome::Stopped).unwrap();
+    assert_eq!(*p.state(4), State::Skipped { upstream: Some(2) });
+    p.ended(5, 2, Outcome::Done).unwrap();
+    assert!(p.finished());
+}
+
+#[test]
+fn ahead_a_halted_methods_queued_tasks_are_cancelled() {
+    // Three fits of M1, one each rep, all failing: M1 halts.
+    let mut w = vec![want(0, None, 0, 1, 1.0)];
+    for rep in 0..4 {
+        let mut f = want(1, Some("M1"), rep, 1, 1.0);
+        f.upstream = vec![0];
+        w.push(f);
+    }
+    let mut p = Pool::new(w, budget(100, 100.0)).unwrap();
+    p.queue_ahead();
+    assert_eq!(p.next(0, &calm()).len(), 5);
+    p.ended(1, 0, Outcome::Done).unwrap();
+    for i in 1..=3 {
+        p.ended(2, i, Outcome::Failed).unwrap();
+    }
+    assert_eq!(p.halted_methods().len(), 1);
+    assert_eq!(p.cancels(), [4]);
+    p.ended(3, 4, Outcome::Stopped).unwrap();
+    assert_eq!(*p.state(4), State::Skipped { upstream: None });
+}

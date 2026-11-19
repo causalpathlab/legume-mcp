@@ -192,7 +192,8 @@ fn listed(list: &Path, index: Option<String>) -> Result<String> {
 /// `grace` between TERM and KILL: `None` when it is done, or the wrapper's exit code and why not.
 fn run(t: &Task, attempt: u32, grace: Duration) -> Result<Option<(i32, String)>> {
     let dir = &t.dir;
-    let (first, rest) = t.argv.split_first().context("a task's argv is empty")?;
+    let argv = super::plan::expand_globs(&t.argv)?;
+    let (first, rest) = argv.split_first().context("a task's argv is empty")?;
     let log_path = dir.join("log");
     let log = std::fs::File::create(&log_path)
         .with_context(|| format!("making {}", log_path.display()))?;

@@ -962,6 +962,14 @@ person's `remotes.toml`; it is theirs, so an agent never makes one up: when
     4h when not given), `max_running` (at most this many at once), `tool`
     (the binary to find when `run[0]` is not it) and `snapshot` (true: the
     tool is copied by its content into the benchmark's folder).
+  - `shards` (a stage's, 1 when not given): each of its tasks runs as N
+    independent shards, each a task of its own (`<id>.shard<k>`) with
+    `{shard}` (0 to N-1) and `{shards}` (N), which `makes` may use too
+    (`"x.shard-{shard}-of-{shards}.tsv"`). A stage of as many shards
+    reads it shard by shard.
+  - `"combine": "shards"`: a combine stage, one task per point, replicate
+    and method, run once every shard of the sharded stage it reads is
+    done; there `{glob:STAGE/PATTERN}` spans every shard's folder.
 - `compare`: pairs `["M1/estimate", "M2/estimate"]` (method/score) that
   gather compares replicate by replicate, into `paired.tsv`.
 - `plot`: `{"x": AXIS, "facet": AXIS, "metrics": ["auprc"]}` for
@@ -1002,6 +1010,22 @@ methods, 27 tasks.
 }
 ```
 
+**Shards and a combine stage**: each fit in 16 shards, then one task
+that reads all 16 files.
+
+```json
+{"name": "lra", "shards": 16, "mem_gb": 8,
+ "run": ["TOOL2", "{sim}/sim.tsv", "--shard", "{shard}/{shards}", "-o", "{out}/x"],
+ "makes": ["x.shard-{shard}-of-{shards}.tsv"]},
+{"name": "lra_all", "combine": "shards",
+ "run": ["TOOL2", "merge", "{glob:lra/x.shard-*.tsv}", "-o", "{out}/m.score.tsv"],
+ "makes": ["m.score.tsv"]}
+```
+
+A glob that is a whole argv word gives one word per file, in natural
+order (shard 2 before shard 10); one inside a word (`--in={glob:...}`)
+gives the files joined by commas.
+
 **The flow.** `benchmark_plan {"spec": {...}, "on": "REMOTE1"}` keeps the
 spec in `specs-in/<name>.json`, checks it and says the tasks and what each
 books; without `on` it plans here, finding the tools on PATH. Show the
@@ -1009,7 +1033,11 @@ person the counts and what each task books, and ask before starting.
 `benchmark_start {"spec": "specs-in/<name>.json", "on": "REMOTE1"}` returns
 at once; the run goes on in the background, after the server ends too
 (`runner.json` and `run.log` in the benchmark's folder): it plans on a
-compute node, then runs the tasks as Slurm array tasks. Without `on`, it
+compute node, then submits every stage at once as Slurm array jobs (one
+per stage, method and task shape), each held until the array jobs of the
+stage it reads have ended; a method's `max_running` is its array job's
+throttle, and a task whose upstream did not end done is cancelled while it
+waits, counted skipped. Without `on`, it
 runs on this machine (Linux): planned here, as many tasks at once as the
 cores, memory and GPUs the spec books allow; a small pilot is quickest
 this way when the tools are installed here. `benchmark_status

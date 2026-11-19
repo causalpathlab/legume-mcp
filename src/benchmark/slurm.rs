@@ -2,8 +2,16 @@
 //! cluster, each under the wrapper (`legume benchmark task`), driven
 //! through a [`Shell`] from wherever the runner is.
 //!
-//! - **Launch.** Tasks of one shape (threads, memory, timeout) go in as
-//!   one array job, at most `max_array` tasks each. A list of their ids
+//! - **Ahead.** The pool launches a task once its upstream is launched
+//!   ([`Executor::queues_ahead`]), so a whole plan goes in at once. Tasks
+//!   of one stage, method and shape (threads, memory, timeout) go in as
+//!   one array job, of at most the cluster's MaxArraySize tasks (else
+//!   `max_array`), its method's `max_running` the array's `%K` throttle,
+//!   held by `--dependency=afterany` until the array jobs of the tasks it
+//!   reads have ended. A task queued behind one that did not end done is
+//!   cancelled while pending ([`Executor::cancel_queued`]) and ends at
+//!   once; the wrapper refuses one whose upstream is not done.
+//! - **Launch.** A list of their ids
 //!   is written beside the benchmark, named by the run and its content
 //!   (`slurm/<run>-<key>.tasks`, so a list an earlier array job still
 //!   reads is never rewritten with other lines), and array task `i` runs
