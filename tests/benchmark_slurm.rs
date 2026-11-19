@@ -181,6 +181,45 @@ fn tasks_of_one_shape_go_in_as_one_array_job() {
 }
 
 #[test]
+fn a_launch_again_keeps_the_earlier_attempt_and_its_log() {
+    let mut c = Cluster::new();
+    let a = c.task("T1", "printf x > out", 1, 1.0, 30);
+    let b = c.task("T2", "true", 1, 1.0, 30);
+    // T2 was placed once and never ran: no attempt to keep.
+    std::fs::create_dir_all(c.root().join("tasks/T2")).unwrap();
+    std::fs::write(c.root().join("tasks/T2/slurm.json"), "{}").unwrap();
+    let mut s = c.slurm(100);
+    s.launch(&launch(&[a, b])).unwrap();
+    assert_eq!(
+        ends(&mut s, 2),
+        vec![(a, Outcome::Done), (b, Outcome::Done)]
+    );
+    assert!(!c.root().join("tasks/.attempts/T2.1").exists());
+    s.launch(&launch(&[a])).unwrap();
+    assert_eq!(ends(&mut s, 1), vec![(a, Outcome::Done)]);
+    // The first attempt, whole, as its job left it.
+    let first = c.root().join("tasks/.attempts/T1.1");
+    for f in ["done.json", "exit.json", "slurm.json", "log", "out"] {
+        assert!(first.join(f).exists(), "{f}");
+    }
+    let placed = |d: &std::path::Path| -> Value {
+        serde_json::from_str(&std::fs::read_to_string(d.join("slurm.json")).unwrap()).unwrap()
+    };
+    assert_eq!(placed(&first)["array_job_id"], "101");
+    assert_eq!(placed(&c.root().join("tasks/T1"))["array_job_id"], "102");
+    // Each job's own Slurm log, by its id.
+    let logs: Vec<String> = std::fs::read_dir(c.root().join("slurm"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".log"))
+        .collect();
+    assert_eq!(logs.len(), 3, "{logs:?}");
+    for want in ["_101_0.log", "_101_1.log", "_102_0.log"] {
+        assert!(logs.iter().any(|l| l.ends_with(want)), "{want}: {logs:?}");
+    }
+}
+
+#[test]
 fn an_array_job_holds_at_most_max_array_tasks() {
     let mut c = Cluster::new();
     let ids: Vec<usize> = (1..=3)

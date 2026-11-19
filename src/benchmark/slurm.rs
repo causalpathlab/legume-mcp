@@ -7,8 +7,11 @@
 //!   is written beside the benchmark, named by the run and its content
 //!   (`slurm/<run>-<key>.tasks`, so a list an earlier array job still
 //!   reads is never rewritten with other lines), and array task `i` runs
-//!   the task on line `i`. Every array job is named for the run, so the
-//!   runner finds its own and no one else's. Once every array job is in,
+//!   the task on line `i`. An earlier attempt in a task's folder is moved
+//!   aside whole, to `.attempts/<id>.<n>` beside it, never written over
+//!   (they are kept, outputs and all, until removed by hand); each array
+//!   task's Slurm log is named by its job id and index. Every array job
+//!   is named for the run, so the runner finds its own and no one else's. Once every array job is in,
 //!   each task's folder gets `slurm.json`: its array job and index. One
 //!   shell call submits a whole launch.
 //! - **Poll.** One shell call per round: `squeue` for the run's array
@@ -27,6 +30,7 @@ use super::executor::{Ended, Executor, Resumed, TaskExit};
 use super::plan::Task;
 use super::pool::{Launch, Live, Outcome};
 use super::remote::Shell;
+use super::wrapper::{ATTEMPTS, PLACED};
 use crate::project::quote;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -124,8 +128,8 @@ impl Slurm {
         });
         let (min, max) = depths.fold((usize::MAX, 0), |(a, b), d| (a.min(d), b.max(d)));
         let script = format!(
-            "{}find {} -mindepth {} -maxdepth {} \\( -name done.json -o -name slurm.json \
-             -o -name exit.json \\) -type f -print0 2>/dev/null | xargs -0 -r awk 'FNR == 1 \
+            "{}find {} -mindepth {} -maxdepth {} -path '*/{ATTEMPTS}/*' -prune -o \
+             \\( -name done.json -o -name slurm.json -o -name exit.json \\) -type f -print0 2>/dev/null | xargs -0 -r awk 'FNR == 1 \
              {{ if (NR > 1) print \"\"; printf \"f\\t%s\\t\", FILENAME }} {{ printf \"%s\", $0 }} \
              END {{ if (NR > 0) print \"\" }}'\nexit 0\n",
             squeue_line(&self.site.run),
@@ -223,7 +227,7 @@ impl Slurm {
             n - 1,
             t.threads,
             mem_flag(t.mem_gb),
-            quote(&format!("{}/{name}_%a.log", s.slurm_dir)),
+            quote(&format!("{}/{name}_%A_%a.log", s.slurm_dir)),
             quote(&wrap)
         );
         args.push_str(&place_flags(s.partition.as_deref(), s.account.as_deref()));
@@ -386,6 +390,28 @@ fn shape(t: &Task) -> (u32, u64, u64) {
     (t.threads, t.mem_gb.to_bits(), t.timeout_secs)
 }
 
+/// The launch script's start: `set -e`, and `aside`, which reads `<task
+/// folder>\t<key>` lines and moves each folder that holds an earlier
+/// attempt (anything there but its placement, which the launch writes
+/// over) aside whole, as the wrapper's `set_aside` does: shell builtins
+/// for each task, programs only for each one moved.
+fn aside_fn() -> String {
+    format!(
+        "set -e\nshopt -s nullglob dotglob extglob\n\
+         aside() {{\n  \
+         while IFS=$'\\t' read -r d k; do\n    \
+         f=(\"$d\"/!({PLACED}))\n    \
+         if [ ${{#f[@]}} -gt 0 ]; then\n      \
+         a=\"${{d%/*}}/{ATTEMPTS}\"; b=\"${{d##*/}}\"; n=1\n      \
+         while [ -e \"$a/$b.$n\" ]; do n=$((n + 1)); done\n      \
+         [ -d \"$a\" ] || mkdir -p \"$a\"\n      \
+         mv \"$d\" \"$a/$b.$n\"\n    \
+         fi\n  \
+         done\n\
+         }}\n"
+    )
+}
+
 /// What a launch says of each array job it submitted: `@@group <g> <id>`.
 const GROUP: &str = "@@group ";
 
@@ -414,7 +440,7 @@ impl Executor for Slurm {
             }
         }
         let s = &self.site;
-        let mut script = format!("set -e\nmkdir -p {}\n", quote(&s.slurm_dir));
+        let mut script = format!("{}mkdir -p {}\n", aside_fn(), quote(&s.slurm_dir));
         let mut placed = String::new();
         for (g, members) in groups.iter().enumerate() {
             let group: Vec<&Task> = members.iter().map(|&i| &self.tasks[i]).collect();
@@ -428,15 +454,12 @@ impl Executor for Slurm {
             let key = super::key::key(format!("{ids}{entries}").as_bytes());
             let name = format!("{}-{}", s.run, &key[..12]);
             let list = format!("{}/{name}.tasks", s.slurm_dir);
-            // The folders made and a last attempt's ends cleared: a few
-            // programs for the group, not some for each task.
+            // Earlier attempts moved aside, then the folders made.
             let _ = writeln!(
                 script,
                 "e_{g}={}\n\
+                 aside <<< \"$e_{g}\"\n\
                  printf '%s\\n' \"$e_{g}\" | cut -f1 | xargs -d '\\n' mkdir -p\n\
-                 printf '%s\\n' \"$e_{g}\" | cut -f1 | \
-                 sed 's|$|/exit.json|;p;s|exit.json$|done.json|;p;s|done.json$|slurm.json|' | \
-                 xargs -d '\\n' rm -f\n\
                  printf '%s' {} > {}\n\
                  jid_{g}=$({})\njid_{g}=${{jid_{g}%%;*}}\necho \"{GROUP}{g} $jid_{g}\"",
                 quote(&entries),
@@ -450,7 +473,7 @@ impl Executor for Slurm {
                 placed,
                 "i=0\nwhile IFS=$'\\t' read -r d k; do\n  \
                  printf '{{\"array_job_id\": \"%s\", \"index\": %d, \"key\": \"%s\"}}\\n' \
-                 \"$jid_{g}\" \"$i\" \"$k\" > \"$d/slurm.json\"\n  i=$((i + 1))\ndone <<< \"$e_{g}\""
+                 \"$jid_{g}\" \"$i\" \"$k\" > \"$d/{PLACED}\"\n  i=$((i + 1))\ndone <<< \"$e_{g}\""
             );
         }
         script.push_str(&placed);

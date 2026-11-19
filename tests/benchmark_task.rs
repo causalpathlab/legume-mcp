@@ -288,7 +288,7 @@ fn orphan_that_closes_fds_is_killed() {
 }
 
 #[test]
-fn a_rerun_clears_the_last_result() {
+fn a_rerun_moves_the_last_attempt_aside_whole() {
     let mut b = Bench::new();
     let flag = b.root().join("fail");
     let dir = b.task(
@@ -303,9 +303,32 @@ fn a_rerun_clears_the_last_result() {
     std::fs::write(&flag, "").unwrap();
     assert_eq!(task(&plan, "C1").status.code(), Some(4));
     assert!(!dir.join("done.json").exists(), "a stale done.json kept");
+    assert!(!dir.join("out").exists(), "an earlier output kept in place");
     assert_eq!(read(&dir.join("exit.json"))["exit"], 4);
-    // The earlier log is kept beside the new one.
-    assert!(dir.join("log.1").exists());
+    // The finished attempt is kept as it was, beside the task folders.
+    let first = b.root().join("tasks/.attempts/C1.1");
+    for f in ["done.json", "exit.json", "log", "out"] {
+        assert!(first.join(f).exists(), "{f}");
+    }
+    assert_eq!(read(&first.join("exit.json"))["exit"], 0);
+}
+
+#[test]
+fn a_new_attempt_keeps_its_placement() {
+    let mut b = Bench::new();
+    let dir = b.task("C1", "true", &[], 30);
+    let plan = b.plan(5);
+    std::fs::create_dir_all(&dir).unwrap();
+    // As a launch leaves it: only slurm.json, not moved.
+    std::fs::write(dir.join("slurm.json"), "{}").unwrap();
+    assert!(task(&plan, "C1").status.success());
+    assert_eq!(read(&dir.join("exit.json"))["attempt"], 1);
+    assert!(!b.root().join("tasks/.attempts").exists());
+    // A requeue: the ended attempt moved, its placement copied back.
+    assert!(task(&plan, "C1").status.success());
+    assert_eq!(read(&dir.join("exit.json"))["attempt"], 2);
+    assert!(dir.join("slurm.json").exists());
+    assert!(b.root().join("tasks/.attempts/C1.1/slurm.json").exists());
 }
 
 #[test]
@@ -340,7 +363,7 @@ fn unknown_tasks_and_indices_are_refused() {
 }
 
 #[test]
-fn each_attempt_is_numbered_and_its_log_kept() {
+fn each_attempt_is_numbered_and_kept() {
     let mut b = Bench::new();
     let dir = b.task("C1", "echo run", &[], 30);
     let plan = b.plan(5);
@@ -348,12 +371,14 @@ fn each_attempt_is_numbered_and_its_log_kept() {
         task(&plan, "C1");
     }
     assert_eq!(read(&dir.join("exit.json"))["attempt"], 3);
-    for n in ["log.1", "log.2", "log"] {
-        assert_eq!(
-            std::fs::read_to_string(dir.join(n)).unwrap(),
-            "run\n",
-            "{n}"
-        );
+    let attempts = b.root().join("tasks/.attempts");
+    for (n, d) in [
+        (1, attempts.join("C1.1")),
+        (2, attempts.join("C1.2")),
+        (3, dir),
+    ] {
+        assert_eq!(read(&d.join("exit.json"))["attempt"], n);
+        assert_eq!(std::fs::read_to_string(d.join("log")).unwrap(), "run\n");
     }
 }
 
@@ -507,17 +532,20 @@ fn the_index_counts_every_line_of_the_list() {
 }
 
 #[test]
-fn a_wrapper_that_fails_itself_still_says_the_task_failed() {
+fn a_folder_whose_attempt_cannot_be_set_aside_is_not_written_to() {
     let mut b = Bench::new();
-    let dir = b.task("T1", "exit 0", &[], 30);
-    // The last done.json cannot be cleared: a folder is in its place.
-    std::fs::create_dir_all(dir.join("done.json/x")).unwrap();
+    let dir = b.task("T1", "printf new > log", &[], 30);
+    // The earlier attempt cannot be moved aside: a file is where it goes.
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("log"), "earlier\n").unwrap();
+    std::fs::write(b.root().join("tasks/.attempts"), "").unwrap();
     let plan = b.plan(1);
     let o = task(&plan, "T1");
     assert!(!o.status.success());
-    let exit = read(&dir.join("exit.json"));
+    assert!(said(&o).contains(".attempts"), "{}", said(&o));
     assert_eq!(
-        (exit["outcome"].as_str(), exit["key"].as_str()),
-        (Some("failed"), Some("key-T1"))
+        std::fs::read_to_string(dir.join("log")).unwrap(),
+        "earlier\n"
     );
+    assert!(!dir.join("exit.json").exists());
 }
