@@ -1010,11 +1010,13 @@ methods, 27 tasks.
 }
 ```
 
-**Shards and a combine stage**: each fit in 16 shards, then one task
-that reads all 16 files.
+**Shards and a combine stage**: each fit in 256 shards, then one task
+that reads all 256 files. Many small shards finish sooner than a few
+large ones; Slurm queues them all, and the account's own limits cap how
+many run at once (`max_running` adds a throttle only when asked for).
 
 ```json
-{"name": "lra", "shards": 16, "mem_gb": 8,
+{"name": "lra", "shards": 256, "threads": 2, "mem_gb": 10,
  "run": ["TOOL2", "{sim}/sim.tsv", "--shard", "{shard}/{shards}", "-o", "{out}/x"],
  "makes": ["x.shard-{shard}-of-{shards}.tsv"]},
 {"name": "lra_all", "combine": "shards",
