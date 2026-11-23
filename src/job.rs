@@ -101,6 +101,66 @@ fn end_file(dir: &Path) -> PathBuf {
     dir.join("end.json")
 }
 
+/// The file a session job's stages are in, replaced whole each time.
+const PROGRESS: &str = "progress.json";
+
+/// How long ago `path` was last written; None when it is not there.
+#[cfg(all(feature = "sessions", unix))]
+pub(crate) fn age(path: &Path) -> Option<Duration> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .elapsed()
+        .ok()
+}
+
+/// One counted stage of a session job (a progress bar of its TUI), as it
+/// last reported it with [`Reporter::progress`]: shown to the agent by
+/// `job_status` and `job_wait`, where the drawn bars never reach.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Stage {
+    /// What it counts (a phase's name, `"blocks"`); may be empty.
+    pub label: String,
+    pub pos: u64,
+    /// `None` for a stage with no known end.
+    pub len: Option<u64>,
+    pub elapsed_s: u64,
+    /// The estimated time left; `None` when there is no end to estimate.
+    pub eta_s: Option<u64>,
+}
+
+impl Stage {
+    /// `label pos/len (eta 6m52s)`, as a person reads it.
+    pub fn say(&self) -> String {
+        let count = match self.len {
+            Some(len) => format!("{}/{len}", self.pos),
+            None => self.pos.to_string(),
+        };
+        let eta = self
+            .eta_s
+            .map(|s| format!(" (eta {}m{:02}s)", s / 60, s % 60))
+            .unwrap_or_default();
+        format!("{} {count}{eta}", self.label).trim().to_string()
+    }
+}
+
+/// The stages job `dir` last reported; none when it has not reported any,
+/// or not lately: a job that stopped saying where it stands (it hangs, or
+/// its TUI does) would have an old count read as current.
+#[cfg(all(feature = "sessions", unix))]
+pub(crate) fn read_progress(dir: &Path) -> Vec<Stage> {
+    const STALE: Duration = Duration::from_secs(30);
+    let path = dir.join(PROGRESS);
+    if !age(&path).is_some_and(|a| a < STALE) {
+        return Vec::new();
+    }
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
 pub(crate) fn read_spec(dir: &Path) -> Option<Spec> {
     serde_json::from_slice(&std::fs::read(spec_file(dir)).ok()?).ok()
 }
@@ -194,6 +254,8 @@ pub struct Reporter {
     log: Mutex<std::fs::File>,
     /// It has said how the job ended.
     finished: std::sync::atomic::AtomicBool,
+    /// Its last word on progress was "no stages": not said again.
+    idle: std::sync::atomic::AtomicBool,
 }
 
 impl Reporter {
@@ -207,10 +269,13 @@ impl Reporter {
             .open(log_file(&dir))
             .inspect_err(|e| log::warn!("session job log in {}: {e}", dir.display()))
             .ok()?;
+        // What an earlier process in this folder said is not this one's.
+        let _ = std::fs::remove_file(dir.join(PROGRESS));
         Some(Self {
             dir,
             log: Mutex::new(log),
             finished: Default::default(),
+            idle: Default::default(),
         })
     }
 
@@ -220,6 +285,25 @@ impl Reporter {
         let mut log = crate::lock(&self.log);
         // One write a line, so a reader never sees half of one.
         let _ = log.write_all(format!("{}\n", line.trim_end_matches('\n')).as_bytes());
+    }
+
+    /// Where the job's counted stages stand now, replacing what it said last:
+    /// `job_status` and `job_wait` show them while it runs. Nothing once the
+    /// job has said how it ended.
+    pub fn progress(&self, stages: &[Stage]) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let idle = stages.is_empty();
+        if self.finished.load(SeqCst) || (idle && self.idle.swap(true, SeqCst)) {
+            return;
+        }
+        self.idle.store(idle, SeqCst);
+        let said = serde_json::to_vec(stages).map_err(std::io::Error::from);
+        if let Err(e) = said.and_then(|b| replace(&self.dir, PROGRESS, &b)) {
+            log::warn!(
+                "session job in {}: writing {PROGRESS}: {e}",
+                self.dir.display()
+            );
+        }
     }
 
     /// The job is over, as `end` says: recorded as a step (only as one that
@@ -243,8 +327,64 @@ impl Reporter {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A stage as `senna run` reports a fit's, at `pos` of 1000.
+    pub(crate) fn stage(pos: u64) -> Stage {
+        Stage {
+            label: "Phase 1 (hier)".into(),
+            pos,
+            len: Some(1000),
+            elapsed_s: 20,
+            eta_s: Some(412),
+        }
+    }
+
+    #[cfg(all(feature = "sessions", unix))]
+    /// What the TUI reports is what the server reads back, replaced whole
+    /// each time; once the job has said how it ended, nothing more is
+    /// written.
+    #[test]
+    fn progress_is_read_back_as_last_reported_until_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let reporter = Reporter {
+            dir: dir.path().to_path_buf(),
+            log: Mutex::new(std::fs::File::create(log_file(dir.path())).unwrap()),
+            finished: Default::default(),
+            idle: Default::default(),
+        };
+        assert!(read_progress(dir.path()).is_empty());
+        reporter.progress(&[stage(10)]);
+        reporter.progress(&[stage(215)]);
+        assert_eq!(read_progress(dir.path()), vec![stage(215)]);
+        // "No stages" is written once, not again until something moves.
+        let file = dir.path().join(PROGRESS);
+        reporter.progress(&[]);
+        assert!(read_progress(dir.path()).is_empty());
+        std::fs::remove_file(&file).unwrap();
+        reporter.progress(&[]);
+        assert!(!file.exists());
+        reporter.progress(&[stage(300)]);
+        assert_eq!(read_progress(dir.path()), vec![stage(300)]);
+
+        reporter.finish(End::Done(String::new()));
+        reporter.progress(&[stage(900)]);
+        assert_eq!(read_progress(dir.path()), vec![stage(300)]);
+    }
+
+    #[test]
+    fn a_stage_says_its_count_and_time_left() {
+        assert_eq!(stage(215).say(), "Phase 1 (hier) 215/1000 (eta 6m52s)");
+        let spin = Stage {
+            label: String::new(),
+            pos: 7,
+            len: None,
+            elapsed_s: 1,
+            eta_s: None,
+        };
+        assert_eq!(spin.say(), "7");
+    }
 
     #[test]
     fn a_second_word_changes_nothing_and_does_not_wait() {
@@ -253,6 +393,7 @@ mod tests {
             dir: dir.path().to_path_buf(),
             log: Mutex::new(std::fs::File::create(log_file(dir.path())).unwrap()),
             finished: Default::default(),
+            idle: Default::default(),
         };
         reporter.finish(End::Failed("first".into()));
         // As if end.json could not be written: the second word must not
