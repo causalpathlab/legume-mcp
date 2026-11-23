@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 const TAIL: usize = 20;
 /// The longest `job_wait` blocks the server.
 pub(crate) const WAIT_MAX: u64 = 120;
+/// How often a `job_wait` says where a job stands while it waits.
+const SAY_EVERY: Duration = Duration::from_secs(5);
 /// What a job's output is cut to in a status.
 const OUT_CAP: usize = 4096;
 
@@ -57,9 +59,36 @@ pub(crate) struct Session {
 struct Progress {
     state: State,
     tail: VecDeque<String>,
+    /// Its counted stages as a session job last reported them.
+    stages: Vec<crate::job::Stage>,
     /// The child's stdout once it is done; the error once it failed.
     out: String,
     ms: Option<u64>,
+}
+
+impl Progress {
+    /// Its stages while it runs and has any.
+    fn running_stages(&self) -> Option<&[crate::job::Stage]> {
+        (self.state == State::Running && !self.stages.is_empty()).then_some(&self.stages[..])
+    }
+
+    /// What `job_wait` says while it waits: its stages, else its newest log
+    /// line; nothing once it ended.
+    fn said(&self) -> Option<String> {
+        if self.state != State::Running {
+            return None;
+        }
+        match self.running_stages() {
+            Some(stages) => Some(
+                stages
+                    .iter()
+                    .map(crate::job::Stage::say)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+            None => self.tail.back().cloned(),
+        }
+    }
 }
 
 /// One job.
@@ -91,6 +120,13 @@ impl Job {
                 (s.stop)();
             }
         }
+    }
+
+    /// Its counted stages, as it reported them last.
+    #[cfg(all(feature = "sessions", unix))]
+    pub(crate) fn set_stages(&self, stages: Vec<crate::job::Stage>) {
+        let mut p = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        p.stages = stages;
     }
 
     pub(crate) fn line(&self, line: &str) {
@@ -169,6 +205,9 @@ impl Job {
             "seconds": p.ms.unwrap_or_else(|| self.started.elapsed().as_millis() as u64) / 1000,
             "last_lines": p.tail.iter().rev().take(5).rev().collect::<Vec<_>>(),
         });
+        if let Some(stages) = p.running_stages() {
+            v["progress"] = json!(stages);
+        }
         if let Some(s) = &self.session {
             v["session"] = json!(s.id);
             v["attach"] = json!(s.attach);
@@ -221,6 +260,7 @@ impl Jobs {
             progress: Mutex::new(Progress {
                 state: State::Running,
                 tail: VecDeque::new(),
+                stages: Vec::new(),
                 out: String::new(),
                 ms: None,
             }),
@@ -285,20 +325,33 @@ impl Jobs {
 
     /// `job_wait`: until job `id` ends, or `seconds` (at most
     /// [`WAIT_MAX`]) pass; its status either way.
-    pub(crate) fn wait(&self, id: &str, seconds: u64) -> anyhow::Result<Value> {
+    /// While it waits, `say` hears where the job stands every [`SAY_EVERY`]
+    /// it is still running.
+    pub(crate) fn wait(
+        &self,
+        id: &str,
+        seconds: u64,
+        mut say: impl FnMut(&str),
+    ) -> anyhow::Result<Value> {
         let job = self.get(id).ok_or_else(|| Self::unknown(id))?;
         let deadline = Instant::now() + Duration::from_secs(seconds.min(WAIT_MAX));
         let mut p = job.progress.lock().unwrap_or_else(|e| e.into_inner());
-        while p.state == State::Running {
+        loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
+            if p.state != State::Running || left.is_zero() {
                 break;
             }
             p = job
                 .ended
-                .wait_timeout(p, left)
+                .wait_timeout(p, left.min(SAY_EVERY))
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
+            // Said only when it waits on: the status it returns says the rest.
+            if let Some(said) = p.said().filter(|_| Instant::now() < deadline) {
+                drop(p);
+                say(&said);
+                p = job.progress.lock().unwrap_or_else(|e| e.into_inner());
+            }
         }
         drop(p);
         Ok(job.status())
@@ -385,6 +438,31 @@ mod tests {
 
     fn held_by(jobs: &Jobs, out: &Path) -> Option<String> {
         jobs.holder(&[out.to_path_buf()]).map(|(id, _)| id)
+    }
+
+    #[cfg(all(feature = "sessions", unix))]
+    /// A running job's reported stages are in its status and in what
+    /// `job_wait` says while it waits, else its newest log line; once it
+    /// ends, neither.
+    #[test]
+    fn a_running_jobs_stages_are_in_its_status_and_said_while_waited_on() {
+        let jobs = Jobs::default();
+        let job = jobs.add("fit", "a fit", &[], None, None);
+        let progress = || jobs.status(Some("job-1")).unwrap().get("progress").cloned();
+        let said = || job.progress.lock().unwrap().said();
+        assert!(progress().is_none());
+        // No stages: its newest log line keeps a wait from going quiet.
+        job.line("loading");
+        assert_eq!(said().as_deref(), Some("loading"));
+        job.set_stages(vec![crate::job::tests::stage(215)]);
+        assert_eq!(progress().unwrap()[0]["pos"], 215);
+        assert_eq!(
+            said().as_deref(),
+            Some("Phase 1 (hier) 215/1000 (eta 6m52s)")
+        );
+        job.end(State::Done, String::new());
+        assert!(progress().is_none());
+        assert!(said().is_none());
     }
 
     #[test]

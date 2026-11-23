@@ -121,7 +121,7 @@ impl Server {
             if !ours {
                 continue;
             }
-            if let Some(seen) = age(&dir.join("seen")) {
+            if let Some(seen) = job::age(&dir.join("seen")) {
                 if sweep && seen > KEEP_SEEN {
                     let _ = std::fs::remove_dir_all(&dir);
                 }
@@ -357,16 +357,6 @@ fn epoch() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// How long ago `path` was last written; None when it is not there.
-fn age(path: &Path) -> Option<Duration> {
-    std::fs::metadata(path)
-        .ok()?
-        .modified()
-        .ok()?
-        .elapsed()
-        .ok()
-}
-
 /// The lock on job folder `dir` that its follower holds while it follows
 /// it, when no one holds it; the system lets it go with the process.
 fn try_lock(dir: &Path) -> std::io::Result<Option<File>> {
@@ -414,6 +404,9 @@ impl Following {
                 // Its last lines come before its end: looked for when it says
                 // something, and now and then.
                 let said = log.each(say);
+                if asked.elapsed() >= ASK_EVERY {
+                    job.set_stages(job::read_progress(dir));
+                }
                 if said || asked.elapsed() >= ASK_EVERY {
                     if let Some(end) = job::read_end(dir) {
                         log.each(say);

@@ -210,6 +210,18 @@ type Out = Arc<Mutex<Box<dyn Write + Send>>>;
 type Cancelled = Arc<Mutex<HashSet<String>>>;
 type Records = Option<Arc<Project>>;
 
+/// A `notifications/progress` for the call that sent `token`: its `n`th.
+fn notify_progress(out: &Out, token: &Value, n: u64, message: &str) {
+    send(
+        out,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": { "progressToken": token, "progress": n, "message": message },
+        }),
+    );
+}
+
 fn send(out: &Out, msg: &Value) {
     let mut w = out.lock().unwrap_or_else(|e| e.into_inner());
     // A closed stdout ends the session; the reader sees it too.
@@ -315,14 +327,7 @@ impl Call {
         }
         let Some(token) = &self.token else { return };
         let n = self.step.fetch_add(1, Ordering::Relaxed) + 1;
-        send(
-            &self.out,
-            &json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/progress",
-                "params": { "progressToken": token, "progress": n, "message": message },
-            }),
-        );
+        notify_progress(&self.out, token, n, message);
     }
 
     /// Run `cmd` to its end and return its stdout. Each stderr line is
@@ -1239,7 +1244,16 @@ where
                         ("job_status", id) => jobs.status(id),
                         ("job_wait", Some(id)) => {
                             let seconds = args["seconds"].as_u64().unwrap_or(30);
-                            jobs.wait(id, seconds)
+                            // Where the job stands, as `notifications/progress`
+                            // while it waits, when the client asked to hear.
+                            let token = params["_meta"].get("progressToken").cloned();
+                            let mut n = 0u64;
+                            jobs.wait(id, seconds, |said| {
+                                if let Some(token) = &token {
+                                    n += 1;
+                                    notify_progress(&out, token, n, said);
+                                }
+                            })
                         }
                         ("job_cancel", Some(id)) => jobs.cancel(id),
                         _ => Err(anyhow::anyhow!("`id` is required")),
