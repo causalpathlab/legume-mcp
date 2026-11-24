@@ -465,8 +465,10 @@ impl Call {
                         });
                     }
                 };
-                let result = run_child(cmd, &|| job.cancelled() || stopped(), &progress)
-                    .and_then(|out| made(&step.outputs).map(|()| out));
+                let stages = |stages: Vec<job::Stage>| job.set_stages(stages);
+                let result =
+                    run_child_staged(cmd, &|| job.cancelled() || stopped(), &progress, &stages)
+                        .and_then(|out| made(&step.outputs).map(|()| out));
                 if let Ok(out) = &result {
                     step.conclude(out);
                 }
@@ -600,18 +602,29 @@ fn send_chunks(mut from: impl Read, to: &Sender<Piped>) {
     }
 }
 
+/// [`run_child_staged`], the child's stages not kept.
+fn run_child(
+    cmd: Command,
+    cancelled: &dyn Fn() -> bool,
+    progress: &dyn Fn(&str),
+) -> Result<String> {
+    run_child_staged(cmd, cancelled, progress, &|_| {})
+}
+
 /// Run `cmd` to its end and return its stdout; each stderr line goes to
-/// `progress`; `cancelled` is asked as it runs; a failure quotes its error
+/// `progress`, a progress line ([`job::PREFIX`]) as its stage says it
+/// ([`job::Stage::say`]), and the stages running then to `stages`; `cancelled` is asked as it runs; a failure quotes its error
 /// ([`quote`]). The child leads its own process group, which is stopped
 /// the same way when the child exits as when `cancelled` says so: TERM to
 /// the group, up to [`GRACE`] for it to go, then KILL. Its pipes are then
 /// read until they close, or for at most [`LAST_READ`]. A Rust child
 /// prints no backtrace unless the tool asks for one: the agent reads the
 /// error.
-fn run_child(
+fn run_child_staged(
     mut cmd: Command,
     cancelled: &dyn Fn() -> bool,
     progress: &dyn Fn(&str),
+    stages: &dyn Fn(Vec<job::Stage>),
 ) -> Result<String> {
     // Left as the tool has it when it set the variable, or removed it
     // (get_envs lists a removal too).
@@ -643,8 +656,16 @@ fn run_child(
     });
     let (mut out, mut unread) = (Vec::new(), None);
     let mut tail = VecDeque::with_capacity(STDERR_KEPT);
+    let mut staged = job::Stages::default();
     let mut take = |piped| match piped {
         Piped::Line(line) => {
+            let line = match staged.read(&line) {
+                Some(stage) => {
+                    stages(staged.running());
+                    stage.say()
+                }
+                None => line,
+            };
             progress(&line);
             if tail.len() == STDERR_KEPT {
                 tail.pop_front();
@@ -1828,6 +1849,40 @@ mod tests {
             })
             .sum();
         assert_eq!(held, 100);
+    }
+
+    /// A child's progress lines become its stages, said as a person reads
+    /// them; a bar's last line takes it out; other lines pass as they are.
+    #[test]
+    #[cfg(unix)]
+    fn a_childs_progress_lines_become_its_stages() {
+        let said = Mutex::new(Vec::new());
+        let staged = Mutex::new(Vec::new());
+        let p = job::PREFIX;
+        let script = format!(
+            "echo '{p}{{\"id\":1,\"label\":\"blocks\",\"pos\":12,\"len\":40,\"elapsed_s\":31,\"eta_s\":72,\"done\":false}}' >&2; \
+             echo 'a plain line' >&2; \
+             echo '{p}{{\"id\":1,\"label\":\"blocks\",\"pos\":40,\"len\":40,\"elapsed_s\":90,\"eta_s\":0,\"done\":true}}' >&2"
+        );
+        run_child_staged(
+            sh(&script),
+            &|| false,
+            &|l| said.lock().unwrap().push(l.to_string()),
+            &|s| staged.lock().unwrap().push(s),
+        )
+        .unwrap();
+        assert_eq!(
+            *said.lock().unwrap(),
+            [
+                "blocks 12/40 (eta 1m12s)",
+                "a plain line",
+                "blocks 40/40 (eta 0m00s)"
+            ]
+        );
+        let staged = staged.lock().unwrap();
+        assert_eq!(staged.len(), 2);
+        assert_eq!((staged[0][0].pos, staged[0][0].len), (12, Some(40)));
+        assert!(staged[1].is_empty());
     }
 
     #[test]

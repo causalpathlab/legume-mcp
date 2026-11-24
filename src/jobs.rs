@@ -59,7 +59,8 @@ pub(crate) struct Session {
 struct Progress {
     state: State,
     tail: VecDeque<String>,
-    /// Its counted stages as a session job last reported them.
+    /// Its counted stages as it last reported them: a session job, or a
+    /// child in its progress lines.
     stages: Vec<crate::job::Stage>,
     /// The child's stdout once it is done; the error once it failed.
     out: String,
@@ -123,7 +124,6 @@ impl Job {
     }
 
     /// Its counted stages, as it reported them last.
-    #[cfg(all(feature = "sessions", unix))]
     pub(crate) fn set_stages(&self, stages: Vec<crate::job::Stage>) {
         let mut p = self.progress.lock().unwrap_or_else(|e| e.into_inner());
         p.stages = stages;

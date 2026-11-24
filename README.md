@@ -11,7 +11,10 @@ implements `Handler` (its tools and how each is called) and hands it to
 - A tool's failure is a result with `isError` and the error chain as text.
 - `Call::progress` sends progress notifications when the client asks for them;
   `Call::run` runs a child process, passes its stderr on as progress, and stops
-  it with what it started (its process group) when the client cancels.
+  it with what it started (its process group) when the client cancels. A
+  child's `legume-progress {json}` lines (legume-numeric's bars off a
+  terminal; see `job::PREFIX`) are said as `label pos/len (eta …)`, and a
+  background job's `job_status` gives them as `progress` stages.
 - stdout carries the protocol: tools must log to stderr and run anything that
   prints as a child.
 - Only serde_json, anyhow, base64 and log; no async runtime. Each feature is
