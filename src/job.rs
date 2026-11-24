@@ -115,9 +115,10 @@ pub(crate) fn age(path: &Path) -> Option<Duration> {
         .ok()
 }
 
-/// One counted stage of a session job (a progress bar of its TUI), as it
-/// last reported it with [`Reporter::progress`]: shown to the agent by
-/// `job_status` and `job_wait`, where the drawn bars never reach.
+/// One counted stage of a job (a progress bar), as it last reported it: a
+/// session job's TUI with [`Reporter::progress`], a child run off a
+/// terminal in a [`PREFIX`] line. Shown to the agent by `job_status` and
+/// `job_wait`, where the drawn bars never reach.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Stage {
     /// What it counts (a phase's name, `"blocks"`); may be empty.
@@ -142,6 +143,62 @@ impl Stage {
             .map(|s| format!(" (eta {}m{:02}s)", s / 60, s % 60))
             .unwrap_or_default();
         format!("{} {count}{eta}", self.label).trim().to_string()
+    }
+}
+
+/// What starts a child's progress line on its stderr, as legume-numeric's
+/// bars say themselves off a terminal; one JSON object follows:
+///
+/// ```text
+/// legume-progress {"id":3,"label":"blocks","pos":12,"len":40,"elapsed_s":31,"eta_s":72,"done":false}
+/// ```
+///
+/// `id` tells a child's bars apart, `len` and `eta_s` may be `null`, and
+/// `done` is true on a bar's last line. Any tool may print them.
+pub const PREFIX: &str = "legume-progress ";
+
+/// A child's progress line as [`PREFIX`] says it.
+#[derive(Deserialize)]
+struct Line {
+    id: u64,
+    #[serde(default)]
+    label: String,
+    pos: u64,
+    len: Option<u64>,
+    #[serde(default)]
+    elapsed_s: u64,
+    eta_s: Option<u64>,
+    #[serde(default)]
+    done: bool,
+}
+
+/// A child's stages, as its progress lines (see [`PREFIX`]) said them.
+#[derive(Default)]
+pub(crate) struct Stages(std::collections::BTreeMap<u64, Stage>);
+
+impl Stages {
+    /// `line` read, when it is a progress line: its stage as it now stands
+    /// (gone from the stages when the line was its last).
+    pub(crate) fn read(&mut self, line: &str) -> Option<Stage> {
+        let l: Line = serde_json::from_str(line.strip_prefix(PREFIX)?).ok()?;
+        let stage = Stage {
+            label: l.label,
+            pos: l.pos,
+            len: l.len,
+            elapsed_s: l.elapsed_s,
+            eta_s: l.eta_s,
+        };
+        if l.done {
+            self.0.remove(&l.id);
+        } else {
+            self.0.insert(l.id, stage.clone());
+        }
+        Some(stage)
+    }
+
+    /// The stages running, in the order they began.
+    pub(crate) fn running(&self) -> Vec<Stage> {
+        self.0.values().cloned().collect()
     }
 }
 
