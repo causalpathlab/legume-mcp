@@ -484,6 +484,15 @@ fn slides(
         });
     }
 
+    // Why steps ran as they did: the choices a tool recorded with them.
+    let choices = entries(&|k| k == crate::step::CHOICE);
+    if !choices.is_empty() {
+        deck.push(Slide {
+            title: "Why the steps ran as they did".into(),
+            blocks: choices.into_iter().flat_map(|e| quote(e, 900)).collect(),
+        });
+    }
+
     // The hypotheses.
     for h in &records.hypotheses {
         let l = &h.ledger;
@@ -1342,6 +1351,9 @@ mod tests {
             json!({ "kind": "figure", "output": format!("results/{day}/umap.png"), "number": "2B", "hypothesis": "H1", "words": "cluster 4 sits apart" }),
         );
         note(json!({ "kind": "summary", "words": "We asked why cluster 4 stands apart." }));
+        let why = crate::Why::new("the root is the Ngn3-high cells", crate::By::User);
+        let step = crate::Step::new(&[], "senna ode").why(why);
+        crate::step::chosen(&p, &step, &Ok(String::new()));
 
         let b = build(&root, Some(&day)).unwrap();
         assert!(b.summary && b.graph.is_some());
@@ -1360,6 +1372,8 @@ mod tests {
             "**Would nullify it:** not said yet",
             "runall.sh, line 4: senna view export",
             "H1: what result would make you drop it?",
+            "## Why the steps ran as they did",
+            "- Why: the root is the Ngn3-high cells\n- By: user",
         ] {
             assert!(text.contains(want), "{want} in {text}");
         }

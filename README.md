@@ -265,6 +265,7 @@ matter without opening it. `run_making` and `spawn_job` take them from a
 let step = Step::new(&outputs, "senna fit, 12 topics")
     .inputs(&[counts, batches])                    // else: read from the command
     .fact(Fact::count("cells", 9812).of(11204).rule("3 MADs"))
+    .why(Why::new("12 topics: the elbow of the fit's loss", By::Agent))
     .after(|stdout, outputs| vec![Fact::value("loss", 1.83).flag("did not converge")]);
 cx.run_step(cmd, step)?;                           // or cx.spawn_step(cmd, step)
 ```
@@ -275,6 +276,22 @@ cx.run_step(cmd, step)?;                           // or cx.spawn_step(cmd, step
 - `after` finds the numbers known once the step is done; it runs only when
   the step succeeded. A session job's TUI gives them as it ends:
   `Reporter::finish_with(end, facts)`.
+- `why` says why the step ran as it did, when a choice steers it (its root
+  cells, its number of topics): `Why::new(text, By::User)` (or `By::Agent`,
+  `By::AgentAccepted`: the agent proposed it, the person accepted), with the
+  evidence it rests on `.citing(&cites)`. The driver script gets it above the
+  step's line, each part on one line:
+
+  ```bash
+  # why (user): the root is the Ngn3-high cells, the least differentiated
+  #   cites: lupin round 2, annotate_why
+  if [ ! -e results/2026-11-25/ode.zarr.zip ]; then
+  ```
+
+  and the day's notebook a `choice` entry from the tool's server (the step's
+  summary, then `- Why:`, `- By:`, `- Cites:`, and `- Did not succeed:` when
+  it failed), which the report shows on its own slide. `INDEX.tsv` is
+  unchanged.
 - A fact is a count or a value, out of how many (`of`), by which `rule`, and
   a `flag` when it looks wrong. The `legume` server's `status` shows each
   output's facts and lists the flagged ones apart, for the agent to raise

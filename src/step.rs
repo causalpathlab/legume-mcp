@@ -2,8 +2,11 @@
 //! numbers it made. `results/INDEX.tsv` lists each output with the step's
 //! summary, its inputs (so each output can be traced back to the data it
 //! came from) and its facts (so an agent or a reader sees the numbers that
-//! matter, and the ones a tool flagged, without opening the outputs).
+//! matter, and the ones a tool flagged, without opening the outputs). A
+//! step run as it was by a choice carries [`Why`]: the driver script says it
+//! above the step's line and the notebook keeps it as a `choice` entry.
 
+use crate::project::{one_line, Project};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -110,6 +113,134 @@ pub(crate) fn read_facts(cell: &str) -> Vec<Fact> {
     serde_json::from_str(cell).unwrap_or_default()
 }
 
+/// Who made a choice that steers a step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum By {
+    /// The person chose it.
+    User,
+    /// The agent chose it on its own.
+    Agent,
+    /// The agent proposed it and the person accepted it.
+    AgentAccepted,
+}
+
+impl std::fmt::Display for By {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            By::User => "user",
+            By::Agent => "agent",
+            By::AgentAccepted => "agent, user accepted",
+        })
+    }
+}
+
+/// Why a step was run as it was (its root cells, its number of topics): the
+/// reason, who chose it, and the evidence it cites.
+///
+/// ```
+/// # use legume_mcp::{By, Why};
+/// let why = Why::new("the root is the Ngn3-high cells, the least differentiated", By::User)
+///     .citing(&["lupin round 2, annotate_why".into()]);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Why {
+    text: String,
+    by: By,
+    cites: Vec<String>,
+}
+
+impl Why {
+    /// The reason, in one line or a few, and who chose it.
+    pub fn new(text: &str, by: By) -> Self {
+        Self {
+            text: text.into(),
+            by,
+            cites: Vec::new(),
+        }
+    }
+
+    /// The evidence it rests on: a tool's result, a figure, a paper.
+    pub fn citing(mut self, cites: &[String]) -> Self {
+        self.cites.extend_from_slice(cites);
+        self
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn by(&self) -> By {
+        self.by
+    }
+
+    pub fn cites(&self) -> &[String] {
+        &self.cites
+    }
+
+    /// The cites in one line, project paths relative.
+    fn cited(&self, p: &Project) -> String {
+        let cites: Vec<String> = self.cites.iter().map(|c| plain(p, c)).collect();
+        cites.join("; ")
+    }
+
+    /// The comment the driver script gets above the step's line: each part
+    /// on one line, so nothing in it ends the comment.
+    fn comment(&self, p: &Project) -> String {
+        let mut out = format!("# why ({}): {}\n", self.by, plain(p, &self.text));
+        if !self.cites.is_empty() {
+            out.push_str(&format!("#   cites: {}\n", self.cited(p)));
+        }
+        out
+    }
+
+    /// The notebook's `choice` entry for the step of `summary`, which did
+    /// not succeed when `failed` says why. Plain lines: the agent records
+    /// it, so nothing in it reads as the person's quoted words.
+    fn entry(&self, p: &Project, summary: &str, failed: Option<&str>) -> String {
+        let mut text = format!(
+            "{}\n\n- Why: {}\n- By: {}",
+            plain(p, summary),
+            plain(p, &self.text),
+            self.by
+        );
+        if !self.cites.is_empty() {
+            text.push_str(&format!("\n- Cites: {}", self.cited(p)));
+        }
+        if let Some(failed) = failed {
+            text.push_str(&format!("\n- Did not succeed: {}", plain(p, failed)));
+        }
+        text
+    }
+}
+
+/// `s` on one line, without control characters, project paths relative.
+fn plain(p: &Project, s: &str) -> String {
+    one_line(&p.rel(s))
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
+/// The notebook kind of a step's [`Why`].
+pub(crate) const CHOICE: &str = "choice";
+
+/// The `choice` entry of `step`, which ended in `result`, written to the
+/// notebook, and the comment the driver script gets above its line; none
+/// when it has no [`Why`].
+pub(crate) fn chosen(p: &Project, step: &Step, result: &anyhow::Result<String>) -> String {
+    let Some(why) = &step.why else {
+        return String::new();
+    };
+    let failed = result.as_ref().err().map(|e| {
+        let e = format!("{e:#}");
+        e.lines().next().unwrap_or_default().to_string()
+    });
+    p.notebook(CHOICE, &why.entry(p, &step.summary, failed.as_deref()));
+    why.comment(p)
+}
+
 /// What a facts callback is given once the step is done: the child's
 /// stdout and the outputs.
 type After = Box<dyn FnOnce(&str, &[PathBuf]) -> Vec<Fact> + Send>;
@@ -118,12 +249,13 @@ type After = Box<dyn FnOnce(&str, &[PathBuf]) -> Vec<Fact> + Send>;
 /// [`crate::Call::spawn_step`]:
 ///
 /// ```no_run
-/// # use legume_mcp::{Call, Fact, Step};
+/// # use legume_mcp::{By, Call, Fact, Step, Why};
 /// # fn f(cx: &Call, cmd: std::process::Command, outputs: Vec<std::path::PathBuf>,
 /// #      counts: std::path::PathBuf) -> anyhow::Result<()> {
 /// let step = Step::new(&outputs, "senna fit, 12 topics")
 ///     .inputs(&[counts])
 ///     .fact(Fact::count("cells", 9812).of(11204))
+///     .why(Why::new("12 topics: the elbow of the fit's loss", By::Agent))
 ///     .after(|_stdout, _outputs| vec![Fact::value("loss", 1.83)]);
 /// cx.run_step(cmd, step)?;
 /// # Ok(()) }
@@ -133,6 +265,7 @@ pub struct Step {
     pub(crate) summary: String,
     inputs: Option<Vec<PathBuf>>,
     pub(crate) facts: Vec<Fact>,
+    pub(crate) why: Option<Why>,
     after: Option<After>,
 }
 
@@ -145,6 +278,7 @@ impl Step {
             summary: summary.into(),
             inputs: None,
             facts: Vec::new(),
+            why: None,
             after: None,
         }
     }
@@ -159,6 +293,15 @@ impl Step {
     /// A number known before it runs (the cells it is given, say).
     pub fn fact(mut self, fact: Fact) -> Self {
         self.facts.push(fact);
+        self
+    }
+
+    /// Why it is run as it is: a choice that steers it. The driver script
+    /// says it above the step's line (`# why (user): ...`) and the day's
+    /// notebook keeps it as a `choice` entry, whether the step succeeds or
+    /// not; `INDEX.tsv` does not.
+    pub fn why(mut self, why: Why) -> Self {
+        self.why = Some(why);
         self
     }
 
@@ -254,6 +397,60 @@ mod tests {
         let found = inputs_of(&cmd, &[d.join("out/run.json")]);
         let d = crate::absolute(d);
         assert_eq!(found, vec![d.join("counts.zarr"), d.join("batch.tsv")]);
+    }
+
+    #[test]
+    fn a_steps_why_goes_above_its_line_and_into_the_notebook() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = std::sync::Arc::new(Project::new(root.to_path_buf(), "senna", "0"));
+        let records = Some(p.clone());
+        let out = root.join("ode.out");
+        std::fs::write(&out, "").unwrap();
+        let why = Why::new(
+            "the root is the Ngn3-high cells,\nthe least differentiated",
+            By::User,
+        )
+        .citing(&[format!("{}/lupin/annotate_why.json", root.display())]);
+        let step = Step::new(std::slice::from_ref(&out), "senna ode from the root cells").why(why);
+        let cmd = Command::new("senna");
+        let bare = Some(p.command(&cmd));
+        crate::record_step(&records, "ode", bare.clone(), &step, &Ok(String::new()));
+        let failed =
+            Step::new(&[], "senna ode again").why(Why::new("try fewer steps", By::AgentAccepted));
+        let err = Err(anyhow::anyhow!("bad\nmore"));
+        crate::record_step(&records, "ode", bare, &failed, &err);
+
+        let day = root.join("results").join(crate::project::now().0);
+        let script = std::fs::read_to_string(day.join("runall.sh")).unwrap();
+        assert!(
+            script.contains(
+                "# why (user): the root is the Ngn3-high cells, the least differentiated\n\
+                 #   cites: lupin/annotate_why.json\nif [ ! -e ode.out ]"
+            ),
+            "{script}"
+        );
+        assert!(
+            script.contains(
+                "# why (agent, user accepted): try fewer steps\n# did not succeed (bad):"
+            ),
+            "{script}"
+        );
+        let notebook = p.notebook_today();
+        assert!(
+            notebook.contains(
+                " · senna · choice\n\nsenna ode from the root cells\n\n\
+                 - Why: the root is the Ngn3-high cells, the least differentiated\n\
+                 - By: user\n- Cites: lupin/annotate_why.json\n"
+            ),
+            "{notebook}"
+        );
+        assert!(
+            notebook.contains("- By: agent, user accepted\n- Did not succeed: bad\n"),
+            "{notebook}"
+        );
+        let index = std::fs::read_to_string(root.join("results/INDEX.tsv")).unwrap();
+        assert!(!index.contains("Ngn3"), "{index}");
     }
 
     #[test]
