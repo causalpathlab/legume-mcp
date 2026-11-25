@@ -21,7 +21,8 @@
 //!   guide to organizing computational biology projects): a dated results
 //!   folder with a driver script that repeats every step that wrote
 //!   something, a lab notebook the agent writes through the built-in
-//!   `notebook` tool, an index of outputs, and the inputs' provenance. Tools
+//!   `notebook` tool, an index of outputs, and the inputs' provenance (and
+//!   why a step ran as it did, [`Step::why`]). Tools
 //!   that write run a child through [`Call::run`] or [`Call::run_making`],
 //!   make their inputs through [`Call::write_file`], and put default
 //!   outputs under [`Call::results_dir`], so a user can find and redo an
@@ -75,7 +76,7 @@ pub mod project;
 #[cfg(feature = "benchmark")]
 pub mod score;
 mod step;
-pub use step::{inputs_of, Fact, Step};
+pub use step::{inputs_of, By, Fact, Step, Why};
 #[cfg(feature = "benchmark")]
 mod table;
 #[cfg(feature = "benchmark")]
@@ -493,7 +494,8 @@ impl Call {
 
 /// Record `step`, which ran `bare` (when records are kept): its guarded
 /// line in the driver script and its outputs in the index when it
-/// succeeded, a commented line saying why when it did not.
+/// succeeded, a commented line saying why when it did not; the step's
+/// [`Why`], when it has one, above either and in the notebook.
 fn record_step(
     records: &Records,
     tool: &str,
@@ -505,16 +507,19 @@ fn record_step(
         return;
     };
     let line = p.guarded(&bare, &step.outputs);
-    match result {
-        Ok(_) => {
-            p.script_step(&format!("{line}\n"), Some(&bare));
+    let failed = result.as_ref().err().map(|e| {
+        let why = p.rel(&format!("{e:#}"));
+        why.lines().next().unwrap_or_default().to_string()
+    });
+    let chosen = step::chosen(p, step, failed.as_deref());
+    match failed {
+        None => {
+            p.script_step(&format!("{chosen}{line}\n"), Some(&bare));
             p.index(tool, step);
         }
-        Err(e) => {
-            let why = p.rel(&format!("{e:#}"));
-            let why = why.lines().next().unwrap_or_default();
+        Some(why) => {
             let commented: String = line.lines().map(|l| format!("#   {l}\n")).collect();
-            p.script(&format!("# did not succeed ({why}):\n{commented}"));
+            p.script(&format!("{chosen}# did not succeed ({why}):\n{commented}"));
         }
     }
 }
