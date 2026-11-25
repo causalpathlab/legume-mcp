@@ -7,7 +7,7 @@
 use crate::job::{self, End, Spec};
 use crate::jobs::{Job, Jobs, Session, State};
 use crate::watch::{Body, Feed, Steer};
-use crate::{absolute, lock, Call, ServerInfo};
+use crate::{absolute, lock, Call, ServerInfo, Why};
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::fs::File;
@@ -223,6 +223,16 @@ impl Call {
     /// it up if this one ends first. The job records itself as it ends
     /// ([`crate::job::Reporter::finish`]).
     pub fn start_session_job(&self, job: SessionJob) -> Result<Started> {
+        self.start_session(job, None)
+    }
+
+    /// [`Self::start_session_job`] for a step with a [`Why`]: kept in the
+    /// job's `job.json` and recorded as it ends, as [`crate::Step::why`] is.
+    pub fn start_session_job_why(&self, job: SessionJob, why: Why) -> Result<Started> {
+        self.start_session(job, Some(why))
+    }
+
+    fn start_session(&self, job: SessionJob, why: Option<Why>) -> Result<Started> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let server = &self.server;
         let outputs: Vec<PathBuf> = job.outputs.iter().map(|o| absolute(o)).collect();
@@ -247,6 +257,7 @@ impl Call {
             inputs: crate::inputs_of(&job.record, &outputs),
             outputs,
             record: self.records.as_ref().map(|p| p.command(&job.record)),
+            why,
             started: crate::project::rfc3339(),
             epoch: epoch(),
         };

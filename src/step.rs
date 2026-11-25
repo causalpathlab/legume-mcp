@@ -114,7 +114,8 @@ pub(crate) fn read_facts(cell: &str) -> Vec<Fact> {
 }
 
 /// Who made a choice that steers a step.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum By {
     /// The person chose it.
@@ -143,11 +144,12 @@ impl std::fmt::Display for By {
 /// let why = Why::new("the root is the Ngn3-high cells, the least differentiated", By::User)
 ///     .citing(&["lupin round 2, annotate_why".into()]);
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Why {
     text: String,
     by: By,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     cites: Vec<String>,
 }
 
@@ -195,12 +197,20 @@ impl Why {
         out
     }
 
-    /// The notebook's `choice` entry for the step of `summary`, which did
-    /// not succeed when `failed` says why. Plain lines: the agent records
-    /// it, so nothing in it reads as the person's quoted words.
-    fn entry(&self, p: &Project, summary: &str, failed: Option<&str>) -> String {
+    /// The notebook's `choice` entry for the step of `summary`, begun at
+    /// `started` (HH:MM) when it is known, which did not succeed when
+    /// `failed` says why. Plain lines: the agent records it, so nothing in
+    /// it reads as the person's quoted words.
+    fn entry(
+        &self,
+        p: &Project,
+        summary: &str,
+        started: Option<&str>,
+        failed: Option<&str>,
+    ) -> String {
+        let started = started.map_or(String::new(), |t| format!(" (started {})", plain(p, t)));
         let mut text = format!(
-            "{}\n\n- Why: {}\n- By: {}",
+            "{}{started}\n\n- Why: {}\n- By: {}",
             plain(p, summary),
             plain(p, &self.text),
             self.by
@@ -237,7 +247,11 @@ pub(crate) fn chosen(p: &Project, step: &Step, result: &anyhow::Result<String>) 
         let e = format!("{e:#}");
         e.lines().next().unwrap_or_default().to_string()
     });
-    p.notebook(CHOICE, &why.entry(p, &step.summary, failed.as_deref()));
+    let started = step.started.as_deref();
+    p.notebook(
+        CHOICE,
+        &why.entry(p, &step.summary, started, failed.as_deref()),
+    );
     why.comment(p)
 }
 
@@ -266,6 +280,9 @@ pub struct Step {
     inputs: Option<Vec<PathBuf>>,
     pub(crate) facts: Vec<Fact>,
     pub(crate) why: Option<Why>,
+    /// When it began (HH:MM), for a step recorded long after: a session
+    /// job's.
+    pub(crate) started: Option<String>,
     after: Option<After>,
 }
 
@@ -279,6 +296,7 @@ impl Step {
             inputs: None,
             facts: Vec::new(),
             why: None,
+            started: None,
             after: None,
         }
     }

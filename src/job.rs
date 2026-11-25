@@ -21,7 +21,8 @@
 //!
 //! The step is recorded as the job ends, as `Call::spawn_job` records one:
 //! its line in `runall.sh` and its outputs in `INDEX.tsv` when it
-//! succeeded (with the facts the TUI gives [`Reporter::finish_with`]), a commented line saying why when it did not. The TUI does it
+//! succeeded (with the facts the TUI gives [`Reporter::finish_with`]), a commented line saying why when it did not, and
+//! its [`crate::Why`] when it was started with one. The TUI does it
 //! ([`Reporter::finish`]), so it is recorded whether or not a server is
 //! still there to see it end.
 
@@ -63,6 +64,9 @@ pub(crate) struct Spec {
     pub inputs: Vec<PathBuf>,
     /// The step as the driver script repeats it.
     pub record: Option<String>,
+    /// Why it runs as it does (none from a server before 0.6.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<crate::Why>,
     /// When it started: RFC 3339, and seconds since the epoch.
     pub started: String,
     pub epoch: u64,
@@ -290,6 +294,9 @@ pub(crate) fn conclude(
         };
         let mut step = Step::new(&spec.outputs, &spec.summary).inputs(&spec.inputs);
         step.facts = facts;
+        step.why.clone_from(&spec.why);
+        // `2026-11-25T10:02:03+…` as `10:02`.
+        step.started = spec.started.get(11..16).map(str::to_string);
         crate::record_step(
             &spec.records(feed),
             &spec.tool,
@@ -396,6 +403,58 @@ pub(crate) mod tests {
             elapsed_s: 20,
             eta_s: Some(412),
         }
+    }
+
+    /// A session job's why is kept in its job.json and recorded as it
+    /// ends, with when it started; a job.json without one still reads.
+    #[test]
+    fn a_session_jobs_why_is_recorded_as_it_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, job) = (dir.path().join("proj"), dir.path().join("job"));
+        std::fs::create_dir_all(&job).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let out = root.join("ode.out");
+        std::fs::write(&out, "").unwrap();
+        let spec = Spec {
+            server: "senna".into(),
+            version: "0".into(),
+            project: Some(root.clone()),
+            tool: "ode".into(),
+            tui: "senna".into(),
+            session: "senna-ode-1".into(),
+            summary: "senna ode from the root cells".into(),
+            outputs: vec![out],
+            inputs: Vec::new(),
+            record: Some("senna ode".into()),
+            why: Some(crate::Why::new(
+                "the root is the Ngn3-high cells",
+                crate::By::User,
+            )),
+            started: "2026-11-25T10:02:03-08:00".into(),
+            epoch: 0,
+        };
+        let mut old = serde_json::to_value(&spec).unwrap();
+        assert_eq!(old["why"]["by"], "user");
+        old.as_object_mut().unwrap().remove("why");
+        let old: Spec = serde_json::from_value(old).unwrap();
+        assert!(old.why.is_none());
+        replace(&job, "job.json", &serde_json::to_vec(&spec).unwrap()).unwrap();
+        conclude(&job, End::Done(String::new()), Vec::new(), None);
+        let p = spec.records(None).unwrap();
+        let day = root.join("results").join(crate::project::now().0);
+        let script = std::fs::read_to_string(day.join("runall.sh")).unwrap();
+        assert!(
+            script.contains("# why (user): the root is the Ngn3-high cells\nif [ ! -e ode.out ]"),
+            "{script}"
+        );
+        let notebook = p.notebook_today();
+        assert!(
+            notebook.contains(
+                " · senna · choice\n\nsenna ode from the root cells (started 10:02)\n\n\
+                 - Why: the root is the Ngn3-high cells\n- By: user\n"
+            ),
+            "{notebook}"
+        );
     }
 
     #[cfg(all(feature = "sessions", unix))]
