@@ -183,7 +183,7 @@ fn a_session_job_is_watched_followed_cancelled_and_outlives_its_server() {
     // A person attaches and sees its screen; detached again, it runs on.
     let mut t = sessions.term(&["attach", session], &[]);
     t.wait_screen("job working");
-    t.type_(b"\x1b\x04");
+    t.type_(&legume_tui::Key::DETACH.bytes());
     assert_eq!(t.exit_code(), 0);
 
     // Its log reaches job_status; its output is held while it runs.
