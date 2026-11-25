@@ -1353,7 +1353,7 @@ mod tests {
         note(json!({ "kind": "summary", "words": "We asked why cluster 4 stands apart." }));
         let why = crate::Why::new("the root is the Ngn3-high cells", crate::By::User);
         let step = crate::Step::new(&[], "senna ode").why(why);
-        crate::step::chosen(&p, &step, &Ok(String::new()));
+        crate::step::chosen(&p, &step, None);
 
         let b = build(&root, Some(&day)).unwrap();
         assert!(b.summary && b.graph.is_some());

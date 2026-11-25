@@ -209,9 +209,14 @@ impl Why {
         failed: Option<&str>,
     ) -> String {
         let started = started.map_or(String::new(), |t| format!(" (started {})", plain(p, t)));
+        // A summary starting `>` would read as the person's words.
+        let summary = plain(p, summary);
+        let summary = match summary.strip_prefix('>') {
+            Some(rest) => format!("\\>{rest}"),
+            None => summary,
+        };
         let mut text = format!(
-            "{}{started}\n\n- Why: {}\n- By: {}",
-            plain(p, summary),
+            "{summary}{started}\n\n- Why: {}\n- By: {}",
             plain(p, &self.text),
             self.by
         );
@@ -236,22 +241,15 @@ fn plain(p: &Project, s: &str) -> String {
 /// The notebook kind of a step's [`Why`].
 pub(crate) const CHOICE: &str = "choice";
 
-/// The `choice` entry of `step`, which ended in `result`, written to the
-/// notebook, and the comment the driver script gets above its line; none
-/// when it has no [`Why`].
-pub(crate) fn chosen(p: &Project, step: &Step, result: &anyhow::Result<String>) -> String {
+/// The `choice` entry of `step`, which did not succeed when `failed` says
+/// why, written to the notebook, and the comment the driver script gets
+/// above its line; none when it has no [`Why`].
+pub(crate) fn chosen(p: &Project, step: &Step, failed: Option<&str>) -> String {
     let Some(why) = &step.why else {
         return String::new();
     };
-    let failed = result.as_ref().err().map(|e| {
-        let e = format!("{e:#}");
-        e.lines().next().unwrap_or_default().to_string()
-    });
     let started = step.started.as_deref();
-    p.notebook(
-        CHOICE,
-        &why.entry(p, &step.summary, started, failed.as_deref()),
-    );
+    p.notebook(CHOICE, &why.entry(p, &step.summary, started, failed));
     why.comment(p)
 }
 
@@ -435,7 +433,7 @@ mod tests {
         let bare = Some(p.command(&cmd));
         crate::record_step(&records, "ode", bare.clone(), &step, &Ok(String::new()));
         let failed =
-            Step::new(&[], "senna ode again").why(Why::new("try fewer steps", By::AgentAccepted));
+            Step::new(&[], "> senna ode again").why(Why::new("try fewer steps", By::AgentAccepted));
         let err = Err(anyhow::anyhow!("bad\nmore"));
         crate::record_step(&records, "ode", bare, &failed, &err);
 
@@ -464,7 +462,10 @@ mod tests {
             "{notebook}"
         );
         assert!(
-            notebook.contains("- By: agent, user accepted\n- Did not succeed: bad\n"),
+            notebook.contains(
+                "\\> senna ode again\n\n- Why: try fewer steps\n\
+                 - By: agent, user accepted\n- Did not succeed: bad\n"
+            ),
             "{notebook}"
         );
         let index = std::fs::read_to_string(root.join("results/INDEX.tsv")).unwrap();

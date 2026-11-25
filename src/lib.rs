@@ -507,15 +507,17 @@ fn record_step(
         return;
     };
     let line = p.guarded(&bare, &step.outputs);
-    let chosen = step::chosen(p, step, result);
-    match result {
-        Ok(_) => {
+    let failed = result.as_ref().err().map(|e| {
+        let why = p.rel(&format!("{e:#}"));
+        why.lines().next().unwrap_or_default().to_string()
+    });
+    let chosen = step::chosen(p, step, failed.as_deref());
+    match failed {
+        None => {
             p.script_step(&format!("{chosen}{line}\n"), Some(&bare));
             p.index(tool, step);
         }
-        Err(e) => {
-            let why = p.rel(&format!("{e:#}"));
-            let why = why.lines().next().unwrap_or_default();
+        Some(why) => {
             let commented: String = line.lines().map(|l| format!("#   {l}\n")).collect();
             p.script(&format!("{chosen}# did not succeed ({why}):\n{commented}"));
         }

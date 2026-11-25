@@ -332,7 +332,8 @@ next server for the same project takes up the ones still running or ended
 unseen. Their folders are in `jobs` beside the watch folders.
 `Call::start_session_job_why(job, why)` starts one with a `Why`, kept in its
 `job.json` and recorded as it ends as `Step::why` is, the notebook entry
-saying when it started (`senna ode ... (started 10:02)`).
+saying when it started (`senna ode ... (started 10:02)`, with the date
+when that was an earlier day).
 
 While a job runs, its outputs are held: a step writing one of them (the same
 file, or one inside the other, however spelled) is refused, naming the job,

@@ -21,10 +21,10 @@
 //!
 //! The step is recorded as the job ends, as `Call::spawn_job` records one:
 //! its line in `runall.sh` and its outputs in `INDEX.tsv` when it
-//! succeeded (with the facts the TUI gives [`Reporter::finish_with`]), a commented line saying why when it did not, and
-//! its [`crate::Why`] when it was started with one. The TUI does it
-//! ([`Reporter::finish`]), so it is recorded whether or not a server is
-//! still there to see it end.
+//! succeeded (with the facts the TUI gives [`Reporter::finish_with`]), a
+//! commented line saying why when it did not, and its [`crate::Why`] when
+//! it was started with one. The TUI does it ([`Reporter::finish`]), so it
+//! is recorded whether or not a server is still there to see it end.
 
 use crate::project::Project;
 use crate::watch::Feed;
@@ -295,8 +295,7 @@ pub(crate) fn conclude(
         let mut step = Step::new(&spec.outputs, &spec.summary).inputs(&spec.inputs);
         step.facts = facts;
         step.why.clone_from(&spec.why);
-        // `2026-11-25T10:02:03+…` as `10:02`.
-        step.started = spec.started.get(11..16).map(str::to_string);
+        step.started = started(&spec.started, &crate::project::rfc3339());
         crate::record_step(
             &spec.records(feed),
             &spec.tool,
@@ -310,6 +309,17 @@ pub(crate) fn conclude(
         log::warn!("session job in {}: writing end.json: {e}", dir.display());
     }
     Some(end)
+}
+
+/// When a job that began at `started` (RFC 3339) began, as its end at
+/// `now` records it: `10:02` the same day, `2026-11-24 23:50` a day before.
+fn started(started: &str, now: &str) -> Option<String> {
+    let t = started.get(..16)?;
+    if now.get(..10) == t.get(..10) {
+        t.get(11..).map(str::to_string)
+    } else {
+        Some(t.replacen('T', " ", 1))
+    }
 }
 
 /// The session job this process is, as its TUI tells legume-mcp of it.
@@ -455,6 +465,15 @@ pub(crate) mod tests {
             ),
             "{notebook}"
         );
+    }
+
+    #[test]
+    fn a_job_begun_the_day_before_says_its_date() {
+        let now = "2026-11-25T08:00:00-08:00";
+        assert_eq!(started("2026-11-25T07:02:03-08:00", now).unwrap(), "07:02");
+        let before = started("2026-11-24T23:50:00-08:00", now).unwrap();
+        assert_eq!(before, "2026-11-24 23:50");
+        assert!(started("", now).is_none());
     }
 
     #[cfg(all(feature = "sessions", unix))]
