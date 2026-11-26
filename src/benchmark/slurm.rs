@@ -23,7 +23,8 @@
 //!   each task's folder gets `slurm.json`: its array job and index. One
 //!   shell call submits a whole launch.
 //! - **Poll.** One shell call per round: `squeue` for the run's array
-//!   jobs (a pending range is one line, however many tasks it holds),
+//!   jobs (a pending range is one line, however many tasks it holds,
+//!   printed whole by `SLURM_BITSTR_LEN=0`),
 //!   and the `exit.json` of each task the runner has that is not
 //!   pending. A task ends when its `exit.json` is there, whatever the
 //!   queue says: its `outcome` is the wrapper's. One gone from the queue
@@ -93,6 +94,10 @@ pub struct Slurm {
     /// The array tasks the last poll saw pending, whose files are not
     /// looked at.
     pending: HashSet<Job>,
+    /// Each array job whose pending range the last poll saw cut short, and
+    /// the last index it showed: a task past it may be pending, and its
+    /// files are looked at.
+    cut: HashMap<String, usize>,
     /// The array jobs the last poll that read the queue saw in it, once
     /// one has.
     queued_arrays: Option<HashSet<String>>,
@@ -137,6 +142,7 @@ impl Slurm {
             tasks,
             running: BTreeMap::new(),
             pending: HashSet::new(),
+            cut: HashMap::new(),
             queued_arrays: None,
             fresh: HashSet::new(),
             capped_last: HashMap::new(),
@@ -207,7 +213,7 @@ impl Slurm {
                     };
                     (job, p.key == t.key)
                 })
-                .filter(|(j, _)| poll.queued.contains(j) || poll.pending.contains(j));
+                .filter(|(j, _)| poll.may_be_queued(j));
             if done.is_some() || matches!(placed, Some((_, false))) {
                 resumed.rekeyed.push(i);
             }
@@ -222,6 +228,7 @@ impl Slurm {
             resumed.adopted.push(i);
         }
         self.pending = poll.pending;
+        self.cut = poll.cut;
         Ok(resumed)
     }
 
@@ -256,7 +263,7 @@ impl Slurm {
             .filter(|i| {
                 self.running
                     .get(i)
-                    .is_some_and(|r| self.pending.contains(&r.job))
+                    .is_some_and(|r| self.pending.contains(&r.job) || past_cut(&self.cut, &r.job))
             })
             .collect()
     }
@@ -355,22 +362,48 @@ fn parse_job(s: &str) -> Result<Job> {
     })
 }
 
-/// The array tasks of a pending range, `<array job>_[1-3,5%2]`.
-fn parse_range(s: &str) -> Option<Vec<Job>> {
+/// A pending range as `squeue` prints it, `<array job>_[1-3,5,8-12:2%2]`.
+struct Range {
+    array_job: String,
+    jobs: Vec<Job>,
+    /// A range cut short (no closing `]`, or `...`): the last index it
+    /// shows; any later one may be pending too.
+    cut_after: Option<usize>,
+}
+
+/// The array tasks of a pending range; `None` when the line is not one.
+fn parse_range(s: &str) -> Option<Range> {
     let (array_job, rest) = s.split_once("_[")?;
+    let closed = rest.strip_suffix(']');
+    let cut = closed.is_none() || rest.contains("...");
     // `%N` is the array job's throttle, not an index.
-    let spec = rest.strip_suffix(']')?.split('%').next()?;
+    let spec = closed.unwrap_or(rest).split('%').next()?;
+    let mut parts: Vec<&str> = spec
+        .split(',')
+        .filter(|p| !p.is_empty() && *p != "...")
+        .collect();
+    if closed.is_none() && !spec.ends_with(',') {
+        // The last part may itself be cut (`26-3` of `26-34`).
+        parts.pop();
+    }
     let mut jobs = Vec::new();
-    for part in spec.split(',') {
-        let (a, b) = part.split_once('-').unwrap_or((part, part));
-        for index in a.parse::<usize>().ok()?..=b.parse::<usize>().ok()? {
+    for part in parts {
+        let (bounds, step) = part.split_once(':').unwrap_or((part, "1"));
+        let (a, b) = bounds.split_once('-').unwrap_or((bounds, bounds));
+        let step = step.parse::<usize>().ok().filter(|&k| k > 0)?;
+        for index in (a.parse::<usize>().ok()?..=b.parse::<usize>().ok()?).step_by(step) {
             jobs.push(Job {
                 array_job: array_job.to_string(),
                 index,
             });
         }
     }
-    Some(jobs)
+    let cut_after = cut.then(|| jobs.iter().map(|j| j.index).max().unwrap_or(0));
+    Some(Range {
+        array_job: array_job.to_string(),
+        jobs,
+        cut_after,
+    })
 }
 
 /// The files of one task's folder that resume reads.
@@ -448,10 +481,15 @@ pub fn srun(
 }
 
 /// `squeue` of the run's array jobs, each row a `q` line, or `qfail`.
+///
+/// `SLURM_BITSTR_LEN=0` prints a pending array's indices whole: by
+/// default Slurm cuts the list (`11_[0-4,6-14,16-24,26-34,`) once tasks
+/// cancelled from its middle make it long, and the tasks past the cut
+/// would read as gone.
 fn squeue_line(run: &str) -> String {
     format!(
-        "if q=$(squeue -h --name={} -o '%i %t'); then printf '%s\\n' \"$q\" | sed 's/^/q /'; \
-         else echo qfail; fi\n",
+        "if q=$(SLURM_BITSTR_LEN=0 squeue -h --name={} -o '%i %t'); then \
+         printf '%s\\n' \"$q\" | sed 's/^/q /'; else echo qfail; fi\n",
         quote(run)
     )
 }
@@ -729,6 +767,7 @@ impl Executor for Slurm {
         if poll.queue_ok {
             self.queued_arrays = Some(poll.arrays);
             self.pending = poll.pending;
+            self.cut = poll.cut;
             self.fresh.clear();
         }
         let now = Instant::now();
@@ -753,9 +792,12 @@ impl Executor for Slurm {
                 });
                 continue;
             }
+            // A task past where its range was cut may be pending; not in
+            // self.pending, its exit.json is read each round.
             if !poll.queue_ok
                 || poll.queued.contains(&r.job)
                 || self.pending.contains(&r.job)
+                || past_cut(&self.cut, &r.job)
                 || self.fresh.contains(&r.job)
             {
                 r.gone_since = None;
@@ -846,6 +888,22 @@ struct Poll {
     exits: HashMap<usize, String>,
     /// `squeue` answered.
     queue_ok: bool,
+    /// Each array job whose pending range came back cut short (see
+    /// [`squeue_line`]), and the last index it shows.
+    cut: HashMap<String, usize>,
+}
+
+impl Poll {
+    /// `job` is in the queue, or may be: past where its array's range was cut.
+    fn may_be_queued(&self, job: &Job) -> bool {
+        self.queued.contains(job) || self.pending.contains(job) || past_cut(&self.cut, job)
+    }
+}
+
+/// `job` lies past where its array's pending range was cut.
+fn past_cut(cut: &HashMap<String, usize>, job: &Job) -> bool {
+    cut.get(&job.array_job)
+        .is_some_and(|&last| job.index > last)
 }
 
 /// `q <job> <state>` lines from `squeue`, or `qfail`; `x <task> <json>`
@@ -869,7 +927,10 @@ fn parse_poll(out: &str) -> Poll {
                 }
             }
             if let Some(range) = parse_range(job) {
-                p.pending.extend(range);
+                if let Some(last) = range.cut_after {
+                    p.cut.insert(range.array_job, last);
+                }
+                p.pending.extend(range.jobs);
             } else if let Ok(job) = parse_job(job) {
                 if words.next() == Some("PD") {
                     p.pending.insert(job);
@@ -921,6 +982,41 @@ mod tests {
     }
 
     #[test]
+    fn a_range_cut_short_is_read_up_to_the_cut() {
+        // As Slurm 17.02 prints it: what it shows is pending, and only an
+        // index past the last one shown may be.
+        let p = parse_poll("q 10_7 R\nq 11_[0-4,6-14,16-24,26-34, PD\nx 3 {\"exit\": 0}\n");
+        assert!(p.queue_ok);
+        assert!(p.may_be_queued(&job("10", 7)));
+        assert!(p.pending.contains(&job("11", 26)));
+        assert!(!p.may_be_queued(&job("11", 5)));
+        assert!(p.may_be_queued(&job("11", 40)));
+        assert!(!p.may_be_queued(&job("12", 0)));
+        assert_eq!(p.exits[&3], "{\"exit\": 0}");
+        // A part cut in the middle (`26-3` of `26-34`) is not read.
+        let p = parse_poll("q 11_[0-4,26-3 PD\n");
+        assert_eq!(p.cut["11"], 4);
+        assert!(!p.pending.contains(&job("11", 26)));
+        assert!(p.may_be_queued(&job("11", 30)));
+    }
+
+    #[test]
+    fn ranges_cut_with_an_ellipsis_throttled_or_stepped_are_read() {
+        let p = parse_poll("q 11_[0-4,...] PD\nq 12_[0-1,...%2] PD\nq 13_[0-8:2,20] PD\n");
+        assert_eq!((p.cut["11"], p.cut["12"]), (4, 1));
+        assert!(p.may_be_queued(&job("11", 9)) && p.may_be_queued(&job("12", 9)));
+        assert!(!p.cut.contains_key("13"));
+        let thirteen: HashSet<Job> = [0, 2, 4, 6, 8, 20].map(|i| job("13", i)).into();
+        assert!(thirteen.is_subset(&p.pending));
+        assert!(!p.pending.contains(&job("13", 3)));
+    }
+
+    #[test]
+    fn squeue_prints_whole_ranges() {
+        assert!(squeue_line("r").contains("SLURM_BITSTR_LEN=0 squeue"));
+    }
+
+    #[test]
     fn scancel_takes_each_array_jobs_tasks_as_ranges() {
         let jobs = [
             job("10", 3),
@@ -939,7 +1035,7 @@ mod tests {
         for bad in ["39", "39_[1-3]", "a_1", "_1"] {
             assert!(parse_job(bad).is_err(), "{bad}");
         }
-        assert_eq!(parse_range("39_[4]").unwrap(), vec![job("39", 4)]);
+        assert_eq!(parse_range("39_[4]").unwrap().jobs, vec![job("39", 4)]);
         assert!(parse_range("39_4").is_none() && parse_range("39_[a-2]").is_none());
     }
 }
