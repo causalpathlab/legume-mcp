@@ -440,7 +440,8 @@ pub(crate) mod tests {
                 "the root is the Ngn3-high cells",
                 crate::By::User,
             )),
-            started: "2026-11-25T10:02:03-08:00".into(),
+            // Today, so the notebook shows the time alone (`started 10:02`).
+            started: format!("{}T10:02:03-08:00", &crate::project::rfc3339()[..10]),
             epoch: 0,
         };
         let mut old = serde_json::to_value(&spec).unwrap();
